@@ -574,6 +574,12 @@ pub async fn run_cycle_domain(
                         "download started"
                     );
                     db.lock().unwrap().register_torrent(&release)?;
+                    if let Some(hash) = magnet_hash(&release.magnet) {
+                        let _ = db
+                            .lock()
+                            .unwrap()
+                            .set_torrent_reason(&hash, decision_reason);
+                    }
                     if is_ready_pending {
                         if let (Some(series), Some(season), Some(episode)) =
                             (release.series.as_deref(), release.season, release.episode)

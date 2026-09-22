@@ -5913,14 +5913,17 @@ fn decorate_torrents(
     items
         .into_iter()
         .map(|torrent| {
-            let archived = db
-                .torrent_processed(&torrent.hash)
-                .ok()
-                .flatten()
-                .is_some_and(|path| !path.trim().is_empty());
+            let (processed_path, source, reason) = db
+                .torrent_aux(&torrent.hash)
+                .unwrap_or_default();
+            let archived = !processed_path.trim().is_empty();
             let mut value = serde_json::to_value(&torrent).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {
                 object.insert("archived".into(), serde_json::Value::Bool(archived));
+                // Sorgente (indexer/RSS/web) e motivo del download: mostrati
+                // sotto il nome del file nella Sessione torrent.
+                object.insert("source".into(), serde_json::Value::String(source));
+                object.insert("reason".into(), serde_json::Value::String(reason));
             }
             value
         })
@@ -6641,14 +6644,21 @@ async fn tvdb_search(State(s): State<AppState>, Json(input): Json<TvdbQuery>) ->
             Json(serde_json::json!({"ok":false,"error":"query must contain 1-256 characters"})),
         );
     }
-    match client.search_series(query).await {
-        Ok(results) => (
+    match tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, client.search_series(query)).await {
+        Ok(Ok(results)) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok":true,"results":results})),
         ),
-        Err(error) => (
+        Ok(Err(error)) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("TVDB non ha risposto entro {}s", EXTERNAL_SEARCH_TIMEOUT.as_secs())
+            })),
         ),
     }
 }
@@ -6674,6 +6684,10 @@ async fn tvdb_series(State(s): State<AppState>, Path(id): Path<i64>) -> impl Int
     }
 }
 
+/// Tetto massimo per le ricerche su servizi esterni avviate dalla UI (TMDB,
+/// fallback TVDB). Evita che un upstream lento tenga bloccata la richiesta.
+const EXTERNAL_SEARCH_TIMEOUT: Duration = Duration::from_secs(12);
+
 async fn tmdb_search(State(s): State<AppState>, Json(input): Json<TmdbQuery>) -> impl IntoResponse {
     let cfg = latest_config(&s);
     let Some(api_key) = cfg.tmdb_api_key.clone() else {
@@ -6691,10 +6705,30 @@ async fn tmdb_search(State(s): State<AppState>, Json(input): Json<TmdbQuery>) ->
     }
     let is_movie = input.kind.eq_ignore_ascii_case("movie");
     let tmdb = TmdbClient::new(Some(api_key));
-    let result = if is_movie {
-        tmdb.search_movies(query).await
-    } else {
-        tmdb.search_series(query).await
+    let lookup = async {
+        if is_movie {
+            tmdb.search_movies(query).await
+        } else {
+            tmdb.search_series(query).await
+        }
+    };
+    // Limite rigido: il client TMDB può attendere fino a 20 s e ritentare, quindi
+    // senza questo tetto la richiesta (e la pagina che l'ha avviata) poteva
+    // restare in attesa molto a lungo.
+    let result = match tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, lookup).await {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "TMDB non ha risposto entro {}s",
+                        EXTERNAL_SEARCH_TIMEOUT.as_secs()
+                    )
+                })),
+            )
+        }
     };
     match result {
         Ok(items) if !items.is_empty() => {
@@ -6722,8 +6756,13 @@ async fn tmdb_search(State(s): State<AppState>, Json(input): Json<TmdbQuery>) ->
         Ok(_) => {
             let tvdb =
                 crate::tvdb::TvdbClient::with_language(cfg.tvdb_api_key(), cfg.tvdb_language());
-            let items = match tvdb.search_series(query).await {
-                Ok(results) => results
+            let items = match tokio::time::timeout(
+                EXTERNAL_SEARCH_TIMEOUT,
+                tvdb.search_series(query),
+            )
+            .await
+            {
+                Ok(Ok(results)) => results
                     .into_iter()
                     .map(|item| {
                         serde_json::json!({
@@ -6737,8 +6776,12 @@ async fn tmdb_search(State(s): State<AppState>, Json(input): Json<TmdbQuery>) ->
                         })
                     })
                     .collect::<Vec<_>>(),
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::debug!(%error, "TVDB fallback search failed");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::debug!("TVDB fallback search timed out");
                     Vec::new()
                 }
             };
@@ -6981,10 +7024,19 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
     }
     match s.torrents.add(&release.magnet, &s.cfg) {
         Ok(true) => match s.db.lock().unwrap().register_torrent(&release) {
-            Ok(()) => (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"ok":true,"title":release.title})),
-            ),
+            Ok(()) => {
+                if let Some(hash) = crate::utils::magnet_hash(&release.magnet) {
+                    let _ = s
+                        .db
+                        .lock()
+                        .unwrap()
+                        .set_torrent_reason(&hash, "manual");
+                }
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"ok":true,"title":release.title})),
+                )
+            }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -8535,7 +8587,9 @@ async fn torrent_event_worker(
                     .flatten()
                     .map(|meta| meta.release.is_pack)
                     .unwrap_or(false);
-                let _ = torrents.remove(&event.hash, is_pack);
+                if let Ok(true) = torrents.remove(&event.hash, is_pack) {
+                    let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
+                }
             }
             if processed && matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
                 let completion_meta = db.lock().unwrap().torrent_meta(&event.hash).ok().flatten();
@@ -8898,8 +8952,14 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
                     .flatten()
                     .map(|meta| meta.release.is_pack)
                     .unwrap_or(false);
-                if let Err(error) = torrents.remove(&torrent.hash, is_pack) {
-                    tracing::warn!(hash=%torrent.hash, %error, "failed to remove torrent at seed limit");
+                match torrents.remove(&torrent.hash, is_pack) {
+                    Ok(true) => {
+                        let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(hash=%torrent.hash, %error, "failed to remove torrent at seed limit")
+                    }
                 }
             }
         }
@@ -9002,7 +9062,12 @@ fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &T
 /// A completed download that cannot be imported must not keep occupying the
 /// RAM disk. Keep it recoverable in the configured trash, then remove the
 /// torrent handle because its storage path is no longer active.
-fn discard_completed_source(cfg: &Config, torrents: &LibtorrentClient, event: &TorrentEvent) {
+fn discard_completed_source(
+    cfg: &Config,
+    db: &Arc<Mutex<Database>>,
+    torrents: &LibtorrentClient,
+    event: &TorrentEvent,
+) {
     let source = postprocess::completion_path(event);
     if source.exists() {
         if let Some(trash) = cfg.trash_path.as_deref() {
@@ -9043,7 +9108,11 @@ fn discard_completed_source(cfg: &Config, torrents: &LibtorrentClient, event: &T
         }
     }
     match torrents.remove(&event.hash, false) {
-        Ok(true) => tracing::info!(hash = %event.hash, "rejected completed torrent removed"),
+        Ok(true) => {
+            // Il torrent ha lasciato la sessione: entra nello Storico con l'esito.
+            let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
+            tracing::info!(hash = %event.hash, "rejected completed torrent removed")
+        }
         Ok(false) => tracing::debug!(hash = %event.hash, "rejected torrent was already removed"),
         Err(error) => tracing::warn!(hash = %event.hash, %error, "rejected torrent removal failed"),
     }
@@ -9094,7 +9163,7 @@ async fn handle_torrent_event(
                             "season pack rejected"
                         );
                         db.lock().unwrap().mark_torrent_error(&event.hash, error)?;
-                        discard_completed_source(cfg, torrents, &event);
+                        discard_completed_source(cfg, db, torrents, &event);
                         return Ok(false);
                     }
                     let copied = postprocess::copy_matching_pack_files(
@@ -9114,6 +9183,11 @@ async fn handle_torrent_event(
                             &event.hash,
                             "season pack inferior to existing files",
                         )?;
+                        // Esito definitivo: il pack è stato scartato per intero.
+                        // Esce dalla sessione (finisce nello Storico con il
+                        // motivo) e la sorgente va nel cestino, così non resta
+                        // a occupare spazio senza un badge NAS.
+                        discard_completed_source(cfg, db, torrents, &event);
                         return Ok(false);
                     }
                     let entries = processed
@@ -9177,7 +9251,9 @@ async fn handle_torrent_event(
                         } else if let Err(error) = std::fs::remove_dir_all(&source) {
                             tracing::warn!(hash=%event.hash, %error, "removing pack source failed");
                         }
-                        let _ = torrents.remove(&event.hash, false);
+                        if let Ok(true) = torrents.remove(&event.hash, false) {
+                            let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
+                        }
                         tracing::info!(hash=%event.hash, destination=%destination.display(), size_bytes=size, "season pack moved to archive");
                     } else {
                         tracing::info!(hash=%event.hash, destination=%destination.display(), size_bytes=size, "season pack copied flat while source remains available for seeding");
@@ -9338,10 +9414,14 @@ async fn complete_torrent(
     // (copia con sorgente conservata per il seeding).
     if renamed.is_some() && !postprocess::same_path(processed_path, &path) {
         match torrents.remove(&event.hash, false) {
-            Ok(true) => tracing::info!(
-                hash = %event.hash,
-                "torrent removed after rename: archived under a different path"
-            ),
+            Ok(true) => {
+                // Ha lasciato la sessione: entra nello Storico con il percorso NAS.
+                let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
+                tracing::info!(
+                    hash = %event.hash,
+                    "torrent removed after rename: archived under a different path"
+                )
+            }
             Ok(false) => tracing::debug!(hash=%event.hash, "renamed torrent already removed"),
             Err(error) => {
                 tracing::warn!(hash=%event.hash, %error, "renamed torrent removal failed")

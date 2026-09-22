@@ -306,7 +306,12 @@ pub fn cleanup_old_episode(
             continue;
         }
         let old_quality = parse_quality(name);
-        let old_score = old_quality.score();
+        // Confronta con lo stesso metro del file nuovo: anche il file esistente
+        // va valutato con le impostazioni (`score_res_*`, `score_source_*`, ...).
+        // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
+        // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
+        // 1080p e lo scartava.
+        let old_score = old_quality.score_with_settings(&cfg.settings);
         let new_quality = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -548,7 +553,12 @@ pub fn discard_if_inferior(
             continue;
         }
         let old_quality = parse_quality(name);
-        let old_score = old_quality.score();
+        // Confronta con lo stesso metro del file nuovo: anche il file esistente
+        // va valutato con le impostazioni (`score_res_*`, `score_source_*`, ...).
+        // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
+        // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
+        // 1080p e lo scartava.
+        let old_score = old_quality.score_with_settings(&cfg.settings);
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -624,7 +634,12 @@ pub fn cleanup_old_movie(
             }
         }
         let old_quality = parse_quality(name);
-        let old_score = old_quality.score();
+        // Confronta con lo stesso metro del file nuovo: anche il file esistente
+        // va valutato con le impostazioni (`score_res_*`, `score_source_*`, ...).
+        // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
+        // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
+        // 1080p e lo scartava.
+        let old_score = old_quality.score_with_settings(&cfg.settings);
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -699,7 +714,12 @@ pub fn discard_if_inferior_movie(
             }
         }
         let old_quality = parse_quality(name);
-        let old_score = old_quality.score();
+        // Confronta con lo stesso metro del file nuovo: anche il file esistente
+        // va valutato con le impostazioni (`score_res_*`, `score_source_*`, ...).
+        // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
+        // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
+        // 1080p e lo scartava.
+        let old_score = old_quality.score_with_settings(&cfg.settings);
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -1012,6 +1032,45 @@ mod tests {
         assert!(archive
             .join("Example - S01E01 - Pilot - [1080p][h264][EAC3][IT+EN].mkv")
             .is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lowered_resolution_setting_does_not_make_equal_new_release_inferior() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-res-setting-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        fs::create_dir_all(&archive).unwrap();
+        // Esistente e nuovo sono entrambi 1080p IT+EN: il nuovo non è inferiore.
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [1080p][h265][AAC][IT+EN].mkv"),
+            b"old",
+        )
+        .unwrap();
+        let new_file = archive.join("Example - S01E01 - Pilot - [WEB-DL][1080p][h264][AAC][IT+EN].mkv");
+        fs::write(&new_file, b"new").unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.cleanup_min_score_diff = 50;
+        cfg.trash_path = Some(trash.clone());
+        // Impostazione utente che abbassa il peso del 1080p: se il confronto
+        // mescola `score()` e `score_with_settings()` il nuovo 1080p sembra
+        // "inferiore" e viene scartato per errore.
+        cfg.settings
+            .insert("score_res_1080p".into(), "500".into());
+        let new_score = parse_quality("Example - S01E01 - Pilot - [WEB-DL][1080p][h264][AAC][IT+EN].mkv")
+            .score_with_settings(&cfg.settings);
+        assert!(!discard_if_inferior(
+            &cfg, "Example", 1, 1, new_score, &new_file, &archive
+        )
+        .unwrap());
+        assert!(new_file.is_file(), "il nuovo file non va scartato");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -314,6 +314,26 @@ async fn send(method: &str, path: &str, body: Option<Value>) -> Result<Value, St
     Err("Autenticazione richiesta".into())
 }
 
+/// Variante di `send` con un tetto massimo di attesa: se il server non risponde
+/// entro `millis`, il chiamante riceve un errore invece di restare bloccato a
+/// tempo indefinito (ad esempio con un upstream TMDB/TVDB momentaneamente lento).
+async fn send_timeout(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    millis: u32,
+) -> Result<Value, String> {
+    let request = send(method, path, body);
+    let timeout = TimeoutFuture::new(millis);
+    futures::pin_mut!(request, timeout);
+    match futures::future::select(request, timeout).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right((_, _)) => {
+            Err("Tempo scaduto: il server non ha risposto".into())
+        }
+    }
+}
+
 fn trigger_refresh() {
     if let Some(refresh) = use_context::<RwSignal<u32>>() {
         refresh.update(|value| *value += 1);
@@ -1957,6 +1977,18 @@ fn torrent_state_label(state: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Etichetta leggibile del motivo per cui una release è stata messa in download.
+fn torrent_reason_label(data: RwSignal<Data>, reason: &str) -> String {
+    match reason {
+        "approved" => tr(data, "nuova release"),
+        "upgrade" => tr(data, "sostituisce una qualità inferiore"),
+        "gap_fill" | "gap_filled" => tr(data, "puntata mancante"),
+        "manual" => tr(data, "aggiunta manuale"),
+        "restored" => tr(data, "ripristino"),
+        _ => reason.replace('_', " "),
+    }
+}
+
 fn torrent_version_label(version: &str) -> String {
     match version {
         "v1" => "BitTorrent v1".into(),
@@ -2196,6 +2228,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 </form>
             </Panel>
             <Panel title="Sessione torrent">
+                <p class="muted">{ctx_tr("Torrent ancora nel client (scarico e seed). Il badge NAS indica che i file sono già archiviati: il torrent esce da qui quando lo rimuovi (Pulisci completati o rimozione) e passa allo Storico download.")}</p>
                 <div class="torrent-stats" style="margin-bottom:10px">
                     <div class="metric"><small>{ctx_tr("Download")}</small><strong>{move || format!("{}/s", stat_dl.get())}</strong></div>
                     <div class="metric"><small>{ctx_tr("Upload")}</small><strong>{move || format!("{}/s", stat_ul.get())}</strong></div>
@@ -2339,15 +2372,33 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                 } else {
                                     "—".to_string()
                                 };
+                                // Sotto il nome: perché era in download e la fonte.
+                                let origin_label = {
+                                    let mut parts = Vec::new();
+                                    let reason_label = torrent_reason_label(data, &text(&item, "reason", ""));
+                                    if !reason_label.is_empty() {
+                                        parts.push(format!("{}: {reason_label}", tr(data, "Perché")));
+                                    }
+                                    let source_label = text(&item, "source", "");
+                                    if !source_label.is_empty() {
+                                        parts.push(format!("{}: {source_label}", tr(data, "Fonte")));
+                                    }
+                                    parts.join(" · ")
+                                };
+                                let origin_show = origin_label.clone();
                                 let name_title = name.clone();
                                 let path_title = path.clone();
                                 let when_title = when_full.clone();
                                 view! {
                                     <tr>
                                         <td class="truncate" title=name_title>
-                                            {name}
-                                            <Show when=move || archived>
-                                                <span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
+                                            <div>{name}
+                                                <Show when=move || archived>
+                                                    <span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
+                                                </Show>
+                                            </div>
+                                            <Show when=move || !origin_show.is_empty()>
+                                                <div class="muted" style="font-size:11px;white-space:normal">{origin_label.clone()}</div>
                                             </Show>
                                         </td>
                                         <td class="muted">{type_label}</td>
@@ -2393,6 +2444,20 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
             .unwrap_or(Value::Null)
     });
     let name = Signal::derive(move || text(&item.get(), "name", "Metadata in attesa"));
+    // Riga sotto il nome: perché è in download e da quale fonte è arrivato.
+    let origin_line = Signal::derive(move || {
+        let current = item.get();
+        let mut parts = Vec::new();
+        let reason = torrent_reason_label(data, &text(&current, "reason", ""));
+        if !reason.is_empty() {
+            parts.push(format!("{}: {reason}", tr(data, "Perché")));
+        }
+        let source = text(&current, "source", "");
+        if !source.is_empty() {
+            parts.push(format!("{}: {source}", tr(data, "Fonte")));
+        }
+        parts.join(" · ")
+    });
     let state = Signal::derive(move || text(&item.get(), "state", "queued"));
     let state_label = Signal::derive(move || torrent_state_label(&state.get()).0);
     let state_tone = Signal::derive(move || torrent_state_label(&state.get()).1);
@@ -2475,7 +2540,12 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
     view! {
         <tr>
             <td><input type="checkbox" title=ctx_tr("Seleziona il torrent") prop:checked=move || selected.get().contains(&hash_check) on:change=move |_| { let hash = hash_check_toggle.clone(); selected.update(|items| { if items.contains(&hash) { items.retain(|value| value != &hash); } else { items.push(hash); } }); } /></td>
-            <td class="truncate" title=move || name.get()>{move || name.get()}<Show when=move || item.get().get("archived").and_then(Value::as_bool).unwrap_or(false)><span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviati nella cartella NAS")>{ctx_tr("NAS")}</span></Show></td>
+            <td class="truncate" title=move || name.get()>
+                <div>{move || name.get()}<Show when=move || item.get().get("archived").and_then(Value::as_bool).unwrap_or(false)><span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviati nella cartella NAS")>{ctx_tr("NAS")}</span></Show></div>
+                <Show when=move || !origin_line.get().is_empty()>
+                    <div class="muted" style="font-size:11px;white-space:normal;overflow:hidden;text-overflow:ellipsis">{move || origin_line.get()}</div>
+                </Show>
+            </td>
             <td>
                 <Show
                     when=move || seed_infinite.get()
@@ -2824,7 +2894,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                         searched.set(false);
                         results.set(Vec::new());
                         spawn_local(async move {
-                            match send("POST", "/api/tmdb/search", Some(json!({"query": query, "kind": kind}))).await {
+                            match send_timeout("POST", "/api/tmdb/search", Some(json!({"query": query, "kind": kind})), 30_000).await {
                                 Ok(value) => results.set(array(&value, "items")),
                                 Err(err) => {
                                     results.set(Vec::new());

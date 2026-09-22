@@ -62,6 +62,8 @@ pub struct StoredTorrent {
     /// Percorso in libreria/NAS dove la release è stata archiviata (vuoto se non archiviata).
     pub processed_path: String,
     pub error: String,
+    /// Motivo per cui la release era stata messa in download (`approved`, `upgrade`, ...).
+    pub reason: String,
 }
 
 fn stored_torrent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTorrent> {
@@ -85,6 +87,7 @@ fn stored_torrent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTo
         completed_at: row.get(16)?,
         processed_path: row.get(17)?,
         error: row.get(18)?,
+        reason: row.get(19)?,
     })
 }
 
@@ -344,6 +347,8 @@ impl Database {
             "ALTER TABLE torrent_meta ADD COLUMN quality_score INTEGER DEFAULT 0",
             "ALTER TABLE torrent_meta ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'",
             "ALTER TABLE torrent_meta ADD COLUMN error TEXT DEFAULT ''",
+            "ALTER TABLE torrent_meta ADD COLUMN removed_at TEXT",
+            "ALTER TABLE torrent_meta ADD COLUMN reason TEXT DEFAULT ''",
             "ALTER TABLE torrent_meta ADD COLUMN no_rename INTEGER DEFAULT 0",
             "ALTER TABLE torrent_meta ADD COLUMN created_at TEXT",
             "ALTER TABLE series ADD COLUMN timeframe INTEGER DEFAULT 0",
@@ -354,6 +359,19 @@ impl Database {
         ] {
             let _ = self.conn.execute(statement, []);
         }
+        // I torrent già rimossi prima dell'introduzione di `removed_at` devono
+        // comunque comparire nello "Storico download". Non si toccano le righe
+        // concluse ma mai rimosse, che restano in Sessione.
+        let _ = self.conn.execute(
+            "UPDATE torrent_meta SET removed_at=COALESCE(NULLIF(completed_at,''), updated_at) WHERE status='removed' AND removed_at IS NULL",
+            [],
+        );
+        // Le righe registrate prima di salvare la sorgente hanno il dato dentro
+        // `metadata_json`: lo si riporta nella colonna dedicata.
+        let _ = self.conn.execute(
+            "UPDATE torrent_meta SET source=COALESCE(json_extract(metadata_json,'$.release.source'),'') WHERE COALESCE(source,'')='' AND COALESCE(metadata_json,'')<>''",
+            [],
+        );
         Ok(())
     }
 
@@ -768,8 +786,8 @@ impl Database {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO torrent_meta(hash,kind,title,series_name,season,episode,year,quality_score,metadata_json,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?10) ON CONFLICT(hash) DO UPDATE SET kind=excluded.kind,title=excluded.title,series_name=excluded.series_name,season=excluded.season,episode=excluded.episode,year=excluded.year,quality_score=excluded.quality_score,metadata_json=excluded.metadata_json,status=CASE WHEN torrent_meta.status='completed' THEN torrent_meta.status ELSE 'queued' END,updated_at=excluded.updated_at",
-            params![hash, release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), serde_json::to_string(&TorrentMeta { release: release.clone() })?, now],
+            "INSERT INTO torrent_meta(hash,kind,title,series_name,season,episode,year,quality_score,source,metadata_json,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11) ON CONFLICT(hash) DO UPDATE SET kind=excluded.kind,title=excluded.title,series_name=excluded.series_name,season=excluded.season,episode=excluded.episode,year=excluded.year,quality_score=excluded.quality_score,source=excluded.source,metadata_json=excluded.metadata_json,status=CASE WHEN torrent_meta.status='completed' THEN torrent_meta.status ELSE 'queued' END,updated_at=excluded.updated_at",
+            params![hash, release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, serde_json::to_string(&TorrentMeta { release: release.clone() })?, now],
         )?;
         Ok(())
     }
@@ -1338,6 +1356,45 @@ impl Database {
             .flatten())
     }
 
+    /// Motivo per cui la release è stata accettata e messa in download
+    /// (`approved`, `upgrade`, `gap_fill`, `gap_filled`, `manual`, ...). Serve a
+    /// spiegare nei controlli perché un torrent è in sessione.
+    pub fn set_torrent_reason(&self, hash: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE torrent_meta SET reason=?2 WHERE hash=?1",
+            params![hash.to_ascii_lowercase(), reason],
+        )?;
+        Ok(())
+    }
+
+    /// Dati di contorno mostrati sotto il nome del torrent nella sessione:
+    /// `(percorso archiviato, sorgente, motivo del download)`. Una sola query
+    /// per torrent, dato che l'endpoint `/api/torrents` è interrogato di continuo.
+    pub fn torrent_aux(&self, hash: &str) -> Result<(String, String, String)> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(processed_path,''), COALESCE(source,''), COALESCE(reason,'') FROM torrent_meta WHERE hash=?1",
+                [hash.to_ascii_lowercase()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Motivo registrato per un torrent, se presente e non vuoto.
+    pub fn torrent_reason(&self, hash: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(reason,'') FROM torrent_meta WHERE hash=?1",
+                [hash.to_ascii_lowercase()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|value| !value.trim().is_empty()))
+    }
+
     pub fn torrent_status(&self, hash: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -1440,21 +1497,53 @@ impl Database {
             }
             reconciled += 1;
         }
+        // Download **conclusi** non più nella sessione: sono stati "puliti" e
+        // devono comparire nello Storico. Gli incompleti spariti (sopra) restano
+        // invece esclusi, come richiesto.
+        let mut statement = self.conn.prepare(
+            "SELECT hash FROM torrent_meta WHERE status='completed' AND removed_at IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut cleared = Vec::new();
+        for row in rows {
+            let hash = row?;
+            if !live_hashes.contains(&hash.to_ascii_lowercase()) {
+                cleared.push(hash);
+            }
+        }
+        drop(statement);
+        for hash in cleared {
+            let _ = self.mark_torrent_removed_at(&hash);
+        }
         Ok(reconciled)
     }
 
     /// Segna come `removed` un torrent non concluso tolto dalla sessione e
     /// cancella i suoi placeholder non scaricati: evita che resti "in corso"
     /// nel DB e che il candidato venga visto come `active_episode`/`duplicate`.
+    /// Registra anche l'uscita dalla sessione (`removed_at`) per lo Storico.
     pub fn mark_torrent_removed(&self, hash: &str) -> Result<()> {
         let release = self.torrent_meta(hash)?.map(|meta| meta.release);
         self.conn.execute(
             "UPDATE torrent_meta SET status='removed', updated_at=?2 WHERE hash=?1 AND status NOT IN ('completed','error','removed')",
             params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
         )?;
+        self.mark_torrent_removed_at(hash)?;
         if let Some(release) = release {
             self.clear_placeholders(&release.magnet)?;
         }
+        Ok(())
+    }
+
+    /// Registra che un torrent ha lasciato la sessione: è il momento in cui entra
+    /// nello "Storico download". Non altera stato/esito già scritti
+    /// (`completed`/`error`, `processed_path`), quindi serve ai percorsi di
+    /// completamento dove l'esito è già stato deciso.
+    pub fn mark_torrent_removed_at(&self, hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE torrent_meta SET removed_at=?2, updated_at=?2 WHERE hash=?1 AND removed_at IS NULL",
+            params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -1474,15 +1563,16 @@ impl Database {
         self.stored_torrents_query(limit, true)
     }
 
-    /// Download conclusi per la tabella "Storico download".
+    /// Voci della tabella "Storico download": torrent **usciti dalla sessione**
+    /// (puliti con "Pulisci completati", rimossi a mano o rimossi dall'app dopo
+    /// il postprocess). La Sessione mostra invece solo i torrent ancora nel
+    /// client, quindi non c'è più sovrapposizione fra le due viste.
     ///
-    /// Include sia le release completate da Rextto (`status='completed'`, con
-    /// `processed_path` in libreria) sia quelle importate dal legacy che hanno
-    /// raggiunto il 100% ma il cui stato non è stato aggiornato (`progress>=1`).
-    /// I fallimenti (`status='error'` o `error` valorizzato, es. release
-    /// scartata come inferiore) sono esclusi per non confondere lo storico.
-    /// Il nome usa, nell'ordine, `name`,
-    /// `title` o `series_name`: le righe native non popolano `name`.
+    /// Include anche gli esiti negativi (`status='error'`, es. pack scartato
+    /// come inferiore) così l'utente vede *cosa è stato fatto* e il motivo.
+    /// Sono esclusi i download annullati prima di concludersi (`status='removed'`
+    /// con progresso incompleto) e le righe senza nome.
+    /// Il nome usa, nell'ordine, `name`, `title` o `series_name`.
     /// Ritorna `(items_della_pagina, totale)`. `offset` è l'indice di partenza.
     pub fn completed_torrents(
         &self,
@@ -1490,9 +1580,8 @@ impl Database {
         limit: usize,
     ) -> Result<(Vec<StoredTorrent>, i64)> {
         const WHERE: &str = "FROM torrent_meta
-             WHERE status <> 'error'
-               AND COALESCE(error,'') = ''
-               AND (status = 'completed' OR COALESCE(progress,0) >= 1)
+             WHERE removed_at IS NOT NULL
+               AND (status IN ('completed','error') OR COALESCE(progress,0) >= 1)
                AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''";
         let total: i64 = self
             .conn
@@ -1503,9 +1592,9 @@ impl Database {
                     COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),
                     COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,''),
                     COALESCE(kind,''),COALESCE(series_name,''),COALESCE(season,0),COALESCE(episode,0),
-                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,'')
+                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,''),COALESCE(reason,'')
              {WHERE}
-             ORDER BY COALESCE(NULLIF(completed_at,''), updated_at) DESC LIMIT ?1 OFFSET ?2"
+             ORDER BY COALESCE(NULLIF(removed_at,''), NULLIF(completed_at,''), updated_at) DESC LIMIT ?1 OFFSET ?2"
         ))?;
         let rows = statement.query_map(
             [limit.clamp(1, 2000) as i64, offset as i64],
@@ -1528,7 +1617,7 @@ impl Database {
             "SELECT hash,COALESCE(name,''),COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),
                     COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,''),
                     COALESCE(kind,''),COALESCE(series_name,''),COALESCE(season,0),COALESCE(episode,0),
-                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,'')
+                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,''),COALESCE(reason,'')
              FROM torrent_meta WHERE TRIM(COALESCE(name,'')) != '' {filter} ORDER BY updated_at DESC LIMIT ?1"
         ))?;
         let rows = statement.query_map(
