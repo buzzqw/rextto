@@ -89,11 +89,13 @@ pub async fn search_with_timeout(
             };
             match found {
                 Ok(found) => {
+                    crate::logging::source_ok("web", &engine, found.len());
                     tracing::debug!(engine = %engine, query = %query, results = found.len(), "web engine search completed");
                     (found, None)
                 }
                 Err(error) => {
                     let error = crate::utils::redact_url_secrets(&error.to_string());
+                    crate::logging::source_fail("web", &engine, &error);
                     tracing::debug!(engine = %engine, query = %query, error = %error, "web engine search failed");
                     (Vec::new(), Some(engine))
                 }

@@ -381,6 +381,18 @@ label { color: var(--muted); font-size: 0.875rem; }
 .detail { padding: 12px 14px; background: var(--panel-2); border-radius: 8px; margin-top: 8px; }
 pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border-radius: 8px; background: var(--code-bg); color: var(--code-text); font: 0.8125rem/1.6 ui-monospace, monospace; white-space: pre-wrap; }
 .log-view { max-height: 62vh; overflow: auto; padding: 13px; border-radius: var(--radius); background: var(--code-bg); color: var(--code-text); font: 0.8125rem/1.65 ui-monospace, monospace; white-space: pre-wrap; }
+.log-view .log-error { color: var(--danger); }
+.log-view .log-warn { color: var(--warn); }
+.log-view .log-debug { color: var(--muted); }
+.log-view mark { background: rgba(127,127,127,.18); color: inherit; font-weight: 700; border-radius: 3px; padding: 0 2px; }
+.log-view mark.hl-nas { color: var(--label); }
+.log-view mark.hl-dl { color: var(--accent); }
+.log-view mark.hl-ok { color: var(--accent); }
+.log-view mark.hl-err { color: var(--danger); }
+.log-view mark.hl-warn { color: var(--warn); }
+.log-view mark.hl-src { color: var(--label); font-style: italic; }
+.log-view mark.hl-score { color: var(--warn); }
+.log-view mark.hl-filter { color: var(--danger); }
 .toast-host { position: fixed; right: 16px; bottom: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; max-width: min(440px, 90vw); }
 .toast { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--panel); color: var(--text); border: 1px solid var(--line); box-shadow: 0 10px 28px rgba(0,0,0,.28); animation: toast-in .18s ease; }
 .toast span { flex: 1; min-width: 0; }

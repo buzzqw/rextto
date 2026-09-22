@@ -2043,7 +2043,7 @@ async fn series_rename_apply(
                         episode.episode,
                         &target.display().to_string(),
                     ) {
-                        tracing::warn!(%error, "rename: aggiornamento percorso DB fallito");
+                        tracing::warn!(%error, "rename: failed to update DB path");
                     }
                 }
                 items.push(serde_json::json!({
@@ -8761,6 +8761,13 @@ async fn monitor_stalled(
             .lock()
             .unwrap()
             .mark_torrent_error(&torrent.hash, "stalled download");
+        tracing::warn!(
+            hash = %torrent.hash,
+            title = %failed_title,
+            progress = torrent.progress,
+            stall_minutes,
+            "❌ DOWNLOAD FAILED — stalled (no peers or traffic within the timeout)"
+        );
         remove_failed_torrent(torrents, &torrent.hash);
         let _ = notifier.notify_event("download_failed", serde_json::json!({"hash":torrent.hash,"title":failed_title,"error":"stalled download","upgrade_restored":restored})).await;
         watch.remove(&torrent.hash);
@@ -8832,6 +8839,11 @@ async fn monitor_metadata(
                 .lock()
                 .unwrap()
                 .mark_torrent_error(&torrent.hash, "metadata timeout");
+            tracing::warn!(
+                hash = %torrent.hash,
+                giveup_minutes,
+                "❌ DOWNLOAD FAILED — no metadata (dead magnet) within the give-up window"
+            );
             remove_failed_torrent(torrents, &torrent.hash);
             let _ = notifier.notify_event("torrent_error", serde_json::json!({"hash":torrent.hash,"error":"metadata timeout","upgrade_restored":restored})).await;
             wait_start.remove(&torrent.hash);
@@ -8994,7 +9006,13 @@ fn post_seed_relocate(
     }
     match torrents.move_storage(&torrent.hash, &destination) {
         Ok(true) => {
-            tracing::info!(hash=%torrent.hash, from=%current.display(), to=%destination.display(), "post-seeding relocation started")
+            tracing::info!(
+                hash = %torrent.hash,
+                from = %current.display(),
+                to = %destination.display(),
+                size = %crate::logging::human_bytes_i64(torrent.total_size),
+                "📁 MOVING TO NAS — post-seeding relocation"
+            )
         }
         Ok(false) => tracing::debug!(hash=%torrent.hash, "post-seeding relocation was not applied"),
         Err(error) => tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation failed"),
@@ -9143,6 +9161,19 @@ async fn handle_torrent_event(
         // legacy parity: at `add()` the size is unknown and the RAM disk is used
         // first; once metadata arrives the real size decides if it still fits.
         "metadata_received" => {
+            if let Some(torrent) = torrents
+                .list()
+                .into_iter()
+                .find(|torrent| torrent.hash.eq_ignore_ascii_case(&event.hash))
+            {
+                tracing::info!(
+                    hash = %event.hash,
+                    title = %metadata.release.title,
+                    torrent_name = %torrent.name,
+                    size = %crate::logging::human_bytes_i64(torrent.total_size),
+                    "📦 DOWNLOAD METADATA RECEIVED"
+                );
+            }
             enforce_ramdisk_capacity(cfg, torrents, &event);
             false
         }
@@ -9214,9 +9245,12 @@ async fn handle_torrent_event(
                         .collect::<Vec<_>>();
                     tracing::info!(
                         hash = %event.hash,
+                        title = %metadata.release.title,
                         destination = %destination.display(),
+                        size = %crate::logging::human_bytes_i64(size),
+                        episode_count = episodes.len(),
                         episodes = ?episodes,
-                        "season pack postprocess completed"
+                        "🎉 SEASON PACK COMPLETE — archived to NAS"
                     );
                     let notification = notifier.notify_event("season_pack_completed", serde_json::json!({
                         "series": &metadata.release.series,
@@ -9254,9 +9288,9 @@ async fn handle_torrent_event(
                         if let Ok(true) = torrents.remove(&event.hash, false) {
                             let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
                         }
-                        tracing::info!(hash=%event.hash, destination=%destination.display(), size_bytes=size, "season pack moved to archive");
+                        tracing::info!(hash=%event.hash, destination=%destination.display(), size=%crate::logging::human_bytes_i64(size), "📁 SEASON PACK MOVED TO NAS (source removed after rename)");
                     } else {
-                        tracing::info!(hash=%event.hash, destination=%destination.display(), size_bytes=size, "season pack copied flat while source remains available for seeding");
+                        tracing::info!(hash=%event.hash, destination=%destination.display(), size=%crate::logging::human_bytes_i64(size), "📁 SEASON PACK COPIED TO NAS (source kept for seeding)");
                     }
                     true
                 } else {
@@ -9267,6 +9301,13 @@ async fn handle_torrent_event(
                     complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
                 } else if move_requests.insert(event.hash.clone()) {
                     postprocess::validate_destination_from(current, &destination)?;
+                    tracing::info!(
+                        hash = %event.hash,
+                        title = %metadata.release.title,
+                        from = %current.display(),
+                        to = %destination.display(),
+                        "📁 MOVING TO NAS — completed download leaves the work folder"
+                    );
                     if !torrents.move_storage(&event.hash, &destination)? {
                         move_requests.remove(&event.hash);
                     }
@@ -9406,7 +9447,34 @@ async fn complete_torrent(
         &processed_path.display().to_string(),
         size,
     )?;
-    tracing::info!(hash=%event.hash, path=%processed_path.display(), size_bytes=size, renamed=renamed.is_some(), "torrent completion persisted");
+    // Download duration and average speed, reconstructed from the DB timestamps
+    // (the completion alert may arrive after the process restarted).
+    let (duration_seconds, average_speed) = db
+        .lock()
+        .unwrap()
+        .torrent_times(&event.hash)
+        .ok()
+        .flatten()
+        .and_then(|(created, completed)| {
+            let created = crate::utils::parse_timestamp(&created)?;
+            let completed = completed
+                .as_deref()
+                .and_then(crate::utils::parse_timestamp)
+                .unwrap_or_else(chrono::Utc::now);
+            let seconds = (completed - created).num_seconds().max(1);
+            Some((seconds, size.max(1) / seconds))
+        })
+        .unwrap_or((0, 0));
+    tracing::info!(
+        hash = %event.hash,
+        title = %release.title,
+        path = %processed_path.display(),
+        size = %crate::logging::human_bytes_i64(size),
+        duration = %crate::logging::human_duration(duration_seconds),
+        average_speed = %crate::logging::human_rate(average_speed),
+        renamed = renamed.is_some(),
+        "🎉 DOWNLOAD COMPLETE — file processed and saved"
+    );
     // Se il file è stato rinominato o collegato a un file già esistente, i dati
     // del torrent non sono più al nome atteso (o sono un doppione) e libtorrent
     // ripartirebbe da 0: banda sprecata su contenuto già archiviato. Il torrent

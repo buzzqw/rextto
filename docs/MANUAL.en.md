@@ -153,6 +153,11 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
   service state, **indexer reachability**, path permissions, source health,
   recent errors, disks.
 - **Logs** — live SSE stream with text filter, line count and follow/pause.
+  Lines are English and explicitly formatted as `date time  LEVEL [component]
+  message · key: value`, with highlighted keywords (NAS, download, sources,
+  filters, errors). Every cycle prints a **SOURCE REPORT** with each source's
+  outcome, the filter decisions, and the download events (start, metadata,
+  NAS move, completion).
 - **Charts** — CPU/RAM/download/upload/disk/ram-disk sparklines and daily
   consumption.
 - **Activity** — recent torrent events and downloads.

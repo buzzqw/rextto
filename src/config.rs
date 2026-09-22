@@ -989,17 +989,28 @@ impl Config {
     }
 
     pub fn release_allowed(&self, release: &crate::models::Release) -> bool {
+        self.release_denied_reason(release).is_none()
+    }
+
+    /// Human-readable reason a release is refused by the global filters, or
+    /// `None` when it is allowed. Used to make every filter decision visible in
+    /// the log instead of silently dropping releases.
+    pub fn release_denied_reason(&self, release: &crate::models::Release) -> Option<&'static str> {
         if title_is_blacklisted(&release.title, &self.blacklist) {
-            return false;
+            return Some("title matches the blacklist");
         }
         if title_is_content_filtered(&release.title, &self.content_filters) {
-            return false;
+            return Some("title matches a content filter");
         }
-        self.max_release_age_days <= 0
-            || Utc::now()
+        if self.max_release_age_days > 0
+            && Utc::now()
                 .signed_duration_since(release.discovered_at)
                 .num_days()
-                <= self.max_release_age_days
+                > self.max_release_age_days
+        {
+            return Some("older than max_release_age_days");
+        }
+        None
     }
 
     fn load_config_db(&mut self) -> Result<()> {

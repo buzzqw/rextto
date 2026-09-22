@@ -160,6 +160,11 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   Rextto, **raggiungibilità degli indexer**, permessi percorsi, stato sorgenti,
   ultimi errori, dischi.
 - **Log** — stream SSE live con filtro testuale, numero righe e segui/pausa.
+  Le righe sono in inglese e in formato esplicito: `data ora  LIVELLO [componente]
+  messaggio · campo: valore`, con parole chiave evidenziate (NAS, download,
+  sorgenti, filtri, errori). Ogni ciclo stampa un **SOURCE REPORT** con l'esito
+  di ogni sorgente, le decisioni dei filtri, e gli eventi di download (avvio,
+  metadati, spostamento su NAS, completamento).
 - **Grafici** — sparkline CPU/RAM/download/upload/disco/RAM disk e consumo
   giornaliero.
 - **Attività** — eventi torrent recenti e download.

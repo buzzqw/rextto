@@ -15,6 +15,9 @@ use anyhow::Result;
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
 
+/// Visual boundary that makes each cycle easy to locate in the log.
+const CYCLE_DIVIDER: &str = "══════════════════════════════════════════════════════════════";
+
 pub async fn run_cycle(
     cfg: &Config,
     engine: &Engine,
@@ -41,17 +44,11 @@ pub async fn run_cycle_domain(
         last_started_at: Some(Utc::now()),
         ..Default::default()
     };
-    if crate::messages::is_english() {
-        tracing::info!(
-            "🔄 Cycle started (mode: {})",
-            domain.unwrap_or("full")
-        );
-    } else {
-        tracing::info!(
-            "🔄 Ciclo avviato (modalità: {})",
-            domain.unwrap_or("completa")
-        );
-    }
+    tracing::info!("{CYCLE_DIVIDER}");
+    tracing::info!(
+        "🔄 CYCLE STARTED (mode: {})",
+        domain.unwrap_or("full")
+    );
     let comics_interval = comics
         .setting("comics_check_interval", "604800")?
         .parse::<i64>()
@@ -339,17 +336,30 @@ pub async fn run_cycle_domain(
                 .as_deref()
                 .and_then(|name| cfg.find_series_match(name, release.season))
             else {
+                log_candidate_rejected(
+                    &release,
+                    "series not monitored (no match or season ignored)",
+                );
                 continue;
             };
             if !Config::series_release_allowed(series, &release.quality, &release.title) {
+                log_candidate_rejected(
+                    &release,
+                    "excluded by the series quality/language/exclude rules",
+                );
                 continue;
             }
             release.series = Some(series.name.clone());
         } else {
             let Some(movie) = cfg.find_movie_match(&release.title, release.year) else {
+                log_candidate_rejected(&release, "movie not monitored or filtered out");
                 continue;
             };
             if !Config::movie_release_allowed(movie, &release.quality) {
+                log_candidate_rejected(
+                    &release,
+                    "excluded by the movie quality/language/subtitle rules",
+                );
                 continue;
             }
             release.title = movie.name.clone();
@@ -386,6 +396,14 @@ pub async fn run_cycle_domain(
                             && old.quality.score_with_settings(&cfg.settings) >= score
                     }
             }) {
+                tracing::info!(
+                    title = %release.title,
+                    series = %series,
+                    season,
+                    score,
+                    reason = "superseded by an equal or better release already selected",
+                    "🚫 FILTER candidate rejected"
+                );
                 continue;
             }
             best.retain(|old| {
@@ -428,10 +446,7 @@ pub async fn run_cycle_domain(
             best.push(release);
         }
     }
-    tracing::info!(
-        candidates = best.len(),
-        "cycle: candidate releases selected"
-    );
+    tracing::info!("🎯 CANDIDATES — {} release(s) survived the filters", best.len());
     for release in &best {
         tracing::debug!(
             kind = %release.kind,
@@ -457,9 +472,9 @@ pub async fn run_cycle_domain(
         if let Some(free) = crate::libtorrent::free_space_bytes(&cfg.libtorrent_dir) {
             if free < minimum {
                 tracing::warn!(
-                    free_gb = free as f64 / 1_073_741_824.0,
-                    min_gb = minimum as f64 / 1_073_741_824.0,
-                    "cycle: spazio libero sotto min_free_space_gb, download saltati"
+                    free = %crate::logging::human_bytes(free),
+                    minimum = %crate::logging::human_bytes(minimum),
+                    "cycle: free space below min_free_space_gb, downloads skipped"
                 );
                 stats.error("min_free_space");
                 return Ok(stats);
@@ -571,7 +586,7 @@ pub async fn run_cycle_domain(
                         approval_reason = %approval_reason,
                         gap_episodes = ?gap_episodes,
                         hash = ?magnet_hash(&release.magnet),
-                        "download started"
+                        "📥 DOWNLOAD STARTED"
                     );
                     db.lock().unwrap().register_torrent(&release)?;
                     if let Some(hash) = magnet_hash(&release.magnet) {
@@ -628,7 +643,7 @@ pub async fn run_cycle_domain(
                 }
             }
         } else {
-            tracing::debug!(
+            tracing::info!(
                 kind = %release.kind,
                 series = ?release.series,
                 season = ?release.season,
@@ -639,42 +654,39 @@ pub async fn run_cycle_domain(
                 reason = %decision_reason,
                 approval_reason = %approval_reason,
                 gap_episodes = ?gap_episodes,
-                "candidate skipped"
+                "⏭️ FILTER download skipped"
             );
         }
     }
     db.lock().unwrap().save_cycle(&stats)?;
     let started = stats.last_started_at.unwrap_or_else(Utc::now);
     let elapsed = (Utc::now() - started).num_seconds().max(0);
-    if crate::messages::is_english() {
-        tracing::info!(
-            "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} | gaps filled: {} | errors: {}",
-            human_duration(elapsed),
-            stats.scraped,
-            stats.candidates,
-            stats.downloads_started,
-            stats.gaps_filled,
-            stats.errors
-        );
-    } else {
-        tracing::info!(
-            "📊 CYCLE REPORT — durata {} — scraping: {} | candidati: {} | download avviati: {} | gap riempiti: {} | errori: {}",
-            human_duration(elapsed),
-            stats.scraped,
-            stats.candidates,
-            stats.downloads_started,
-            stats.gaps_filled,
-            stats.errors
-        );
-    }
+    tracing::info!(
+        "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} | gaps filled: {} | errors: {}",
+        human_duration(elapsed),
+        stats.scraped,
+        stats.candidates,
+        stats.downloads_started,
+        stats.gaps_filled,
+        stats.errors
+    );
     if stats.downloads_started == 0 {
-        if crate::messages::is_english() {
-            tracing::info!("💤 No downloads in this cycle");
-        } else {
-            tracing::info!("💤 Nessun download in questo ciclo");
-        }
+        tracing::info!("💤 No downloads in this cycle");
     }
+    tracing::info!("{CYCLE_DIVIDER}");
     Ok(stats)
+}
+
+/// Logs a release refused during candidate selection so the user can see which
+/// filters dropped what, and why, without enabling debug logging.
+fn log_candidate_rejected(release: &Release, reason: &str) {
+    tracing::info!(
+        kind = %release.kind,
+        title = %release.title,
+        source = %release.source,
+        reason,
+        "🚫 FILTER candidate rejected"
+    );
 }
 
 fn human_duration(seconds: i64) -> String {

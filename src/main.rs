@@ -117,7 +117,8 @@ async fn main() -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_timer(rextto::logging::LocalTime)
+                .event_format(rextto::logging::ReadableFormat)
+                .fmt_fields(rextto::logging::ReadableFields)
                 .with_writer(log_writer),
         )
         .init();

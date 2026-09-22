@@ -41,12 +41,13 @@ impl Engine {
         let max_pages = cfg.feed_max_pages();
         let max_age_days = cfg.max_release_age_days;
         let old_ratio = cfg.stop_on_old_page_ratio();
-        let phase1 = if crate::messages::is_english() {
-            format!("🔎 Step 1/2: scanning {} sources (HTML/RSS feeds)", cfg.feed_urls.len())
-        } else {
-            format!("🔎 Fase 1/2: scansione di {} sorgenti (feed HTML/RSS)", cfg.feed_urls.len())
-        };
-        tracing::info!("{phase1}");
+        // Each cycle reports only its own sources: drop anything accumulated
+        // since the previous drain (e.g. manual searches from the UI).
+        let _ = crate::logging::take_source_stats();
+        tracing::info!(
+            "🔎 Step 1/2: scanning {} sources (HTML/RSS feeds)",
+            cfg.feed_urls.len()
+        );
         let mut feed_set = tokio::task::JoinSet::new();
         let mut feed_iter = cfg.feed_urls.clone().into_iter();
         let schedule_feed = |set: &mut tokio::task::JoinSet<Result<Vec<Release>>>,
@@ -67,9 +68,14 @@ impl Engine {
                     .await;
                     match &result {
                         Ok(items) => {
+                            crate::logging::source_ok("feed", &feed, items.len());
                             tracing::debug!(feed = %feed, items = items.len(), "rss feed analyzed")
                         }
-                        Err(error) => tracing::warn!(feed = %feed, %error, "rss feed failed"),
+                        Err(error) => {
+                            let message = crate::utils::redact_url_secrets(&error.to_string());
+                            crate::logging::source_fail("feed", &feed, &message);
+                            tracing::warn!(feed = %feed, error = %message, "rss feed failed")
+                        }
                     }
                     result
                 });
@@ -104,16 +110,14 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(" | ");
         let breakdown = if breakdown.is_empty() {
-            crate::messages::pick("nessuna", "none").to_string()
+            "none".to_string()
         } else {
             breakdown
         };
-        let sources_summary = if crate::messages::is_english() {
-            format!("🌐 Sources: {feeds_releases} releases from {} feeds — {breakdown}", cfg.feed_urls.len())
-        } else {
-            format!("🌐 Sorgenti: {feeds_releases} release da {} feed — {breakdown}", cfg.feed_urls.len())
-        };
-        tracing::info!("{sources_summary}");
+        tracing::info!(
+            "🌐 Sources: {feeds_releases} releases from {} feeds — {breakdown}",
+            cfg.feed_urls.len()
+        );
         // Persist the detail-page cache right after the feed phase: the indexer
         // searches below can take minutes, and a restart would otherwise throw
         // away every magnet resolved in this cycle.
@@ -136,12 +140,10 @@ impl Engine {
             targets.push((format!("{} {}", movie.name, movie.year), Vec::new()));
         }
         let targets_total = targets.len();
-        let phase2 = if crate::messages::is_english() {
-            format!("🔎 Step 2/2: searching {} series/movies (Torznab indexers + web engines)", targets_total)
-        } else {
-            format!("🔎 Fase 2/2: ricerca su {} serie/film (indexer Torznab + motori web)", targets_total)
-        };
-        tracing::info!("{phase2}");
+        tracing::info!(
+            "🔎 Step 2/2: searching {} series/movies (Torznab indexers + web engines)",
+            targets_total
+        );
         let cfg = Arc::new(cfg.clone());
         let mut set = tokio::task::JoinSet::new();
         let mut iter = targets.into_iter();
@@ -163,12 +165,11 @@ impl Engine {
             }
             schedule(&mut set, &mut iter);
         }
-        let search_summary = if crate::messages::is_english() {
-            format!("🔎 Indexer/web search: {} releases from {} queries (series+movies)", all.len().saturating_sub(feeds_releases), targets_total)
-        } else {
-            format!("🔎 Ricerca indexer/web: {} release da {} query (serie+film)", all.len().saturating_sub(feeds_releases), targets_total)
-        };
-        tracing::info!("{search_summary}");
+        tracing::info!(
+            "🔎 Indexer/web search: {} releases from {} queries (series+movies)",
+            all.len().saturating_sub(feeds_releases),
+            targets_total
+        );
         let engine_failures = websearch::take_engine_failures();
         if !engine_failures.is_empty() {
             let detail = engine_failures
@@ -176,22 +177,43 @@ impl Engine {
                 .map(|(engine, count)| format!("{engine} ({count})"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            if crate::messages::is_english() {
-                tracing::warn!("⚠️ Unreachable web engines this cycle: {detail}");
-            } else {
-                tracing::warn!("⚠️ Motori web non raggiungibili in questo ciclo: {detail}");
-            }
+            tracing::warn!("⚠️ Unreachable web engines this cycle: {detail}");
         }
         let mut seen = std::collections::HashSet::new();
-        all.retain(|release| {
-            cfg.release_allowed(release)
-                && magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
-        });
-        if crate::messages::is_english() {
-            tracing::info!("✅ Scraping: {} unique releases after filters", all.len());
-        } else {
-            tracing::info!("✅ Scraping: {} release uniche dopo i filtri", all.len());
+        let mut kept = Vec::with_capacity(all.len());
+        for release in std::mem::take(&mut all) {
+            if let Some(reason) = cfg.release_denied_reason(&release) {
+                tracing::info!(
+                    title = %release.title,
+                    source = %release.source,
+                    reason,
+                    "🚫 FILTER rejected"
+                );
+                continue;
+            }
+            let Some(hash) = magnet_hash(&release.magnet) else {
+                tracing::info!(
+                    title = %release.title,
+                    source = %release.source,
+                    reason = "missing magnet hash",
+                    "🚫 FILTER rejected"
+                );
+                continue;
+            };
+            if !seen.insert(hash) {
+                tracing::debug!(
+                    title = %release.title,
+                    source = %release.source,
+                    reason = "duplicate infohash",
+                    "filter skipped duplicate"
+                );
+                continue;
+            }
+            kept.push(release);
         }
+        all = kept;
+        tracing::info!("✅ Scraping: {} unique releases after filters", all.len());
+        print_source_report();
         crate::cache::save();
         Ok(all)
     }
@@ -267,11 +289,13 @@ async fn search_one(
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((name, query, Ok(items))) => {
+                    crate::logging::source_ok("indexer", &name, items.len());
                     tracing::debug!(indexer = %name, results = items.len(), query, "indexer search completed");
                     results.extend(items);
                 }
                 Ok((name, query, Err(error))) => {
                     let error = crate::utils::redact_url_secrets(&error.to_string());
+                    crate::logging::source_fail("indexer", &name, &error);
                     tracing::warn!(indexer = %name, query, error = %error, "indexer search failed");
                 }
                 Err(error) => tracing::warn!(%error, "indexer search task failed"),
@@ -323,6 +347,40 @@ async fn search_one(
 #[allow(dead_code)]
 fn _indexer_name(indexer: &IndexerConfig) -> &str {
     &indexer.name
+}
+
+/// One readable line per source (feed, indexer, web engine) telling the user
+/// whether it worked and how many releases it produced. Aggregated per cycle:
+/// attempts are repeated for every query, so a raw per-attempt log would flood.
+fn print_source_report() {
+    let stats = crate::logging::take_source_stats();
+    if stats.is_empty() {
+        return;
+    }
+    tracing::info!("📡 SOURCE REPORT — outcomes of every source in this cycle");
+    for (kind, name, stat) in stats {
+        if stat.fail == 0 {
+            tracing::info!(
+                "   ✅ [{kind}] {name}: {} run(s), {} releases",
+                stat.ok,
+                stat.results
+            );
+        } else if stat.ok == 0 {
+            tracing::warn!(
+                "   ❌ [{kind}] {name}: {} failure(s) — {}",
+                stat.fail,
+                stat.last_error.as_deref().unwrap_or("unknown error")
+            );
+        } else {
+            tracing::warn!(
+                "   ⚠️ [{kind}] {name}: {} ok / {} failed, {} releases — {}",
+                stat.ok,
+                stat.fail,
+                stat.results,
+                stat.last_error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
 }
 
 fn feed_label(url: &str) -> String {

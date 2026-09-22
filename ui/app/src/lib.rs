@@ -7442,6 +7442,95 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
     }
 }
 
+/// Escapes HTML metacharacters so raw log lines can be injected with `inner_html`.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Turns a raw log line into HTML: colourises the record level and highlights
+/// the meaningful keywords (NAS, download, sources, errors, filters, scores) so
+/// the viewer is scannable at a glance.
+fn highlight_log_line(line: &str) -> String {
+    const KEYWORDS: &[(&str, &str)] = &[
+        ("source report", "hl-src"),
+        ("nas", "hl-nas"),
+        ("download", "hl-dl"),
+        ("indexer", "hl-src"),
+        ("feed", "hl-src"),
+        ("engine", "hl-src"),
+        ("scraping", "hl-src"),
+        ("error", "hl-err"),
+        ("failed", "hl-err"),
+        ("failure", "hl-err"),
+        ("stalled", "hl-warn"),
+        ("warning", "hl-warn"),
+        ("completed", "hl-ok"),
+        ("complete", "hl-ok"),
+        ("archived", "hl-ok"),
+        ("moved", "hl-ok"),
+        ("approved", "hl-ok"),
+        ("upgrade", "hl-score"),
+        ("score", "hl-score"),
+        ("filter", "hl-filter"),
+        ("rejected", "hl-filter"),
+        ("skipped", "hl-filter"),
+        ("blocklist", "hl-filter"),
+    ];
+    let lower = line.to_ascii_lowercase();
+    let mut body = String::with_capacity(line.len() + 32);
+    let mut index = 0;
+    while index < line.len() {
+        let mut best: Option<(usize, &str)> = None;
+        for &(keyword, class) in KEYWORDS {
+            if lower[index..].starts_with(keyword)
+                && best.map_or(true, |(len, _)| keyword.len() > len)
+            {
+                best = Some((keyword.len(), class));
+            }
+        }
+        if let Some((len, class)) = best {
+            let matched = &line[index..index + len];
+            body.push_str("<mark class=\"");
+            body.push_str(class);
+            body.push_str("\">");
+            body.push_str(&escape_html(matched));
+            body.push_str("</mark>");
+            index += len;
+        } else {
+            let ch = line[index..].chars().next().unwrap();
+            let end = index + ch.len_utf8();
+            body.push_str(&escape_html(&line[index..end]));
+            index = end;
+        }
+    }
+    let class = if line.contains(" ERROR ") {
+        "log-error"
+    } else if line.contains(" WARN ") {
+        "log-warn"
+    } else if line.contains(" INFO ") {
+        "log-info"
+    } else if line.contains(" DEBUG ") || line.contains(" TRACE ") {
+        "log-debug"
+    } else {
+        ""
+    };
+    if class.is_empty() {
+        body
+    } else {
+        format!("<span class=\"{class}\">{body}</span>")
+    }
+}
+
 #[component]
 fn LogsView(data: RwSignal<Data>) -> impl IntoView {
     let _ = data;
@@ -7488,7 +7577,7 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
             .get()
             .iter()
             .filter(|line| term.is_empty() || line.to_ascii_lowercase().contains(&term))
-            .cloned()
+            .map(|line| highlight_log_line(line))
             .collect::<Vec<_>>()
     });
     Effect::new(move |_| {
@@ -7510,7 +7599,7 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
                     </button>
                     <small class="muted">{move || format!("{} righe", filtered.get().len())}</small>
                 </div>
-                <pre class="log-view" node_ref=log_ref>{move || filtered.get().join("\n")}</pre>
+                <pre class="log-view" node_ref=log_ref inner_html=move || filtered.get().join("\n")></pre>
             </Panel>
         </div>
     }

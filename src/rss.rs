@@ -896,7 +896,7 @@ pub async fn fetch_torznab_flaresolverr(
                 return Err(error.into());
             };
             let error = crate::utils::redact_url_secrets(&error.to_string());
-            tracing::info!(indexer = %indexer.name, error = %error, "torznab bloccato, riprovo via FlareSolverr");
+            tracing::info!(indexer = %indexer.name, error = %error, "torznab blocked, retrying via FlareSolverr");
             let body = fetch_with_flaresolverr(client, flaresolverr, &full_url).await?;
             let content_type = if body.trim_start().starts_with('[') {
                 "application/json".to_string()
