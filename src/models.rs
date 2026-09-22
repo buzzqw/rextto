@@ -274,6 +274,29 @@ impl ArchiveQualityIndex {
     }
 }
 
+/// Torrent attualmente nella sessione libtorrent (non solo nel DB): serve a
+/// bloccare una release già in corso, come `LibtorrentClient.list_torrents`
+/// del legacy.
+#[derive(Debug, Clone, Default)]
+pub struct LiveDownloads {
+    pub hashes: std::collections::HashSet<String>,
+    pub episodes: std::collections::HashSet<(String, i64, i64)>,
+}
+
+impl LiveDownloads {
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty() && self.episodes.is_empty()
+    }
+}
+
+/// Dati extra per la decisione di approvazione: cosa c'è su disco (archivio) e
+/// cosa c'è già in download (sessione live).
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalContext {
+    pub archive: ArchiveQualityIndex,
+    pub live: LiveDownloads,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
     pub title: String,

@@ -268,6 +268,18 @@ impl Database {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, seasons TEXT DEFAULT '1+', quality TEXT DEFAULT '', language TEXT DEFAULT 'ita', enabled INTEGER DEFAULT 1, archive_path TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', aliases TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY, series_id INTEGER NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, title TEXT, quality_score INTEGER NOT NULL DEFAULT 0, is_repack INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, archive_path TEXT, size_bytes INTEGER DEFAULT 0, original_title TEXT, rename_verified INTEGER DEFAULT 0, UNIQUE(series_id, season, episode)); CREATE TABLE IF NOT EXISTS movies (id INTEGER PRIMARY KEY, name TEXT, year INTEGER, title TEXT, quality_score INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, size_bytes INTEGER DEFAULT 0, removed_at TEXT); CREATE TABLE IF NOT EXISTS pending_downloads (id INTEGER PRIMARY KEY, series_id INTEGER, season INTEGER, episode INTEGER, best_magnet TEXT, best_quality_score INTEGER, ready_at TEXT); CREATE TABLE IF NOT EXISTS cycle_history (id INTEGER PRIMARY KEY, at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS torrent_meta (hash TEXT PRIMARY KEY, tag TEXT DEFAULT '', source TEXT DEFAULT '', ui_state TEXT DEFAULT '', progress REAL DEFAULT 0, paused INTEGER DEFAULT 0, total_size INTEGER DEFAULT 0, downloaded INTEGER DEFAULT 0, name TEXT DEFAULT '', kind TEXT DEFAULT '', title TEXT DEFAULT '', series_name TEXT DEFAULT '', season INTEGER, episode INTEGER, year INTEGER, quality_score INTEGER DEFAULT 0, metadata_json TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', completed_at TEXT, processed_path TEXT, error TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_episodes_lookup ON episodes(series_id, season, episode); CREATE INDEX IF NOT EXISTS idx_episodes_magnet ON episodes(magnet_hash); CREATE INDEX IF NOT EXISTS idx_episodes_downloaded ON episodes(downloaded_at); CREATE INDEX IF NOT EXISTS idx_movies_magnet ON movies(magnet_hash); CREATE INDEX IF NOT EXISTS idx_movies_removed ON movies(removed_at); CREATE INDEX IF NOT EXISTS idx_torrent_meta_status ON torrent_meta(status); INSERT INTO schema_meta(key,value,updated_at) VALUES ('schema_version','2',datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at;")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS gap_search_log (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, last_searched_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS series_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode_count INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season)); CREATE TABLE IF NOT EXISTS ignored_episodes (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS upgrade_backup (new_hash TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS blocklist (magnet_hash TEXT PRIMARY KEY, title TEXT DEFAULT '', reason TEXT DEFAULT '', created_at TEXT NOT NULL);")?;
+        // Identità della release bloccata (come il legacy `download_blocklist`):
+        // hash + serie/stagione/episodio o film/anno, per audit e UI.
+        for statement in [
+            "ALTER TABLE blocklist ADD COLUMN kind TEXT DEFAULT ''",
+            "ALTER TABLE blocklist ADD COLUMN series_name TEXT DEFAULT ''",
+            "ALTER TABLE blocklist ADD COLUMN season INTEGER",
+            "ALTER TABLE blocklist ADD COLUMN episode INTEGER",
+            "ALTER TABLE blocklist ADD COLUMN movie_name TEXT DEFAULT ''",
+            "ALTER TABLE blocklist ADD COLUMN movie_year INTEGER",
+        ] {
+            let _ = self.conn.execute(statement, []);
+        }
         // "Visti nei feed": tutte le release che passano dalle sorgenti, non solo
         // quelle in libreria. Tabelle separate per film e serie, con chiave di
         // raggruppamento calcolata in Rust per unire le release dello stesso titolo.
@@ -353,7 +365,7 @@ impl Database {
             release,
             release.quality.score(),
             Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF,
-            &crate::models::ArchiveQualityIndex::default(),
+            &crate::models::ApprovalContext::default(),
         )
     }
 
@@ -362,14 +374,19 @@ impl Database {
         release: &Release,
         score: i64,
         min_score_diff: i64,
-        archive: &crate::models::ArchiveQualityIndex,
+        context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
             return Ok((false, "blocklisted".into()));
         }
+        // Protezione download attivi (parità col client live del legacy): mai
+        // riproporre un hash già nella sessione.
+        if context.live.hashes.contains(&hash) {
+            return Ok((false, "active_episode".into()));
+        }
         if release.is_pack {
-            return self.check_series_pack(release, &hash, score, min_score_diff, archive);
+            return self.check_series_pack(release, &hash, score, min_score_diff, context);
         }
         let season = release.season.context("series release has no season")?;
         let episode = release.episode.context("series release has no episode")?;
@@ -383,6 +400,13 @@ impl Database {
             params![series_name],
             |r| r.get(0),
         )?;
+        if context.live.episodes.contains(&(
+            crate::parser::normalize_series_name(series_name),
+            season,
+            episode,
+        )) {
+            return Ok((false, "active_episode".into()));
+        }
         if self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
         // Considera duplicato solo un episodio già scaricato/archiviato: una
         // riga placeholder (downloaded_at NULL) non deve impedire un retry.
@@ -398,7 +422,7 @@ impl Database {
         // su disco c'è già un file di qualità uguale o superiore, non scaricare
         // anche se il DB non lo conosce. Se il file su disco è inferiore, il
         // candidato resta valido.
-        if let Some((disk_quality, disk_score)) = archive.best_for(season, episode) {
+        if let Some((disk_quality, disk_score)) = context.archive.best_for(season, episode) {
             let db_score = db_row.as_ref().map(|(_, value, _)| *value).unwrap_or(i64::MIN);
             if *disk_score > db_score
                 && release
@@ -454,7 +478,7 @@ impl Database {
         hash: &str,
         score: i64,
         min_score_diff: i64,
-        archive: &crate::models::ArchiveQualityIndex,
+        context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
         let season = release.season.context("season pack has no season")?;
         let series_name = release.series.as_deref().unwrap_or(&release.title);
@@ -518,12 +542,17 @@ impl Database {
             |row| row.get::<_, bool>(0),
         )?;
         for episode in &targets {
-            // Non toccare gli episodi con un download ancora attivo.
+            // Non toccare gli episodi con un download ancora attivo (DB o sessione).
             let active = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))",
                 params![series_name, season, episode],
                 |row| row.get::<_, bool>(0),
-            ).unwrap_or(false);
+            ).unwrap_or(false)
+                || context.live.episodes.contains(&(
+                    crate::parser::normalize_series_name(series_name),
+                    season,
+                    *episode,
+                ));
             if active {
                 continue;
             }
@@ -536,7 +565,7 @@ impl Database {
                 None => {
                     // File già su disco (non nel DB) con qualità uguale o
                     // superiore: episodio coperto, inutile scaricare il pack.
-                    if let Some((disk_quality, disk_score)) = archive.best_for(season, *episode) {
+                    if let Some((disk_quality, disk_score)) = context.archive.best_for(season, *episode) {
                         if release
                             .quality
                             .upgrade_reason(disk_quality, score, *disk_score, min_score_diff)
@@ -556,7 +585,7 @@ impl Database {
                 }
                 Some((id, existing_score, existing_title)) => {
                     // Confronta col migliore tra la riga DB e il file su disco.
-                    let (old_quality, old_score) = match archive.best_for(season, *episode) {
+                    let (old_quality, old_score) = match context.archive.best_for(season, *episode) {
                         Some((disk_quality, disk_score)) if *disk_score > existing_score => {
                             (disk_quality.clone(), *disk_score)
                         }
@@ -726,12 +755,45 @@ impl Database {
     }
     pub fn blocklist(&self, release: &Release, reason: &str) -> Result<()> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
-        self.conn.execute("INSERT OR REPLACE INTO blocklist(magnet_hash,title,reason,created_at) VALUES (?1,?2,?3,?4)", params![hash, release.title, reason, Utc::now().to_rfc3339()])?;
+        // Per un film `series` è None: l'identità utile è nome/anno del film.
+        let (movie_name, movie_year) = if release.kind == "movie" {
+            (release.title.clone(), release.year)
+        } else {
+            (String::new(), None)
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO blocklist(magnet_hash,title,reason,created_at,kind,series_name,season,episode,movie_name,movie_year) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                hash,
+                release.title,
+                reason,
+                Utc::now().to_rfc3339(),
+                release.kind,
+                release.series,
+                release.season,
+                release.episode,
+                movie_name,
+                movie_year
+            ],
+        )?;
         Ok(())
     }
     pub fn blocklist_entries(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
-        let mut statement = self.conn.prepare("SELECT magnet_hash,title,reason,created_at FROM blocklist ORDER BY created_at DESC LIMIT ?1")?;
-        let rows = statement.query_map([limit.clamp(1, 1000)], |row| Ok(serde_json::json!({"hash":row.get::<_, String>(0)?,"title":row.get::<_, String>(1)?,"reason":row.get::<_, String>(2)?,"created_at":row.get::<_, String>(3)?})))?;
+        let mut statement = self.conn.prepare("SELECT magnet_hash,title,reason,created_at,COALESCE(kind,''),COALESCE(series_name,''),season,episode,COALESCE(movie_name,''),movie_year FROM blocklist ORDER BY created_at DESC LIMIT ?1")?;
+        let rows = statement.query_map([limit.clamp(1, 1000)], |row| {
+            Ok(serde_json::json!({
+                "hash": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "reason": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, String>(3)?,
+                "kind": row.get::<_, String>(4)?,
+                "series_name": row.get::<_, String>(5)?,
+                "season": row.get::<_, Option<i64>>(6)?,
+                "episode": row.get::<_, Option<i64>>(7)?,
+                "movie_name": row.get::<_, String>(8)?,
+                "movie_year": row.get::<_, Option<i64>>(9)?,
+            }))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn remove_blocklist(&self, hash: &str) -> Result<bool> {
@@ -2385,7 +2447,7 @@ mod tests {
                 &fallback_hash,
                 score,
                 200,
-                &crate::models::ArchiveQualityIndex::default(),
+                &crate::models::ApprovalContext::default(),
             )
             .unwrap();
         assert!(approved, "il 1080p deve essere approvato: {reason}");
@@ -2421,7 +2483,13 @@ mod tests {
                 2000,
             ),
         );
-        let (approved, reason) = db.check_series_scored(&release, score, 200, &index).unwrap();
+        let context = crate::models::ApprovalContext {
+            archive: index,
+            live: crate::models::LiveDownloads::default(),
+        };
+        let (approved, reason) = db
+            .check_series_scored(&release, score, 200, &context)
+            .unwrap();
         assert!(!approved, "atteso duplicate dal disco, ottenuto {reason}");
 
         // Senza indice (nessun file su disco) il candidato è approvato.
@@ -2430,10 +2498,56 @@ mod tests {
                 &release,
                 score,
                 200,
-                &crate::models::ArchiveQualityIndex::default(),
+                &crate::models::ApprovalContext::default(),
             )
             .unwrap();
         assert!(approved);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn live_session_blocks_episode_already_downloading() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-live-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let release = release();
+        let score = release.quality.score();
+
+        let mut live = crate::models::LiveDownloads::default();
+        live.episodes
+            .insert((crate::parser::normalize_series_name("Example"), 1, 1));
+        let context = crate::models::ApprovalContext {
+            archive: Default::default(),
+            live,
+        };
+        let (approved, reason) = db
+            .check_series_scored(&release, score, 200, &context)
+            .unwrap();
+        assert!(!approved, "atteso active_episode, ottenuto {reason}");
+        assert_eq!(reason, "active_episode");
+
+        // Stesso hash vivo → bloccato anche da solo.
+        let mut live = crate::models::LiveDownloads::default();
+        live.hashes.insert(
+            magnet_hash(&release.magnet).unwrap().to_ascii_lowercase(),
+        );
+        let context = crate::models::ApprovalContext {
+            archive: Default::default(),
+            live,
+        };
+        let (approved, reason) = db
+            .check_series_scored(&release, score, 200, &context)
+            .unwrap();
+        assert!(!approved, "atteso active_episode per hash, ottenuto {reason}");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -2892,7 +3006,7 @@ mod tests {
         };
         let score = pack.quality.score();
         assert!(score < 1510, "il pack 1080p deve avere score inferiore");
-        let (approved, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
+        let (approved, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ApprovalContext::default()).unwrap();
         assert!(!approved, "pack inferiore non deve essere approvato");
         assert_eq!(reason, "duplicate");
 
@@ -2901,7 +3015,7 @@ mod tests {
         gap.season = Some(5);
         gap.title = "Reacher - Season 05 (2027) [1080p H265 ITA ENG]".into();
         gap.magnet = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".into();
-        let (approved_gap, _) = db.check_series_scored(&gap, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
+        let (approved_gap, _) = db.check_series_scored(&gap, score, 50, &crate::models::ApprovalContext::default()).unwrap();
         assert!(approved_gap, "pack per stagione vuota deve essere approvato");
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -2958,7 +3072,7 @@ mod tests {
         };
         let score = pack.quality.score();
         // Retry consentito: i placeholder non sono "già scaricati".
-        let (approved, _) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
+        let (approved, _) = db.check_series_scored(&pack, score, 50, &crate::models::ApprovalContext::default()).unwrap();
         assert!(approved, "un placeholder non scaricato non deve bloccare il retry");
         // Ora l'episodio risulta scaricato: stesso magnet -> duplicato.
         db.conn
@@ -2967,7 +3081,7 @@ mod tests {
                 params![hash, magnet],
             )
             .unwrap();
-        let (approved_again, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
+        let (approved_again, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ApprovalContext::default()).unwrap();
         assert!(!approved_again);
         assert_eq!(reason, "duplicate");
         drop(db);

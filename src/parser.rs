@@ -167,6 +167,26 @@ fn leet_fold(value: &str) -> String {
         .collect()
 }
 
+/// Chiave `(nome serie normalizzato, stagione, episodio)` da un nome file o
+/// titolo di release. Usata per confrontare le release coi torrent già attivi
+/// nella sessione.
+pub fn parse_episode_key(name: &str) -> Option<(String, i64, i64)> {
+    let pattern = crate::utils::cached_regex(
+        r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<s>\d{1,2})e|(?P<ns>\d{1,2})x)(?P<e>\d{1,4})",
+    )
+    .ok()?;
+    let captures = pattern.captures(name)?;
+    let series = normalize_series_name(captures.name("name")?.as_str());
+    let season = captures
+        .name("s")
+        .or_else(|| captures.name("ns"))?
+        .as_str()
+        .parse::<i64>()
+        .ok()?;
+    let episode = captures.name("e")?.as_str().parse::<i64>().ok()?;
+    Some((series, season, episode))
+}
+
 pub fn parse_quality(title: &str) -> Quality {
     let low = title.to_lowercase();
     // legacy normalisations: `t_norm` replaces [._-] with spaces; `t_norm_lang`
@@ -673,6 +693,23 @@ mod tests {
         // Anno "nudo" e serie intitolate a un anno restano distinti.
         assert!(series_names_match("1923", "1923"));
         assert!(!series_names_match("1923", "1883"));
+    }
+
+    #[test]
+    fn parses_episode_key_from_release_name() {
+        assert_eq!(
+            parse_episode_key("Neagley.S01E05.Trip.2160p.WEB-DL.mkv"),
+            Some(("neagley".to_string(), 1, 5))
+        );
+        assert_eq!(
+            parse_episode_key("PLUR1BUS (2025) - S01E01 - We Is Us.mkv"),
+            Some(("plur1bus (2025)".to_string(), 1, 1))
+        );
+        assert_eq!(
+            parse_episode_key("Example 2x03 Title.mkv"),
+            Some(("example".to_string(), 2, 3))
+        );
+        assert!(parse_episode_key("Movie.2026.1080p.mkv").is_none());
     }
 
     #[test]

@@ -774,6 +774,37 @@ impl Config {
         })
     }
 
+    /// Cartella archivio effettiva di una serie: `archive_path` se configurato,
+    /// altrimenti una sottocartella di `archive_root` il cui nome matcha la serie
+    /// (o un alias). Porting dell'auto-detect del legacy: serve sia alla
+    /// destinazione dei download sia alla scansione dei file su disco.
+    pub fn resolve_archive_path(&self, series: &SeriesConfig) -> Option<std::path::PathBuf> {
+        let configured = series.archive_path.trim();
+        if !configured.is_empty() {
+            return Some(std::path::PathBuf::from(configured));
+        }
+        let root = self.archive_root.as_deref()?;
+        let entries = std::fs::read_dir(root).ok()?;
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let matches = crate::parser::series_names_match(&series.name, &name)
+                || series
+                    .aliases
+                    .iter()
+                    .any(|alias| crate::parser::series_names_match(alias, &name));
+            if matches {
+                candidates.push(path);
+            }
+        }
+        candidates.sort();
+        candidates.into_iter().next()
+    }
+
     fn season_allowed(specification: &str, season: i64) -> bool {
         let specification = specification.trim();
         if specification.is_empty() || specification == "*" {
@@ -1630,6 +1661,44 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_archive_path_auto_detects_series_folder() {
+        let root = std::env::temp_dir().join(format!("rextto-archive-{}", uuid::Uuid::new_v4()));
+        let base = root.join("archive-root");
+        std::fs::create_dir_all(base.join("Example Show")).unwrap();
+        let mut cfg = Config::default();
+        cfg.archive_root = Some(base.clone());
+
+        let series = SeriesConfig {
+            name: "Example Show".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_archive_path(&series),
+            Some(base.join("Example Show"))
+        );
+
+        // `archive_path` configurato ha la priorità sull'auto-detect.
+        let configured = SeriesConfig {
+            name: "Example Show".into(),
+            archive_path: "/custom/path".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolve_archive_path(&configured),
+            Some(std::path::PathBuf::from("/custom/path"))
+        );
+
+        // Nessuna cartella corrispondente: nessun risultato.
+        let other = SeriesConfig {
+            name: "Altra Serie".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_archive_path(&other), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn prepare_dirs_does_not_create_the_import_source() {

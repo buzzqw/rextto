@@ -47,18 +47,21 @@ pub fn destination_for(release: &Release, cfg: &Config) -> Option<PathBuf> {
         }
     }
     if release.kind == "series" {
-        let series = release
+        if let Some(series) = release
             .series
             .as_deref()
-            .and_then(|name| cfg.find_series_match(name, release.season))?;
-        if !series.archive_path.trim().is_empty() {
-            let destination = PathBuf::from(series.archive_path.trim());
-            if series.season_subfolders {
-                if let Some(season) = release.season {
-                    return Some(destination.join(format!("Stagione {season:02}")));
+            .and_then(|name| cfg.find_series_match(name, release.season))
+        {
+            // `archive_path` configurato oppure cartella auto-rilevata sotto
+            // `archive_root` (una cartella per serie, come il legacy).
+            if let Some(destination) = cfg.resolve_archive_path(series) {
+                if series.season_subfolders {
+                    if let Some(season) = release.season {
+                        return Some(destination.join(format!("Stagione {season:02}")));
+                    }
                 }
+                return Some(destination);
             }
-            return Some(destination);
         }
     }
     cfg.archive_root

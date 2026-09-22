@@ -6779,16 +6779,28 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
             );
         }
         release.series = Some(series.name.clone());
+        let resolved_archive = s.cfg.resolve_archive_path(series);
         let archive_index = crate::cleaner::index_archive(
             &series.name,
-            FsPath::new(&series.archive_path),
+            resolved_archive.as_deref().unwrap_or(FsPath::new("")),
             &s.cfg.settings,
         );
+        let mut live = crate::models::LiveDownloads::default();
+        for torrent in s.torrents.list() {
+            live.hashes.insert(torrent.hash.to_ascii_lowercase());
+            if let Some(key) = crate::parser::parse_episode_key(&torrent.name) {
+                live.episodes.insert(key);
+            }
+        }
+        let context = crate::models::ApprovalContext {
+            archive: archive_index,
+            live,
+        };
         s.db.lock().unwrap().check_series_scored(
             &release,
             release.quality.score_with_settings(&s.cfg.settings),
             s.cfg.upgrade_min_score_diff,
-            &archive_index,
+            &context,
         )
     } else {
         let Some(movie) = s.cfg.find_movie_match(&release.title, release.year) else {
@@ -7026,11 +7038,29 @@ async fn torrent_peers_legacy(
 ) -> impl IntoResponse {
     torrent_peers(State(s), Path(input.hash)).await
 }
+/// True se i file in download di un season pack possono essere cancellati:
+/// il pack è già stato copiato in libreria (status `completed`), quindi la copia
+/// in `libtorrent_dir` è ridondante. Porting di `_mark_pack_copied` del legacy.
+fn torrent_files_are_disposable(db: &Database, hash: &str) -> bool {
+    let Ok(Some(meta)) = db.torrent_meta(hash) else {
+        return false;
+    };
+    if !meta.release.is_pack {
+        return false;
+    }
+    matches!(
+        db.torrent_status(hash).ok().flatten().as_deref(),
+        Some("completed")
+    )
+}
+
 async fn remove_torrent_legacy(
     State(s): State<AppState>,
     Json(input): Json<RemoveTorrentInput>,
 ) -> impl IntoResponse {
-    let removed = s.torrents.remove(&input.hash, input.delete_files);
+    let delete_files = input.delete_files
+        || torrent_files_are_disposable(&s.db.lock().unwrap(), &input.hash);
+    let removed = s.torrents.remove(&input.hash, delete_files);
     if matches!(removed, Ok(true)) {
         // Coerenza DB/sessione: il torrent non esiste più, non deve restare
         // "queued" né bloccare un nuovo tentativo, né risorgere al riavvio.
@@ -7086,7 +7116,9 @@ async fn remove_completed_torrents(
             skipped += 1;
             continue;
         }
-        match s.torrents.remove(&torrent.hash, input.delete_files) {
+        let delete_files = input.delete_files
+            || torrent_files_are_disposable(&s.db.lock().unwrap(), &torrent.hash);
+        match s.torrents.remove(&torrent.hash, delete_files) {
             Ok(true) => {
                 let _ = s.db.lock().unwrap().mark_torrent_removed(&torrent.hash);
                 removed.push(torrent.hash)
@@ -7915,7 +7947,8 @@ async fn set_torrent_limits_legacy(
     ))
 }
 async fn remove_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
-    let removed = s.torrents.remove(&hash, false);
+    let delete_files = torrent_files_are_disposable(&s.db.lock().unwrap(), &hash);
+    let removed = s.torrents.remove(&hash, delete_files);
     if matches!(removed, Ok(true)) {
         let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
     }
@@ -7938,7 +7971,9 @@ async fn remove_torrent_with_options(
             let _ = s.db.lock().unwrap().blocklist(&release, "manual");
         }
     }
-    let removed = s.torrents.remove(&hash, input.delete_files);
+    let delete_files =
+        input.delete_files || torrent_files_are_disposable(&s.db.lock().unwrap(), &hash);
+    let removed = s.torrents.remove(&hash, delete_files);
     if matches!(removed, Ok(true)) {
         let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
     }
@@ -8437,17 +8472,19 @@ async fn torrent_event_worker(
     }
 }
 
-/// Aggiorna il timer di stallo di un download: riparte quando arrivano byte
-/// nuovi (`total_done` cresce) o c'è traffico, e scade quando per `timeout` non
-/// è arrivato nulla — anche se il torrent ha peer (sciame fermo a 0 B/s).
+/// Aggiorna il timer di stallo di un download. Come EXTTO: il timer si azzera
+/// appena arriva traffico o si vede anche un solo peer, perché un torrent con
+/// fonti non è "morto" anche se resta a 0 byte. Scade solo dopo `timeout` di
+/// assenza totale di peer e traffico.
 fn stall_expired(
     entry: &mut (Instant, i64),
     now: Instant,
     done: i64,
     download_rate: u64,
+    num_peers: i32,
     timeout: Duration,
 ) -> bool {
-    if done > entry.1 || download_rate > 0 {
+    if done > entry.1 || download_rate > 0 || num_peers > 0 {
         entry.0 = now;
         if done > entry.1 {
             entry.1 = done;
@@ -8503,7 +8540,14 @@ async fn monitor_stalled(
         let entry = watch
             .entry(torrent.hash.clone())
             .or_insert((now, torrent.total_done));
-        if !stall_expired(entry, now, torrent.total_done, torrent.download_rate, timeout) {
+        if !stall_expired(
+            entry,
+            now,
+            torrent.total_done,
+            torrent.download_rate,
+            torrent.num_peers,
+            timeout,
+        ) {
             continue;
         }
         let mut failed_title = String::new();
@@ -9424,14 +9468,15 @@ mod tests {
     }
 
     #[test]
-    fn stall_timer_expires_without_progress_even_with_peers() {
+    fn stall_timer_resets_on_peers_like_extto() {
         let timeout = Duration::from_secs(3600);
         let t0 = Instant::now();
-        // Nessun byte scaricato per più del timeout: scade anche con peer.
+        // Nessun peer e nessun traffico per oltre il timeout: scade.
         let mut entry = (t0, 0_i64);
         assert!(!stall_expired(
             &mut entry,
             t0 + Duration::from_secs(1800),
+            0,
             0,
             0,
             timeout
@@ -9441,21 +9486,34 @@ mod tests {
             t0 + Duration::from_secs(3700),
             0,
             0,
-            timeout
-        ));
-        // Arrivano byte nuovi: il timer riparte.
-        assert!(!stall_expired(
-            &mut entry,
-            t0 + Duration::from_secs(3800),
-            5,
             0,
             timeout
         ));
+        // Basta un peer (senza byte nuovi) per azzerare il timer, come EXTTO.
         assert!(!stall_expired(
             &mut entry,
-            t0 + Duration::from_secs(5000),
+            t0 + Duration::from_secs(3800),
+            0,
+            0,
+            2,
+            timeout
+        ));
+        // Poi di nuovo senza peer per un altro timeout: scade.
+        assert!(stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(3800 + 3700),
+            0,
+            0,
+            0,
+            timeout
+        ));
+        // Byte nuovi azzerano comunque il timer.
+        assert!(!stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(8000),
             5,
-            10,
+            0,
+            0,
             timeout
         ));
     }
