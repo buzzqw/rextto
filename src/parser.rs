@@ -78,8 +78,28 @@ pub fn normalize_series_name(value: &str) -> String {
 }
 
 pub fn series_names_match(a: &str, b: &str) -> bool {
-    let left = normalize_series_name(a);
-    let right = normalize_series_name(b);
+    let left = strip_year_tokens(&normalize_series_name(a));
+    let right = strip_year_tokens(&normalize_series_name(b));
+    if tokens_match(&left, &right) {
+        return true;
+    }
+    // Titoli "stilizzati" (es. `PLUR1BUS` per *Pluribus*): confronta una
+    // variante con le cifre sciolte in lettere, ma solo quando una sola delle
+    // due parti contiene cifre. Così non si confondono titoli numerici come
+    // `9-1-1` e non si altera il confronto tra nomi già uguali.
+    if has_ascii_digit(&left) != has_ascii_digit(&right) {
+        let folded_left = leet_fold(&left);
+        let folded_right = leet_fold(&right);
+        if tokens_match(&folded_left, &folded_right) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Confronto di due nomi già normalizzati: uguaglianza oppure token a token
+/// con tolleranza per il plurale finale (`Show`/`Shows`).
+fn tokens_match(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
@@ -89,6 +109,62 @@ pub fn series_names_match(a: &str, b: &str) -> bool {
         && left.iter().zip(right).all(|(a, b)| {
             *a == b || a.strip_suffix('s') == Some(b) || b.strip_suffix('s') == Some(a)
         })
+}
+
+/// Rimuove i token che sono solo un anno racchiuso in parentesi/quadre
+/// (`(2025)`, `[2024]`), frequenti nei nomi file legacy `SERIE (ANNO) - S01E01`.
+/// Se la rimozione svuoterebbe il nome (serie intitolate a un anno, es. `1923`)
+/// il valore resta invariato: un anno "nudo" non viene toccato.
+fn strip_year_tokens(value: &str) -> String {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let kept = tokens
+        .iter()
+        .copied()
+        .filter(|token| !is_year_token(token))
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        value.to_string()
+    } else {
+        kept.join(" ")
+    }
+}
+
+fn is_year_token(token: &str) -> bool {
+    let wrapped = token.starts_with('(')
+        || token.starts_with('[')
+        || token.ends_with(')')
+        || token.ends_with(']');
+    if !wrapped {
+        return false;
+    }
+    let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    trimmed.len() == 4
+        && (trimmed.starts_with("19") || trimmed.starts_with("20"))
+        && trimmed.chars().all(|c| c.is_ascii_digit())
+}
+
+fn has_ascii_digit(value: &str) -> bool {
+    value.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Sostituisce le cifre usate come lettere nei titoli leet:
+/// `1`→`i`, `0`→`o`, `3`→`e`, `4`→`a`, `5`→`s`, `7`→`t`, `6`/`9`→`g`, `8`→`b`.
+fn leet_fold(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '0' => 'o',
+            '1' => 'i',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '6' => 'g',
+            '7' => 't',
+            '8' => 'b',
+            '9' => 'g',
+            other => other,
+        })
+        .collect()
 }
 
 pub fn parse_quality(title: &str) -> Quality {
@@ -581,6 +657,22 @@ mod tests {
     #[test]
     fn matches_aliases_after_normalization() {
         assert!(series_names_match("Grey's Anatomy", "Greys.Anatomy"));
+    }
+
+    #[test]
+    fn matches_stylized_titles_with_leet_and_parenthesized_year() {
+        // File legacy `PLUR1BUS (2025) - S01E01 ...` con serie configurata
+        // "Pluribus": il `1` leet e l'anno fra parentesi non devono impedire il
+        // collegamento all'archivio.
+        assert!(series_names_match("Pluribus", "PLUR1BUS (2025)"));
+        assert!(series_names_match("Pluribus", "PLUR1BUS"));
+        assert!(series_names_match("Pluribus", "Pluribus (2025)"));
+        // I titoli numerici non devono essere sfuocati dal folding.
+        assert!(series_names_match("9-1-1", "9-1-1"));
+        assert!(!series_names_match("9-1-1", "Pluribus"));
+        // Anno "nudo" e serie intitolate a un anno restano distinti.
+        assert!(series_names_match("1923", "1923"));
+        assert!(!series_names_match("1923", "1883"));
     }
 
     #[test]

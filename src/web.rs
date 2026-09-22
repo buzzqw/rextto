@@ -2095,6 +2095,11 @@ async fn series_rename_apply(
                 discovered_at: chrono::Utc::now(),
             };
             if !force && postprocess::episode_name_conforms(&file, &release, &cfg) {
+                // Già conforme al formato ma non tracciato: collega comunque il
+                // file al DB, così il prossimo ciclo sa che l'episodio c'è.
+                if execute {
+                    link_archive_file(&s.db, &series.name, season, episode_number, &file);
+                }
                 continue;
             }
             let score = release.quality.score_with_settings(&cfg.settings);
@@ -2150,6 +2155,7 @@ async fn series_rename_apply(
                         &target,
                         target.parent().unwrap_or(FsPath::new(&series.archive_path)),
                     );
+                    link_archive_file(&s.db, &series.name, season, episode_number, &target);
                     items.push(serde_json::json!({
                         "season": season,
                         "episode": episode_number,
@@ -2158,7 +2164,10 @@ async fn series_rename_apply(
                         "executed": true,
                     }));
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Nessuna rinomina necessaria: collega il file esistente.
+                    link_archive_file(&s.db, &series.name, season, episode_number, &file);
+                }
                 Err(error) => {
                     tracing::warn!(file=%file.display(), %error, "archive file rename failed")
                 }
@@ -4368,45 +4377,37 @@ fn parse_season_episode(name: &str) -> Option<(i64, i64)> {
     None
 }
 
-/// Best-effort episode title from an archive file name, e.g.
-/// `Alien Earth - S01E01 - Neverland - [2160p]...` -> `Neverland`.
-fn episode_title_from_filename(name: &str) -> Option<String> {
-    static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static QUALITY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let marker = MARKER.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)(?:s(?:tagione)?\s*\d{1,2}\s*e(?:p(?:isodio)?)?\.?\s*\d{1,4}|\d{1,2}x\d{1,4})",
-        )
-        .expect("episode marker pattern")
-    });
-    let quality = QUALITY.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)(?:^|[ ._\-\[])(2160p|1080p|720p|480p|4k|web[- .]?dl|webrip|web|bluray|bdrip|hdtv|dvdrip|dlmux|remux|x264|x265|h264|h265|hevc|avc|ac3|eac3|ddp|aac|dts|atmos|truehd|mp3|ita|eng|multi|sub|proper|repack)",
-        )
-        .expect("quality marker pattern")
-    });
-    let found = marker.find(name)?;
-    let rest = name[found.end()..].trim_start_matches([' ', '.', '-', '_']);
-    if rest.is_empty() {
-        return None;
-    }
-    let cut = quality
-        .find(rest)
-        .map(|value| value.start())
-        .unwrap_or(rest.len());
-    let title = rest[..cut]
-        .trim_end_matches([' ', '-', '.', '_', '['])
-        .trim();
-    if title.len() < 2 {
-        None
-    } else {
-        Some(
-            title
-                .replace('.', " ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
+/// Registra un file d'archivio nel DB (percorso, titolo con i tag di qualità e
+/// score): così i confronti di upgrade sanno che l'episodio è già presente e non
+/// riscaricano una release inferiore. Usato dalla verifica di rinomina per i
+/// file non ancora tracciati.
+fn link_archive_file(
+    db: &Arc<Mutex<Database>>,
+    series: &str,
+    season: i64,
+    episode: i64,
+    path: &FsPath,
+) {
+    let Some(title) = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let size = path
+        .metadata()
+        .map(|value| value.len().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    if let Err(error) = db.lock().unwrap().sync_archive_file(
+        series,
+        season,
+        episode,
+        title,
+        &path.display().to_string(),
+        size,
+    ) {
+        tracing::warn!(%error, series, season, episode, "archive file linking failed");
     }
 }
 
@@ -4435,8 +4436,16 @@ fn scan_archive_path(
             .metadata()
             .map(|value| value.len().min(i64::MAX as u64) as i64)
             .unwrap_or(0);
-        let title = episode_title_from_filename(name)
-            .unwrap_or_else(|| format!("{} S{:02}E{:02}", series.name, season, episode));
+        // Il titolo salvato è il nome file completo (senza estensione): contiene
+        // i tag di qualità, così lo score e i confronti di upgrade restano
+        // corretti. Usare solo il titolo dell'episodio faceva perdere
+        // risoluzione/sorgente e ogni file scansionato risultava inferiore.
+        let title = FsPath::new(name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(name)
+            .to_string();
         db.lock().unwrap().sync_archive_file(
             &series.name,
             season,

@@ -1044,9 +1044,11 @@ impl Database {
             |row| row.get(0),
         )?;
         // Uno score reale dal nome file: prima era 0, quindi ogni file
-        // scansionato risultava "inferiore" e veniva ri-scaricato.
+        // scansionato risultava "inferiore" e veniva ri-scaricato. Il titolo
+        // passato dal chiamante è il nome file completo, quindi `parse_quality`
+        // vede risoluzione/sorgente/codec.
         let score = parse_quality(title).score();
-        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=excluded.title,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=CASE WHEN episodes.quality_score=0 THEN excluded.quality_score ELSE episodes.quality_score END", params![series_id, season, episode, title, score, path, size_bytes])?;
+        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=excluded.title,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=CASE WHEN excluded.quality_score>0 THEN excluded.quality_score ELSE episodes.quality_score END", params![series_id, season, episode, title, score, path, size_bytes])?;
         Ok(())
     }
 
