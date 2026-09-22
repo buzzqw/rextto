@@ -16,6 +16,8 @@ disk).
 > 📖 Full manual: [`docs/MANUAL.en.md`](docs/MANUAL.en.md) ·
 > [`docs/MANUAL.it.md`](docs/MANUAL.it.md)
 
+[![Donate](https://img.shields.io/badge/❤️_Support_Rextto-PayPal-00457C.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=azanzani@gmail.com&item_name=Support+Rextto+Project)
+
 ---
 
 ## What Rextto is
@@ -201,6 +203,39 @@ source directory.
 ```bash
 ./import-legacy.sh /path/to/legacy /home/user/rextto/data
 ```
+
+## ❤️ Support the project
+
+Rextto is free, open-source software built entirely in spare time.
+If it saves you hours of configuration, RAM, or disk wear — consider buying the
+author a coffee.
+
+Every donation directly funds new features, bug fixes, and keeping the project
+alive.
+
+<div align="center">
+
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?style=for-the-badge&logo=paypal)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=azanzani@gmail.com&item_name=Support+Rextto+Project)
+
+*Thank you. Seriously.*
+
+</div>
+
+## ⚖️ Legal & fair use
+
+Rextto is a **download automation tool**. It does not host, index, or distribute
+any copyrighted content.
+
+- Rextto connects to **indexers you configure** (Jackett, Prowlarr, public RSS
+  feeds). It has no built-in index.
+- What you download is **entirely your responsibility**. Use Rextto only for
+  content you have the right to access — public domain, Creative Commons, or
+  media you own.
+- The torrent integration (libtorrent) is a neutral technology. Rextto does not
+  encourage or facilitate piracy.
+- This project is released under the **EUPL 1.2** open-source license.
+
+> *"With great automation comes great responsibility."*
 
 ## License
 
