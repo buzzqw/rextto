@@ -8427,12 +8427,31 @@ async fn torrent_event_worker(
     }
 }
 
+/// Aggiorna il timer di stallo di un download: riparte quando arrivano byte
+/// nuovi (`total_done` cresce) o c'è traffico, e scade quando per `timeout` non
+/// è arrivato nulla — anche se il torrent ha peer (sciame fermo a 0 B/s).
+fn stall_expired(
+    entry: &mut (Instant, i64),
+    now: Instant,
+    done: i64,
+    download_rate: u64,
+    timeout: Duration,
+) -> bool {
+    if done > entry.1 || download_rate > 0 {
+        entry.0 = now;
+        if done > entry.1 {
+            entry.1 = done;
+        }
+    }
+    now.duration_since(entry.0) >= timeout
+}
+
 async fn monitor_stalled(
     cfg: &Config,
     torrents: &LibtorrentClient,
     db: &Arc<Mutex<Database>>,
     notifier: &Notifier,
-    wait_start: &mut HashMap<String, Instant>,
+    watch: &mut HashMap<String, (Instant, i64)>,
 ) {
     let stall_minutes = cfg
         .settings
@@ -8440,7 +8459,7 @@ async fn monitor_stalled(
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(10080.0);
     if stall_minutes <= 0.0 {
-        wait_start.clear();
+        watch.clear();
         return;
     }
     let timeout = Duration::from_secs_f64(stall_minutes * 60.0);
@@ -8448,16 +8467,14 @@ async fn monitor_stalled(
     let mut live = HashSet::new();
     for torrent in torrents.list() {
         live.insert(torrent.hash.clone());
-        if torrent.state != "downloading"
-            || torrent.progress >= 100.0
-            || torrent.download_rate > 0
-            || torrent.num_peers > 0
-        {
-            wait_start.remove(&torrent.hash);
+        if torrent.state != "downloading" || torrent.progress >= 100.0 {
+            watch.remove(&torrent.hash);
             continue;
         }
-        let started = *wait_start.entry(torrent.hash.clone()).or_insert(now);
-        if now.duration_since(started) < timeout {
+        let entry = watch
+            .entry(torrent.hash.clone())
+            .or_insert((now, torrent.total_done));
+        if !stall_expired(entry, now, torrent.total_done, torrent.download_rate, timeout) {
             continue;
         }
         let mut failed_title = String::new();
@@ -8482,9 +8499,9 @@ async fn monitor_stalled(
             .mark_torrent_error(&torrent.hash, "stalled download");
         let _ = torrents.remove(&torrent.hash, false);
         let _ = notifier.notify_event("download_failed", serde_json::json!({"hash":torrent.hash,"title":failed_title,"error":"stalled download","upgrade_restored":restored})).await;
-        wait_start.remove(&torrent.hash);
+        watch.remove(&torrent.hash);
     }
-    wait_start.retain(|hash, _| live.contains(hash));
+    watch.retain(|hash, _| live.contains(hash));
 }
 
 async fn monitor_metadata(
@@ -9357,6 +9374,43 @@ mod tests {
         assert!(!needs_infinite_seed_resume(&torrent_view("paused", false, 3)));
         // Already seeding: nothing to do.
         assert!(!needs_infinite_seed_resume(&torrent_view("seeding", false, 0)));
+    }
+
+    #[test]
+    fn stall_timer_expires_without_progress_even_with_peers() {
+        let timeout = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        // Nessun byte scaricato per più del timeout: scade anche con peer.
+        let mut entry = (t0, 0_i64);
+        assert!(!stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(1800),
+            0,
+            0,
+            timeout
+        ));
+        assert!(stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(3700),
+            0,
+            0,
+            timeout
+        ));
+        // Arrivano byte nuovi: il timer riparte.
+        assert!(!stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(3800),
+            5,
+            0,
+            timeout
+        ));
+        assert!(!stall_expired(
+            &mut entry,
+            t0 + Duration::from_secs(5000),
+            5,
+            10,
+            timeout
+        ));
     }
 
     #[test]
