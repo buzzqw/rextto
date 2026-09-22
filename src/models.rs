@@ -255,6 +255,25 @@ impl Quality {
     }
 }
 
+/// Miglior qualità trovata **su disco** per `(stagione, episodio)` nella
+/// cartella di una serie. Serve a decidere gli upgrade guardando i file reali
+/// (come il legacy `_best_quality_in_path`), non solo le righe del DB: un file
+/// non collegato non deve far riscaricare una release uguale o peggiore.
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveQualityIndex {
+    pub best: std::collections::HashMap<(i64, i64), (Quality, i64)>,
+}
+
+impl ArchiveQualityIndex {
+    pub fn best_for(&self, season: i64, episode: i64) -> Option<&(Quality, i64)> {
+        self.best.get(&(season, episode))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.best.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
     pub title: String,

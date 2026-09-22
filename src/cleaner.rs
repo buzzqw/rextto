@@ -10,6 +10,71 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Indice delle migliori qualità presenti su disco nella cartella di una serie.
+///
+/// Porting di `_best_quality_in_path`/`episode_archive_presence` del legacy:
+/// scansiona ricorsivamente l'archivio, raggruppa per `(stagione, episodio)` e
+/// tiene il file col punteggio più alto. Serve a non riscaricare una release
+/// uguale o peggiore a un file già presente ma non collegato nel DB.
+pub fn index_archive(
+    series_name: &str,
+    archive_path: &Path,
+    settings: &std::collections::BTreeMap<String, String>,
+) -> crate::models::ArchiveQualityIndex {
+    let mut index = crate::models::ArchiveQualityIndex::default();
+    if archive_path.as_os_str().is_empty() || !archive_path.is_dir() {
+        return index;
+    }
+    let Ok(pattern) = crate::utils::cached_regex(
+        r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<s>\d{1,2})e|(?P<ns>\d{1,2})x)(?P<e>\d{1,4})",
+    ) else {
+        return index;
+    };
+    let normalized = normalize_series_name(series_name);
+    let Ok(files) = video_files(archive_path) else {
+        return index;
+    };
+    for file in files {
+        let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(captures) = pattern.captures(name) else {
+            continue;
+        };
+        let Some(file_series) = captures.name("name").map(|value| value.as_str()) else {
+            continue;
+        };
+        if !series_names_match(&normalized, file_series) {
+            continue;
+        }
+        let Some(season) = captures
+            .name("s")
+            .or_else(|| captures.name("ns"))
+            .and_then(|value| value.as_str().parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let Some(episode) = captures
+            .name("e")
+            .and_then(|value| value.as_str().parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let quality = parse_quality(name);
+        let score = quality.score_with_settings(settings);
+        let key = (season, episode);
+        let better = index
+            .best
+            .get(&key)
+            .map(|(_, existing)| score > *existing)
+            .unwrap_or(true);
+        if better {
+            index.best.insert(key, (quality, score));
+        }
+    }
+    index
+}
+
 /// Motivi di upgrade considerati "forti" anche quando la differenza di score è
 /// sotto la soglia configurata (parità con EXTTO `_HARD_UPGRADE_REASONS`).
 const HARD_UPGRADE_REASONS: [&str; 4] = ["resolution", "source", "hdr", "repack"];
@@ -670,6 +735,43 @@ pub fn discard_if_inferior_movie(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn index_archive_keeps_best_file_per_episode() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-index-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("Serie");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("Example - S01E01 - Titolo - [1080p][h264][AAC][IT].mkv"),
+            b"hd",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("Example - S01E01 - Titolo - [2160p][h265][DDP][HDR][IT].mkv"),
+            b"4k",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("Example - S01E02 - Altro - [1080p][h264][AAC][IT].mkv"),
+            b"hd",
+        )
+        .unwrap();
+        // Un'altra serie nella stessa cartella non deve entrare nell'indice.
+        fs::write(archive.join("Altro - S01E01 - X - [2160p][h265][IT].mkv"), b"x").unwrap();
+        let settings = std::collections::BTreeMap::new();
+        let index = index_archive("Example", &archive, &settings);
+        let (quality, _) = index.best_for(1, 1).expect("E01 presente");
+        assert_eq!(quality.resolution, "2160p");
+        assert_eq!(index.best_for(1, 2).unwrap().0.resolution, "1080p");
+        assert!(index.best_for(1, 3).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn moves_only_lower_quality_matching_episode_to_trash() {

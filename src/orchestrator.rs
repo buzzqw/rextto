@@ -466,6 +466,8 @@ pub async fn run_cycle_domain(
             }
         }
     }
+    let empty_archive_index = crate::models::ArchiveQualityIndex::default();
+    let mut archive_index_cache = std::collections::HashMap::new();
     for release in best {
         let is_ready_pending =
             magnet_hash(&release.magnet).is_some_and(|hash| ready_pending.contains(&hash));
@@ -491,12 +493,34 @@ pub async fn run_cycle_domain(
                 }
             }
         }
+        // Indice dell'archivio (per serie, calcolato una volta per ciclo): la
+        // decisione considera anche i file reali su disco, non solo il DB.
+        let archive_ref: &crate::models::ArchiveQualityIndex = if release.kind == "series" {
+            let key = release.series.clone().unwrap_or_default();
+            let season = release.season;
+            archive_index_cache.entry(key).or_insert_with(|| {
+                release
+                    .series
+                    .as_deref()
+                    .and_then(|name| cfg.find_series_match(name, season))
+                    .map(|series| {
+                        crate::cleaner::index_archive(
+                            &series.name,
+                            std::path::Path::new(&series.archive_path),
+                            &cfg.settings,
+                        )
+                    })
+                    .unwrap_or_default()
+            })
+        } else {
+            &empty_archive_index
+        };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
             let score = release.quality.score_with_settings(&cfg.settings);
             let min_diff = cfg.upgrade_min_score_diff;
             let result = if release.kind == "series" {
-                db.check_series_scored(&release, score, min_diff)?
+                db.check_series_scored(&release, score, min_diff, archive_ref)?
             } else {
                 db.check_movie_scored(&release, score, min_diff)?
             };

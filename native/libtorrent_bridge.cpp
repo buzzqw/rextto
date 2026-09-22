@@ -1,5 +1,6 @@
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/address.hpp>
+#include <libtorrent/bdecode.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/create_torrent.hpp>
 #include <libtorrent/read_resume_data.hpp>
@@ -910,6 +911,31 @@ size_t rextto_lt_restore(rextto_lt_session* session, const char* state_dir, char
             lt::error_code ec;
             auto params = lt::read_resume_data(lt::span<char const>(content.data(), content.size()), ec);
             if (ec) { warning = "invalid fastresume " + entry.path().string() + ": " + ec.message(); continue; }
+            // Un torrent che stava facendo seed prima dello shutdown viene
+            // ripristinato in seed_mode: libtorrent si fida del resume e NON
+            // rifà il check dei pezzi. Necessario perché il file è spesso sul
+            // NAS, fuori dal path del torrent: un check lo vedrebbe mancante e
+            // ripartirebbe da 0 (banda sprecata su contenuto già archiviato).
+            {
+                bool was_seeding = false;
+                try {
+                    lt::error_code bec;
+                    const auto root = lt::bdecode(lt::span<char const>(content.data(), content.size()), bec);
+                    if (!bec && root.type() == lt::bdecode_node::dict_t) {
+                        const auto seeding_time = root.dict_find_int_value("seeding_time", 0);
+                        const auto finished = root.dict_find_int_value("finished_time", 0);
+                        const auto uploaded = root.dict_find_int_value("total_uploaded", 0);
+                        const auto downloaded = root.dict_find_int_value("total_downloaded", 0);
+                        was_seeding = seeding_time > 0
+                            || (finished > 0 && uploaded > 0 && downloaded > 0
+                                && uploaded >= downloaded / 2);
+                    }
+                } catch (...) {}
+                if (was_seeding) {
+                    params.flags |= lt::torrent_flags::seed_mode;
+                    params.flags |= lt::torrent_flags::override_resume_data;
+                }
+            }
             // A magnet's fastresume may not contain enough metadata after an
             // interrupted first run.  Reuse the .torrent captured when the
             // metadata alert arrived, matching legacy's restart behaviour.

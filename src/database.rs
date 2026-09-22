@@ -349,7 +349,12 @@ impl Database {
     pub const DEFAULT_UPGRADE_MIN_SCORE_DIFF: i64 = 200;
 
     pub fn check_series(&self, release: &Release) -> Result<(bool, String)> {
-        self.check_series_scored(release, release.quality.score(), Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF)
+        self.check_series_scored(
+            release,
+            release.quality.score(),
+            Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF,
+            &crate::models::ArchiveQualityIndex::default(),
+        )
     }
 
     pub fn check_series_scored(
@@ -357,13 +362,14 @@ impl Database {
         release: &Release,
         score: i64,
         min_score_diff: i64,
+        archive: &crate::models::ArchiveQualityIndex,
     ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
             return Ok((false, "blocklisted".into()));
         }
         if release.is_pack {
-            return self.check_series_pack(release, &hash, score, min_score_diff);
+            return self.check_series_pack(release, &hash, score, min_score_diff, archive);
         }
         let season = release.season.context("series release has no season")?;
         let episode = release.episode.context("series release has no episode")?;
@@ -387,7 +393,23 @@ impl Database {
         )? {
             return Ok((false, "duplicate".into()));
         }
-        if let Some((id, existing_score, existing_title)) = self.conn.query_row("SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))).optional()? {
+        let db_row: Option<(i64, i64, String)> = self.conn.query_row("SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))).optional()?;
+        // Intelligenza archivio (parità col legacy `_best_quality_in_path`): se
+        // su disco c'è già un file di qualità uguale o superiore, non scaricare
+        // anche se il DB non lo conosce. Se il file su disco è inferiore, il
+        // candidato resta valido.
+        if let Some((disk_quality, disk_score)) = archive.best_for(season, episode) {
+            let db_score = db_row.as_ref().map(|(_, value, _)| *value).unwrap_or(i64::MIN);
+            if *disk_score > db_score
+                && release
+                    .quality
+                    .upgrade_reason(disk_quality, score, *disk_score, min_score_diff)
+                    .is_none()
+            {
+                return Ok((false, "duplicate".into()));
+            }
+        }
+        if let Some((id, existing_score, existing_title)) = db_row {
             // legacy upgrade_reason: resolution jump, HDTV→WEB-DL, HDR, first
             // REPACK, or a score gain of at least `min_score_diff`.
             let old_quality = parse_quality(&existing_title);
@@ -432,6 +454,7 @@ impl Database {
         hash: &str,
         score: i64,
         min_score_diff: i64,
+        archive: &crate::models::ArchiveQualityIndex,
     ) -> Result<(bool, String)> {
         let season = release.season.context("season pack has no season")?;
         let series_name = release.series.as_deref().unwrap_or(&release.title);
@@ -511,6 +534,17 @@ impl Database {
             ).optional()?;
             match existing {
                 None => {
+                    // File già su disco (non nel DB) con qualità uguale o
+                    // superiore: episodio coperto, inutile scaricare il pack.
+                    if let Some((disk_quality, disk_score)) = archive.best_for(season, *episode) {
+                        if release
+                            .quality
+                            .upgrade_reason(disk_quality, score, *disk_score, min_score_diff)
+                            .is_none()
+                        {
+                            continue;
+                        }
+                    }
                     let episode_hash = if hash_available {
                         hash_available = false;
                         Some(hash)
@@ -521,10 +555,16 @@ impl Database {
                     inserted += 1;
                 }
                 Some((id, existing_score, existing_title)) => {
-                    let old_quality = parse_quality(&existing_title);
+                    // Confronta col migliore tra la riga DB e il file su disco.
+                    let (old_quality, old_score) = match archive.best_for(season, *episode) {
+                        Some((disk_quality, disk_score)) if *disk_score > existing_score => {
+                            (disk_quality.clone(), *disk_score)
+                        }
+                        _ => (parse_quality(&existing_title), existing_score),
+                    };
                     if release
                         .quality
-                        .upgrade_reason(&old_quality, score, existing_score, min_score_diff)
+                        .upgrade_reason(&old_quality, score, old_score, min_score_diff)
                         .is_some()
                     {
                         let previous = tx.query_row("SELECT id,series_id,season,episode,title,quality_score,magnet_hash,magnet_link,downloaded_at,archive_path,size_bytes FROM episodes WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "series".into(), row_id: row.get(0)?, series_id: Some(row.get(1)?), series_name: Some(series_name.to_owned()), season: Some(row.get(2)?), episode: Some(row.get(3)?), name: None, year: None, title: row.get::<_, Option<String>>(4)?.unwrap_or_default(), quality_score: row.get(5)?, magnet_hash: row.get(6)?, magnet_link: row.get(7)?, downloaded_at: row.get(8)?, archive_path: row.get(9)?, size_bytes: row.get(10)? }))?;
@@ -2340,9 +2380,60 @@ mod tests {
         let fallback_hash = magnet_hash(&fallback.magnet).unwrap();
         let score = fallback.quality.score();
         let (approved, reason) = db
-            .check_series_pack(&fallback, &fallback_hash, score, 200)
+            .check_series_pack(
+                &fallback,
+                &fallback_hash,
+                score,
+                200,
+                &crate::models::ArchiveQualityIndex::default(),
+            )
             .unwrap();
         assert!(approved, "il 1080p deve essere approvato: {reason}");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn archive_index_blocks_release_already_present_on_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-archiveindex-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let release = release();
+        let score = release.quality.score();
+
+        // Un 4K è già su disco ma non nel DB: la release 1080p va scartata.
+        let mut index = crate::models::ArchiveQualityIndex::default();
+        index.best.insert(
+            (1, 1),
+            (
+                Quality {
+                    resolution: "2160p".into(),
+                    ..Default::default()
+                },
+                2000,
+            ),
+        );
+        let (approved, reason) = db.check_series_scored(&release, score, 200, &index).unwrap();
+        assert!(!approved, "atteso duplicate dal disco, ottenuto {reason}");
+
+        // Senza indice (nessun file su disco) il candidato è approvato.
+        let (approved, _) = db
+            .check_series_scored(
+                &release,
+                score,
+                200,
+                &crate::models::ArchiveQualityIndex::default(),
+            )
+            .unwrap();
+        assert!(approved);
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -2801,7 +2892,7 @@ mod tests {
         };
         let score = pack.quality.score();
         assert!(score < 1510, "il pack 1080p deve avere score inferiore");
-        let (approved, reason) = db.check_series_scored(&pack, score, 50).unwrap();
+        let (approved, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
         assert!(!approved, "pack inferiore non deve essere approvato");
         assert_eq!(reason, "duplicate");
 
@@ -2810,7 +2901,7 @@ mod tests {
         gap.season = Some(5);
         gap.title = "Reacher - Season 05 (2027) [1080p H265 ITA ENG]".into();
         gap.magnet = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".into();
-        let (approved_gap, _) = db.check_series_scored(&gap, score, 50).unwrap();
+        let (approved_gap, _) = db.check_series_scored(&gap, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
         assert!(approved_gap, "pack per stagione vuota deve essere approvato");
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -2867,7 +2958,7 @@ mod tests {
         };
         let score = pack.quality.score();
         // Retry consentito: i placeholder non sono "già scaricati".
-        let (approved, _) = db.check_series_scored(&pack, score, 50).unwrap();
+        let (approved, _) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
         assert!(approved, "un placeholder non scaricato non deve bloccare il retry");
         // Ora l'episodio risulta scaricato: stesso magnet -> duplicato.
         db.conn
@@ -2876,7 +2967,7 @@ mod tests {
                 params![hash, magnet],
             )
             .unwrap();
-        let (approved_again, reason) = db.check_series_scored(&pack, score, 50).unwrap();
+        let (approved_again, reason) = db.check_series_scored(&pack, score, 50, &crate::models::ArchiveQualityIndex::default()).unwrap();
         assert!(!approved_again);
         assert_eq!(reason, "duplicate");
         drop(db);

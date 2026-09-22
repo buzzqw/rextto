@@ -6044,7 +6044,12 @@ async fn mark_torrent_failed(
         s.db.lock()
             .unwrap()
             .mark_torrent_error(&hash, "manual failure");
-    let removed = s.torrents.remove(&hash, false).unwrap_or(false);
+    let removed = s
+        .torrents
+        .list()
+        .iter()
+        .any(|torrent| torrent.hash.eq_ignore_ascii_case(&hash));
+    remove_failed_torrent(&s.torrents, &hash);
     (
         StatusCode::OK,
         Json(serde_json::json!({"ok":true,"removed":removed,"upgrade_restored":restored})),
@@ -6774,10 +6779,16 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
             );
         }
         release.series = Some(series.name.clone());
+        let archive_index = crate::cleaner::index_archive(
+            &series.name,
+            FsPath::new(&series.archive_path),
+            &s.cfg.settings,
+        );
         s.db.lock().unwrap().check_series_scored(
             &release,
             release.quality.score_with_settings(&s.cfg.settings),
             s.cfg.upgrade_min_score_diff,
+            &archive_index,
         )
     } else {
         let Some(movie) = s.cfg.find_movie_match(&release.title, release.year) else {
@@ -8445,6 +8456,25 @@ fn stall_expired(
     now.duration_since(entry.0) >= timeout
 }
 
+/// Rimuove un torrent fallito. I file parziali vengono cancellati solo se il
+/// download non era completato; per un torrent già completo/in seed non si tocca
+/// la libreria. Il resume viene comunque eliminato da `LibtorrentClient::remove`,
+/// così il torrent non risorge al riavvio.
+fn remove_failed_torrent(torrents: &LibtorrentClient, hash: &str) {
+    let incomplete = torrents
+        .list()
+        .into_iter()
+        .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+        .is_some_and(|torrent| {
+            torrent.progress < 99.99 && !matches!(torrent.state.as_str(), "seeding" | "finished")
+        });
+    match torrents.remove(hash, incomplete) {
+        Ok(true) => tracing::info!(hash, delete_files = incomplete, "failed torrent removed"),
+        Ok(false) => tracing::debug!(hash, "failed torrent already removed"),
+        Err(error) => tracing::warn!(hash, %error, "failed torrent removal failed"),
+    }
+}
+
 async fn monitor_stalled(
     cfg: &Config,
     torrents: &LibtorrentClient,
@@ -8496,7 +8526,7 @@ async fn monitor_stalled(
             .lock()
             .unwrap()
             .mark_torrent_error(&torrent.hash, "stalled download");
-        let _ = torrents.remove(&torrent.hash, false);
+        remove_failed_torrent(torrents, &torrent.hash);
         let _ = notifier.notify_event("download_failed", serde_json::json!({"hash":torrent.hash,"title":failed_title,"error":"stalled download","upgrade_restored":restored})).await;
         watch.remove(&torrent.hash);
     }
@@ -8567,7 +8597,7 @@ async fn monitor_metadata(
                 .lock()
                 .unwrap()
                 .mark_torrent_error(&torrent.hash, "metadata timeout");
-            let _ = torrents.remove(&torrent.hash, false);
+            remove_failed_torrent(torrents, &torrent.hash);
             let _ = notifier.notify_event("torrent_error", serde_json::json!({"hash":torrent.hash,"error":"metadata timeout","upgrade_restored":restored})).await;
             wait_start.remove(&torrent.hash);
             first_seen.remove(&torrent.hash);
