@@ -35,7 +35,7 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
 - **Pulsanti ciclo** — avvia un ciclo completo o di un solo dominio (Serie, Film,
   Fumetti) o un backup immediato.
 - **Card statistiche** — serie/film configurati, file scaricati, spazio libero,
-  magnet in archivio, torrent in sessione.
+  magnet in archivio, torrent in sessione, gruppi visti dai feed.
 - **Rete e download attivi** — CPU/RAM e sparkline di rete in tempo reale.
 - **Consumo e dischi**, **prossime uscite**, **ultimi download**,
   **attività recente** e **ultimi trovati nelle sorgenti**.
@@ -52,7 +52,10 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
 - **Dettagli** (tab Generale, Tracker, Contenuto, Peers, Limiti, Storage):
   copia magnet, limiti per torrent/giorni di seed, reannounce, pin, riavvia,
   segna come fallito, sposta storage.
-- **Storico download**: elenca solo i download completati.
+- **Storico download**: elenca i download conclusi (nativi e migrati). Colonne:
+  nome (con badge **NAS** quando il file è archiviato), tipo/stagione/episodio,
+  **tag NAS** (regola di cartella), score, stato (*Completato*), **percorso
+  libreria/NAS** e data di conclusione.
 
 ## 4. Serie TV
 
@@ -85,6 +88,10 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   aggiunta alla libreria.
 - **Archivio** — ricerca full-text delle release passate con paginazione, accoda
   in blocco, copia magnet, elimina; tab **Serie/Film dal feed**.
+- **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo
+  (film/serie) con numero, risoluzione e score migliori; espandi un gruppo per
+  accodare una singola release. Popolata ad ogni ciclo, anche per titoli non
+  monitorati.
 - **Fumetti** — Esplora GetComics + quick add, lista monitorati, estrazione link
   da un post, impostazioni weekly pack e storico con reinvia/elimina/forza.
 
@@ -98,10 +105,15 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   *Verifica*, URL FlareSolverr + test, motori web, filtri contenuto, blacklist.
 - **libtorrent** — connessioni/prestazioni, protocolli/tracker, sicurezza/proxy,
   RAM disk e porte, limiti di velocità e scheduler; applica/ottimizza/verifica
-  aggiornamenti.
+  aggiornamenti. In *Sicurezza, proxy e rete* l'**interfaccia VPN (killswitch)**
+  vincola ascolto e traffico in uscita a una scheda scelta (es. `tun0`, `wg0`);
+  l'elenco è letto dal server e la modifica si applica dopo il riavvio.
 - **Punteggi** — pesi per categoria, gruppi custom e simulatore live.
 - **Rinomina** — abilita rinomina, editor del template con token e anteprima,
-  chiavi TMDB/TVDB, lingua, soglie di upgrade, token API.
+  chiavi TMDB/TVDB, lingua, soglie di upgrade, token API. La verifica recupera il
+  token sorgente dal titolo originale della release nel database ed elimina i
+  blocchi placeholder vuoti (`[]`), così un `[WEB-DL]` perso viene ripristinato
+  invece di restare `unknown`.
 - **Avanzate** — spazio libero minimo, retention cestino, retention archivio,
   pagine feed, intervallo verifica rinomina, sposta episodi, flag di debug.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
@@ -118,11 +130,29 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
 
 - Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi,
   importa dati legacy, riavvia il servizio.
-- **Database**: prune per cicli/età errori, prune per keyword con anteprima e
-  **VACUUM / ANALYZE** su tutti i database.
-- **Backup**: retention, schedulazione (manuale/giornaliera/settimanale), FTP
-  (host/utente/percorso) con **Test FTP** (verifica connessione, percorso e
-  upload di prova), copia su cartella cloud/sync, invio Telegram, elenco backup.
+- **Duplicati video** — *Anteprima duplicati* e *Pulisci duplicati* trovano i
+  file video chiaramente inferiori (risoluzione strettamente più bassa) rimasti
+  accanto alla versione migliore nella stessa cartella — es. il vecchio 480p
+  accanto al nuovo 1080p — e li spostano nel cestino. A **pari risoluzione**
+  viene tenuta la versione nella lingua preferita (*Configurazione → Rinomina →
+  lingua predefinita*) e il duplicato che dichiara esplicitamente un'altra lingua
+  va nel cestino; i file senza tag lingua restano intatti. I file dei torrent
+  ancora in sessione sono protetti e le sottocartelle svuotate vengono rimosse.
+  La verifica di rinomina esegue la stessa pulizia automaticamente e la pulizia
+  degli upgrade ora rispetta anche i motivi "forti" (risoluzione/sorgente/HDR/
+  repack).
+- **Ripristina sorgente** — *Ripristina sorgente nei nomi* rimette il token
+  `[Source]` (WEB-DL, HDTV, BluRay…) nei nomi archiviati che l'hanno perso,
+  recuperandolo dal titolo originale della release nel database. Non inventa la
+  sorgente: se è sconosciuta il file resta invariato. Prima l'anteprima, poi
+  l'esecuzione; nessun riscaricamento.
+- **Database**: prune per cicli/età errori, **retention dei "visti dai feed"**
+  (giorni; 0 conserva tutto), prune per keyword con elenco delle righe
+  corrispondenti e **VACUUM / ANALYZE** su tutti i database.
+- **Backup**: retention, schedulazione (manuale, ogni N ore o a un orario fisso
+  giornaliero HH:MM), FTP (host/utente/percorso) con **Test FTP** (verifica
+  connessione, percorso e upload di prova), copia su cartella cloud/sync, invio
+  Telegram, elenco backup.
 
 ## 10. Salute, Log, Grafici
 

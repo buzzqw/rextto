@@ -104,6 +104,9 @@ pub struct LibtorrentSettings {
     pub proxy_password: String,
     pub ip_filter_path: String,
     pub listen_interfaces: String,
+    /// Interfaccia forzata per il traffico in uscita (killswitch VPN). Quando è
+    /// impostata, libtorrent annuncia e si connette solo da questa scheda.
+    pub outgoing_interface: String,
     pub dht_bootstrap_nodes: String,
 }
 
@@ -155,6 +158,7 @@ impl Default for LibtorrentSettings {
             proxy_password: String::new(),
             ip_filter_path: String::new(),
             listen_interfaces: String::new(),
+            outgoing_interface: String::new(),
             dht_bootstrap_nodes: String::new(),
         }
     }
@@ -1308,6 +1312,11 @@ impl Config {
             listen_interfaces: self
                 .settings
                 .get("libtorrent_listen_interfaces")
+                .cloned()
+                .unwrap_or_default(),
+            outgoing_interface: self
+                .settings
+                .get("libtorrent_outgoing_interface")
                 .cloned()
                 .unwrap_or_default(),
             dht_bootstrap_nodes: self

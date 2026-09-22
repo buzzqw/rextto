@@ -261,6 +261,184 @@ pub fn stable_id(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Chiave di raggruppamento "condensed" come il legacy `mfs_key`: minuscolo e
+/// solo caratteri alfanumerici. Usata per unire le release della stessa serie o
+/// dello stesso film quando non esiste un id TMDB.
+pub fn condensed_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Estrae il nome leggibile di un film dal titolo di una release, come
+/// `extract_clean_movie_name()` del legacy:
+/// `"The.Veil.2024.1080p.BluRay [Jackett RSS]"` → `"The Veil"`.
+pub fn extract_clean_movie_name(title: &str) -> String {
+    let strip_brackets = |value: &str| {
+        let mut out = String::with_capacity(value.len());
+        let mut depth = 0i32;
+        for character in value.chars() {
+            match character {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth = (depth - 1).max(0),
+                _ if depth == 0 => out.push(character),
+                _ => {}
+            }
+        }
+        out
+    };
+    let mut cleaned = strip_brackets(title).replace(['.', '_'], " ");
+    cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = |value: &str| {
+        value
+            .trim()
+            .trim_end_matches(['(', '-', '.', '_', ' '])
+            .trim()
+            .to_owned()
+    };
+    if let Some(found) = cached_regex(r"\b(19\d{2}|20[012]\d)\b")
+        .unwrap()
+        .find(&cleaned)
+    {
+        let name = trimmed(&cleaned[..found.start()]);
+        if name.chars().count() > 2 {
+            return name;
+        }
+    }
+    if let Some(found) = cached_regex(
+        r"(?i)\b(2160p|1080p|720p|576p|480p|4k|uhd|blu[-\s]?ray|bluray|bdrip|dvdrip|dvdscr|dvd|webrip|web[-\s]?dl|webdl|web|hdtv|pdtv|ts|cam|hdrip|h[\.\s]?264|h[\.\s]?265|x264|x265|xvid|divx|hevc|avc|aac|ac3|ddp[57]|dd[57]\.?1|dts|truehd|flac|mp3|opus|ita|eng|multi|sub|subs|dub|hdr10\+|hdr10|hdr|dv|sdr|remux|proper|repack|extended|theatrical|mkv|mp4|avi|m4v)\b",
+    )
+    .unwrap()
+    .find(&cleaned)
+    {
+        let name = trimmed(&cleaned[..found.start()]);
+        if name.chars().count() > 2 {
+            return name;
+        }
+    }
+    let fallback = cleaned.trim().to_owned();
+    if fallback.is_empty() {
+        title.trim().to_owned()
+    } else {
+        fallback
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkInterface {
+    pub name: String,
+    pub ip: String,
+    pub kind: String,
+}
+
+/// Classifica un'interfaccia dal nome, come il killswitch del legacy:
+/// `VPN` per tun/wg/ppp/utun, `WiFi` per wl/wlan/wi-fi/airport, `Loopback` per lo.
+pub fn classify_interface(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("lo") {
+        "Loopback"
+    } else if lower.starts_with("wl")
+        || lower.starts_with("wlan")
+        || lower.starts_with("wifi")
+        || lower.starts_with("wi-fi")
+        || lower.starts_with("airport")
+    {
+        "WiFi"
+    } else if lower.starts_with("tun")
+        || lower.starts_with("wg")
+        || lower.starts_with("ppp")
+        || lower.starts_with("utun")
+        || lower.starts_with("tailscale")
+        || lower.starts_with("tap")
+    {
+        "VPN"
+    } else {
+        "Ethernet"
+    }
+}
+
+/// Rileva le interfacce di rete con IPv4 e tipo, per il killswitch VPN.
+/// Usa `getifaddrs(3)` su Unix e ricade su `/sys/class/net` se non disponibile.
+/// Le interfacce di loopback vengono escluse come nel legacy.
+pub fn network_interfaces() -> Vec<NetworkInterface> {
+    let mut result = interfaces_via_getifaddrs();
+    if result.is_empty() {
+        result = interfaces_via_sysfs();
+    }
+    result.retain(|interface| interface.kind != "Loopback");
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result
+}
+
+#[cfg(unix)]
+fn interfaces_via_getifaddrs() -> Vec<NetworkInterface> {
+    use std::ffi::CStr;
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut cursor = list;
+    while !cursor.is_null() {
+        let interface = unsafe { &*cursor };
+        if !interface.ifa_addr.is_null()
+            && unsafe { (*interface.ifa_addr).sa_family as i32 } == libc::AF_INET
+        {
+            let name = unsafe { CStr::from_ptr(interface.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
+            let length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let ok = unsafe {
+                libc::getnameinfo(
+                    interface.ifa_addr,
+                    length,
+                    host.as_mut_ptr(),
+                    host.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    libc::NI_NUMERICHOST,
+                )
+            };
+            if ok == 0 {
+                let ip = unsafe { CStr::from_ptr(host.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !ip.is_empty() {
+                    let kind = classify_interface(&name).to_owned();
+                    result.push(NetworkInterface { name, ip, kind });
+                }
+            }
+        }
+        cursor = interface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    result
+}
+
+#[cfg(not(unix))]
+fn interfaces_via_getifaddrs() -> Vec<NetworkInterface> {
+    Vec::new()
+}
+
+fn interfaces_via_sysfs() -> Vec<NetworkInterface> {
+    let mut result = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = classify_interface(&name).to_owned();
+            result.push(NetworkInterface {
+                name,
+                ip: String::new(),
+                kind,
+            });
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +530,33 @@ mod tests {
         assert_eq!(stable_id("example").len(), 40);
         assert!(stable_id("example").chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(stable_id("a"), stable_id("b"));
+    }
+
+    #[test]
+    fn condensed_key_keeps_only_alphanumerics() {
+        assert_eq!(condensed_key("The Veil (2024)"), "theveil2024");
+        assert_eq!(condensed_key("F.B.I."), "fbi");
+    }
+
+    #[test]
+    fn extracts_clean_movie_name_before_year_or_tech_token() {
+        assert_eq!(
+            extract_clean_movie_name("The.Veil.2024.1080p.BluRay [Jackett RSS]"),
+            "The Veil"
+        );
+        assert_eq!(
+            extract_clean_movie_name("Example.Movie.1080p.WEB-DL.ITA"),
+            "Example Movie"
+        );
+        assert_eq!(extract_clean_movie_name("Heat"), "Heat");
+    }
+
+    #[test]
+    fn classifies_network_interfaces_like_legacy() {
+        assert_eq!(classify_interface("tun0"), "VPN");
+        assert_eq!(classify_interface("wg0"), "VPN");
+        assert_eq!(classify_interface("wlp3s0"), "WiFi");
+        assert_eq!(classify_interface("eth0"), "Ethernet");
+        assert_eq!(classify_interface("lo"), "Loopback");
     }
 }

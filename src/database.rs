@@ -52,6 +52,78 @@ pub struct StoredTorrent {
     pub downloaded: i64,
     pub status: String,
     pub updated_at: String,
+    pub kind: String,
+    pub series_name: String,
+    pub season: i64,
+    pub episode: i64,
+    pub year: i64,
+    pub quality_score: i64,
+    pub completed_at: String,
+    /// Percorso in libreria/NAS dove la release è stata archiviata (vuoto se non archiviata).
+    pub processed_path: String,
+    pub error: String,
+}
+
+fn stored_torrent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTorrent> {
+    Ok(StoredTorrent {
+        hash: row.get(0)?,
+        name: row.get(1)?,
+        tag: row.get(2)?,
+        source: row.get(3)?,
+        progress: row.get(4)?,
+        paused: row.get::<_, i64>(5)? != 0,
+        total_size: row.get(6)?,
+        downloaded: row.get(7)?,
+        status: row.get(8)?,
+        updated_at: row.get(9)?,
+        kind: row.get(10)?,
+        series_name: row.get(11)?,
+        season: row.get(12)?,
+        episode: row.get(13)?,
+        year: row.get(14)?,
+        quality_score: row.get(15)?,
+        completed_at: row.get(16)?,
+        processed_path: row.get(17)?,
+        error: row.get(18)?,
+    })
+}
+
+/// Nome del file rinominato in libreria, ricavato dal percorso archiviato.
+/// Ritorna vuoto per percorsi vuoti o per le cartelle (import vecchi), così la
+/// UI ricade sul titolo originale della release.
+fn renamed_file_title(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or("");
+    let lower = base.to_ascii_lowercase();
+    let is_media = [".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".flv"]
+        .iter()
+        .any(|extension| lower.ends_with(extension));
+    if !is_media {
+        return String::new();
+    }
+    base.rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// Qualità "riconoscibile" da un testo (titolo release o nome file): `None` se
+/// non contiene alcun token utile, così il ricalcolo non azzera gli score.
+fn meaningful_quality(text: &str) -> Option<crate::models::Quality> {
+    let quality = parse_quality(text);
+    if quality.resolution != "unknown"
+        || quality.source != "unknown"
+        || quality.codec != "unknown"
+        || quality.audio != "unknown"
+        || !quality.hdr.is_empty()
+        || quality.score() > 0
+    {
+        Some(quality)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -61,6 +133,9 @@ pub struct EpisodeView {
     pub season: i64,
     pub episode: i64,
     pub title: String,
+    /// Nome del file rinominato in libreria (da `archive_path`), vuoto quando il
+    /// file non è ancora archiviato o il percorso è una cartella.
+    pub renamed_title: String,
     pub quality_score: i64,
     pub downloaded_at: Option<String>,
     pub archive_path: Option<String>,
@@ -109,6 +184,38 @@ pub struct RecentDownload {
     pub size_bytes: i64,
     pub archive_path: Option<String>,
     pub quality_score: i64,
+}
+
+/// Gruppo di release "viste nei feed" (stesso titolo, eventualmente con id TMDB).
+#[derive(Debug, serde::Serialize)]
+pub struct FeedSeenGroup {
+    pub group_key: String,
+    pub group_name: String,
+    pub year: i64,
+    pub season: i64,
+    pub count: i64,
+    pub best_score: i64,
+    pub best_resolution: String,
+    pub latest_found: String,
+    pub first_found: String,
+}
+
+/// Singola release "vista nei feed".
+#[derive(Debug, serde::Serialize)]
+pub struct FeedSeenEntry {
+    pub id: i64,
+    pub title: String,
+    pub name: String,
+    pub year: i64,
+    pub season: i64,
+    pub episode: i64,
+    pub resolution: String,
+    pub codec: String,
+    pub audio: String,
+    pub quality_score: i64,
+    pub magnet: String,
+    pub source: String,
+    pub found_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -161,6 +268,46 @@ impl Database {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, seasons TEXT DEFAULT '1+', quality TEXT DEFAULT '', language TEXT DEFAULT 'ita', enabled INTEGER DEFAULT 1, archive_path TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', aliases TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY, series_id INTEGER NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, title TEXT, quality_score INTEGER NOT NULL DEFAULT 0, is_repack INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, archive_path TEXT, size_bytes INTEGER DEFAULT 0, original_title TEXT, rename_verified INTEGER DEFAULT 0, UNIQUE(series_id, season, episode)); CREATE TABLE IF NOT EXISTS movies (id INTEGER PRIMARY KEY, name TEXT, year INTEGER, title TEXT, quality_score INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, size_bytes INTEGER DEFAULT 0, removed_at TEXT); CREATE TABLE IF NOT EXISTS pending_downloads (id INTEGER PRIMARY KEY, series_id INTEGER, season INTEGER, episode INTEGER, best_magnet TEXT, best_quality_score INTEGER, ready_at TEXT); CREATE TABLE IF NOT EXISTS cycle_history (id INTEGER PRIMARY KEY, at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS torrent_meta (hash TEXT PRIMARY KEY, tag TEXT DEFAULT '', source TEXT DEFAULT '', ui_state TEXT DEFAULT '', progress REAL DEFAULT 0, paused INTEGER DEFAULT 0, total_size INTEGER DEFAULT 0, downloaded INTEGER DEFAULT 0, name TEXT DEFAULT '', kind TEXT DEFAULT '', title TEXT DEFAULT '', series_name TEXT DEFAULT '', season INTEGER, episode INTEGER, year INTEGER, quality_score INTEGER DEFAULT 0, metadata_json TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', completed_at TEXT, processed_path TEXT, error TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_episodes_lookup ON episodes(series_id, season, episode); CREATE INDEX IF NOT EXISTS idx_episodes_magnet ON episodes(magnet_hash); CREATE INDEX IF NOT EXISTS idx_episodes_downloaded ON episodes(downloaded_at); CREATE INDEX IF NOT EXISTS idx_movies_magnet ON movies(magnet_hash); CREATE INDEX IF NOT EXISTS idx_movies_removed ON movies(removed_at); CREATE INDEX IF NOT EXISTS idx_torrent_meta_status ON torrent_meta(status); INSERT INTO schema_meta(key,value,updated_at) VALUES ('schema_version','2',datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at;")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS gap_search_log (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, last_searched_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS series_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode_count INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season)); CREATE TABLE IF NOT EXISTS ignored_episodes (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS upgrade_backup (new_hash TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS blocklist (magnet_hash TEXT PRIMARY KEY, title TEXT DEFAULT '', reason TEXT DEFAULT '', created_at TEXT NOT NULL);")?;
+        // "Visti nei feed": tutte le release che passano dalle sorgenti, non solo
+        // quelle in libreria. Tabelle separate per film e serie, con chiave di
+        // raggruppamento calcolata in Rust per unire le release dello stesso titolo.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS movie_feed_seen (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL UNIQUE,
+                name TEXT,
+                year INTEGER DEFAULT 0,
+                resolution TEXT DEFAULT 'unknown',
+                codec TEXT DEFAULT 'unknown',
+                audio TEXT DEFAULT 'unknown',
+                quality_score INTEGER DEFAULT 0,
+                magnet TEXT,
+                source TEXT,
+                found_at TEXT NOT NULL,
+                first_seen_at TEXT,
+                group_key TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_mfs_found ON movie_feed_seen(found_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_mfs_group ON movie_feed_seen(group_key);
+            CREATE TABLE IF NOT EXISTS series_feed_seen (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL UNIQUE,
+                name TEXT,
+                season INTEGER DEFAULT 0,
+                episode INTEGER DEFAULT 0,
+                resolution TEXT DEFAULT 'unknown',
+                codec TEXT DEFAULT 'unknown',
+                audio TEXT DEFAULT 'unknown',
+                quality_score INTEGER DEFAULT 0,
+                magnet TEXT,
+                source TEXT,
+                found_at TEXT NOT NULL,
+                first_seen_at TEXT,
+                group_key TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sfs_found ON series_feed_seen(found_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sfs_group ON series_feed_seen(group_key);",
+        )?;
         for statement in [
             "ALTER TABLE pending_downloads ADD COLUMN best_title TEXT DEFAULT ''",
             "ALTER TABLE pending_downloads ADD COLUMN first_seen_at TEXT",
@@ -216,7 +363,7 @@ impl Database {
             return Ok((false, "blocklisted".into()));
         }
         if release.is_pack {
-            return self.check_series_pack(release, &hash, score);
+            return self.check_series_pack(release, &hash, score, min_score_diff);
         }
         let season = release.season.context("series release has no season")?;
         let episode = release.episode.context("series release has no episode")?;
@@ -231,8 +378,10 @@ impl Database {
             |r| r.get(0),
         )?;
         if self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
+        // Considera duplicato solo un episodio già scaricato/archiviato: una
+        // riga placeholder (downloaded_at NULL) non deve impedire un retry.
         if self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1)",
+            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))",
             [&hash],
             |row| row.get::<_, bool>(0),
         )? {
@@ -251,24 +400,48 @@ impl Database {
             }
             let previous = self.conn.query_row("SELECT id,series_id,season,episode,title,quality_score,magnet_hash,magnet_link,downloaded_at,archive_path,size_bytes FROM episodes WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "series".into(), row_id: row.get(0)?, series_id: Some(row.get(1)?), series_name: Some(series_name.to_owned()), season: Some(row.get(2)?), episode: Some(row.get(3)?), name: None, year: None, title: row.get::<_, Option<String>>(4)?.unwrap_or_default(), quality_score: row.get(5)?, magnet_hash: row.get(6)?, magnet_link: row.get(7)?, downloaded_at: row.get(8)?, archive_path: row.get(9)?, size_bytes: row.get(10)? }))?;
             self.save_upgrade_backup(&hash, &previous)?;
-            self.conn.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=?3,magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, hash, release.magnet, id])?;
+            // Se l'hash è già usato da un altro episodio (es. placeholder di un
+            // pack), non riassegnarlo: mantieni quello esistente.
+            let hash_taken_elsewhere: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 AND NOT (series_id=?2 AND season=?3 AND episode=?4))",
+                params![hash, sid, season, episode],
+                |row| row.get(0),
+            )?;
+            let episode_hash = if hash_taken_elsewhere { None } else { Some(hash.as_str()) };
+            self.conn.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
             return Ok((true, "upgrade".into()));
         }
-        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![sid, season, episode, release.title, score, hash, release.magnet])?;
+        let hash_taken_elsewhere: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1)",
+            [&hash],
+            |row| row.get(0),
+        )?;
+        let episode_hash = if hash_taken_elsewhere { None } else { Some(hash.as_str()) };
+        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![sid, season, episode, release.title, score, episode_hash, release.magnet])?;
         Ok((true, "approved".into()))
     }
 
+    /// Approvazione di un season pack: per un pack completo espande gli episodi
+    /// bersaglio a quelli già noti della stagione (e al conteggio TMDB) e
+    /// confronta la qualità **episodio per episodio**, invece di limitarsi a
+    /// controllare l'esistenza. Così un pack inferiore ai file già presenti
+    /// viene rifiutato (`duplicate`) e non finisce nel client.
     fn check_series_pack(
         &self,
         release: &Release,
         hash: &str,
         score: i64,
+        min_score_diff: i64,
     ) -> Result<(bool, String)> {
         let season = release.season.context("season pack has no season")?;
         let series_name = release.series.as_deref().unwrap_or(&release.title);
-        let mut episodes = release.episode_range.clone();
-        episodes.sort_unstable();
-        episodes.dedup();
+        let explicit: Vec<i64> = release
+            .episode_range
+            .iter()
+            .copied()
+            .filter(|episode| *episode > 0)
+            .collect();
+        let complete = release.episode_range.iter().any(|episode| *episode == 0) || explicit.is_empty();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO series(name) VALUES (?1)",
@@ -279,35 +452,144 @@ impl Database {
             params![series_name],
             |row| row.get(0),
         )?;
-        if episodes.iter().filter(|episode| **episode > 0).any(|episode| tx.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0)).unwrap_or(false)) { return Ok((false, "active_episode".into())); }
+        // Duplicato solo se il pack è già stato scaricato/archiviato: i
+        // placeholder non devono impedire un secondo tentativo (retry).
         if tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 OR magnet_link=?2)",
+            "SELECT EXISTS(SELECT 1 FROM episodes WHERE (magnet_hash=?1 OR magnet_link=?2) AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))",
             params![hash, release.magnet],
             |row| row.get::<_, bool>(0),
         )? {
             return Ok((false, "duplicate".into()));
         }
-        let mut inserted = 0;
-        let mut hash_available = true;
-        for episode in episodes {
-            let exists: Option<(i64, i64)> = tx.query_row("SELECT id,quality_score FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![series_id, season, episode], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-            if exists.is_some() {
+        let mut targets: Vec<i64> = explicit.clone();
+        if complete {
+            let mut statement = tx.prepare(
+                "SELECT DISTINCT episode FROM episodes WHERE series_id=?1 AND season=?2 AND episode>0",
+            )?;
+            let rows = statement.query_map(params![series_id, season], |row| row.get::<_, i64>(0))?;
+            for episode in rows {
+                targets.push(episode?);
+            }
+            if let Ok(count) = tx.query_row(
+                "SELECT episode_count FROM series_metadata WHERE series_name=?1 AND season=?2",
+                params![series_name, season],
+                |row| row.get::<_, i64>(0),
+            ) {
+                if count > 0 && count <= 500 {
+                    targets.extend(1..=count);
+                }
+            }
+        }
+        targets.retain(|episode| *episode > 0);
+        targets.sort_unstable();
+        targets.dedup();
+
+        let mut inserted = 0usize;
+        let mut upgraded = 0usize;
+        // L'hash del pack va assegnato a un solo episodio: se è già presente in
+        // tabella (es. il primo episodio di un tentativo precedente) non va
+        // riassegnato, altrimenti si viola il vincolo UNIQUE.
+        let mut hash_available = !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1)",
+            [hash],
+            |row| row.get::<_, bool>(0),
+        )?;
+        for episode in &targets {
+            // Non toccare gli episodi con un download ancora attivo.
+            let active = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))",
+                params![series_name, season, episode],
+                |row| row.get::<_, bool>(0),
+            ).unwrap_or(false);
+            if active {
                 continue;
             }
-            let episode_hash = if hash_available {
-                hash_available = false;
-                Some(hash)
-            } else {
-                None::<&str>
-            };
-            tx.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![series_id, season, episode, release.title, score, episode_hash, release.magnet])?;
-            inserted += 1;
+            let existing: Option<(i64, i64, String)> = tx.query_row(
+                "SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3",
+                params![series_id, season, episode],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            match existing {
+                None => {
+                    let episode_hash = if hash_available {
+                        hash_available = false;
+                        Some(hash)
+                    } else {
+                        None
+                    };
+                    tx.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![series_id, season, episode, release.title, score, episode_hash, release.magnet])?;
+                    inserted += 1;
+                }
+                Some((id, existing_score, existing_title)) => {
+                    let old_quality = parse_quality(&existing_title);
+                    if release
+                        .quality
+                        .upgrade_reason(&old_quality, score, existing_score, min_score_diff)
+                        .is_some()
+                    {
+                        let previous = tx.query_row("SELECT id,series_id,season,episode,title,quality_score,magnet_hash,magnet_link,downloaded_at,archive_path,size_bytes FROM episodes WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "series".into(), row_id: row.get(0)?, series_id: Some(row.get(1)?), series_name: Some(series_name.to_owned()), season: Some(row.get(2)?), episode: Some(row.get(3)?), name: None, year: None, title: row.get::<_, Option<String>>(4)?.unwrap_or_default(), quality_score: row.get(5)?, magnet_hash: row.get(6)?, magnet_link: row.get(7)?, downloaded_at: row.get(8)?, archive_path: row.get(9)?, size_bytes: row.get(10)? }))?;
+                        self.save_upgrade_backup(hash, &previous)?;
+                        // Solo il primo episodio porta il magnet_hash (UNIQUE).
+                        let episode_hash = if hash_available {
+                            hash_available = false;
+                            Some(hash)
+                        } else {
+                            None
+                        };
+                        // COALESCE: se non assegniamo l'hash, mantieni quello esistente.
+                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
+                        upgraded += 1;
+                    }
+                }
+            }
+        }
+        // Stagione sconosciuta (nessun episodio noto): mantieni il placeholder
+        // stagionale, come faceva la versione precedente.
+        if targets.is_empty() && complete {
+            let existing: Option<(i64, i64, String)> = tx.query_row(
+                "SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=0",
+                params![series_id, season],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            match existing {
+                None => {
+                    let episode_hash = if hash_available {
+                        hash_available = false;
+                        Some(hash)
+                    } else {
+                        None
+                    };
+                    tx.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,0,?3,?4,?5,?6)", params![series_id, season, release.title, score, episode_hash, release.magnet])?;
+                    inserted += 1;
+                }
+                Some((id, existing_score, existing_title)) => {
+                    if release
+                        .quality
+                        .upgrade_reason(&parse_quality(&existing_title), score, existing_score, min_score_diff)
+                        .is_some()
+                    {
+                        let episode_hash = if hash_available {
+                            hash_available = false;
+                            Some(hash)
+                        } else {
+                            None
+                        };
+                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
+                        upgraded += 1;
+                    }
+                }
+            }
         }
         tx.commit()?;
+        let approved = inserted + upgraded > 0;
         Ok((
-            inserted > 0,
-            if inserted > 0 {
-                "approved"
+            approved,
+            if approved {
+                if upgraded > 0 {
+                    "upgrade"
+                } else {
+                    "approved"
+                }
             } else {
                 "duplicate"
             }
@@ -551,6 +833,7 @@ impl Database {
                 season: row.get(2)?,
                 episode: row.get(3)?,
                 title: row.get(4)?,
+                renamed_title: String::new(),
                 quality_score: row.get(5)?,
                 downloaded_at: row.get(6)?,
                 archive_path: row.get(7)?,
@@ -589,6 +872,7 @@ impl Database {
                     season,
                     episode,
                     title: String::new(),
+                    renamed_title: String::new(),
                     quality_score: 0,
                     downloaded_at: None,
                     archive_path: None,
@@ -600,6 +884,16 @@ impl Database {
                     ignored,
                 });
             }
+        }
+        // Titolo mostrato nel dettaglio serie: il nome del file rinominato in
+        // libreria, non quello scaricato. La preview di rinomina continua a
+        // usare `title` (release originale) e il percorso reale del file.
+        for item in items.iter_mut() {
+            item.renamed_title = item
+                .archive_path
+                .as_deref()
+                .map(renamed_file_title)
+                .unwrap_or_default();
         }
         items.sort_by_key(|item| (item.season, item.episode));
         Ok(items)
@@ -749,7 +1043,10 @@ impl Database {
             [series_name],
             |row| row.get(0),
         )?;
-        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,0,datetime('now'),?5,?6) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=excluded.title,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes", params![series_id, season, episode, title, path, size_bytes])?;
+        // Uno score reale dal nome file: prima era 0, quindi ogni file
+        // scansionato risultava "inferiore" e veniva ri-scaricato.
+        let score = parse_quality(title).score();
+        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=excluded.title,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=CASE WHEN episodes.quality_score=0 THEN excluded.quality_score ELSE episodes.quality_score END", params![series_id, season, episode, title, score, path, size_bytes])?;
         Ok(())
     }
 
@@ -911,25 +1208,44 @@ impl Database {
         self.stored_torrents_query(limit, true)
     }
 
-    /// Completed downloads only, for the "Storico download" table: partials are
-    /// left to the live download list so the history stays useful.
-    pub fn completed_torrents(&self, limit: usize) -> Result<Vec<StoredTorrent>> {
-        let mut statement = self.conn.prepare("SELECT hash,COALESCE(name,''),COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,'') FROM torrent_meta WHERE TRIM(COALESCE(name,'')) != '' AND (COALESCE(progress,0) >= 1 OR status='completed') ORDER BY updated_at DESC LIMIT ?1")?;
-        let rows = statement.query_map([limit.clamp(1, 2000) as i64], |row| {
-            Ok(StoredTorrent {
-                hash: row.get(0)?,
-                name: row.get(1)?,
-                tag: row.get(2)?,
-                source: row.get(3)?,
-                progress: row.get(4)?,
-                paused: row.get::<_, i64>(5)? != 0,
-                total_size: row.get(6)?,
-                downloaded: row.get(7)?,
-                status: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    /// Download conclusi per la tabella "Storico download".
+    ///
+    /// Include sia le release completate da Rextto (`status='completed'`, con
+    /// `processed_path` in libreria) sia quelle importate dal legacy che hanno
+    /// raggiunto il 100% ma il cui stato non è stato aggiornato (`progress>=1`).
+    /// I fallimenti (`status='error'` o `error` valorizzato, es. release
+    /// scartata come inferiore) sono esclusi per non confondere lo storico.
+    /// Il nome usa, nell'ordine, `name`,
+    /// `title` o `series_name`: le righe native non popolano `name`.
+    /// Ritorna `(items_della_pagina, totale)`. `offset` è l'indice di partenza.
+    pub fn completed_torrents(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<StoredTorrent>, i64)> {
+        const WHERE: &str = "FROM torrent_meta
+             WHERE status <> 'error'
+               AND COALESCE(error,'') = ''
+               AND (status = 'completed' OR COALESCE(progress,0) >= 1)
+               AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''";
+        let total: i64 = self
+            .conn
+            .query_row(&format!("SELECT COUNT(*) {WHERE}"), [], |row| row.get(0))?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT hash,
+                    COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,''),hash),
+                    COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),
+                    COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,''),
+                    COALESCE(kind,''),COALESCE(series_name,''),COALESCE(season,0),COALESCE(episode,0),
+                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,'')
+             {WHERE}
+             ORDER BY COALESCE(NULLIF(completed_at,''), updated_at) DESC LIMIT ?1 OFFSET ?2"
+        ))?;
+        let rows = statement.query_map(
+            [limit.clamp(1, 2000) as i64, offset as i64],
+            stored_torrent_from_row,
+        )?;
+        Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
     }
 
     pub fn stored_torrents_all(&self, limit: usize) -> Result<Vec<StoredTorrent>> {
@@ -942,21 +1258,17 @@ impl Database {
         } else {
             ""
         };
-        let mut statement = self.conn.prepare(&format!("SELECT hash,COALESCE(name,''),COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,'') FROM torrent_meta WHERE TRIM(COALESCE(name,'')) != '' {filter} ORDER BY updated_at DESC LIMIT ?1"))?;
-        let rows = statement.query_map([limit.clamp(1, 2000) as i64], |row| {
-            Ok(StoredTorrent {
-                hash: row.get(0)?,
-                name: row.get(1)?,
-                tag: row.get(2)?,
-                source: row.get(3)?,
-                progress: row.get(4)?,
-                paused: row.get::<_, i64>(5)? != 0,
-                total_size: row.get(6)?,
-                downloaded: row.get(7)?,
-                status: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        })?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT hash,COALESCE(name,''),COALESCE(tag,''),COALESCE(source,''),COALESCE(progress,0),COALESCE(paused,0),
+                    COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,''),
+                    COALESCE(kind,''),COALESCE(series_name,''),COALESCE(season,0),COALESCE(episode,0),
+                    COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,'')
+             FROM torrent_meta WHERE TRIM(COALESCE(name,'')) != '' {filter} ORDER BY updated_at DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map(
+            [limit.clamp(1, 2000) as i64],
+            stored_torrent_from_row,
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1125,6 +1437,14 @@ impl Database {
             })
             .collect())
     }
+    /// Ricalcola gli score con i pesi configurati e li normalizza.
+    ///
+    /// Oltre alle release ancora tracciate in `torrent_meta`, aggiorna anche
+    /// episodi/film importati o scansionati (senza `torrent_meta`): il loro
+    /// `quality_score` era lo score *base* mentre le approvazioni usano i pesi
+    /// personalizzati, e questo li faceva apparire inferiori → riscaricamenti.
+    /// La qualità si ricava dal titolo o, in mancanza, dal nome del file
+    /// archiviato; se non è riconoscibile il record resta invariato.
     pub fn rescore(&self, settings: &std::collections::BTreeMap<String, String>) -> Result<usize> {
         let mut statement = self
             .conn
@@ -1141,17 +1461,68 @@ impl Database {
             };
             let score = meta.release.quality.score_with_settings(settings);
             changed += self.conn.execute(
-                "UPDATE episodes SET quality_score=?1 WHERE magnet_hash=?2",
+                "UPDATE episodes SET quality_score=?1 WHERE lower(magnet_hash)=lower(?2)",
                 params![score, hash],
             )?;
             changed += self.conn.execute(
-                "UPDATE movies SET quality_score=?1 WHERE magnet_hash=?2",
+                "UPDATE movies SET quality_score=?1 WHERE lower(magnet_hash)=lower(?2)",
                 params![score, hash],
             )?;
             changed += self.conn.execute(
-                "UPDATE torrent_meta SET quality_score=?1,updated_at=?2 WHERE hash=?3",
+                "UPDATE torrent_meta SET quality_score=?1,updated_at=?2 WHERE lower(hash)=lower(?3)",
                 params![score, Utc::now().to_rfc3339(), hash],
             )?;
+        }
+        // Episodi senza una release tracciata: normalizza dal titolo o dal file.
+        let episodes = self
+            .conn
+            .prepare(
+                "SELECT e.id, COALESCE(e.title,''), COALESCE(e.archive_path,'') FROM episodes e
+                 WHERE e.magnet_hash IS NULL
+                    OR NOT EXISTS(SELECT 1 FROM torrent_meta t WHERE lower(t.hash)=lower(e.magnet_hash) AND COALESCE(t.metadata_json,'') != '')",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, title, path) in episodes {
+            let quality = meaningful_quality(&title).or_else(|| {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                meaningful_quality(name)
+            });
+            if let Some(quality) = quality {
+                changed += self.conn.execute(
+                    "UPDATE episodes SET quality_score=?1 WHERE id=?2",
+                    params![quality.score_with_settings(settings), id],
+                )?;
+            }
+        }
+        // Film senza una release tracciata.
+        let movies = self
+            .conn
+            .prepare(
+                "SELECT m.id, COALESCE(NULLIF(m.title,''), m.name, '') FROM movies m
+                 WHERE m.magnet_hash IS NULL
+                    OR NOT EXISTS(SELECT 1 FROM torrent_meta t WHERE lower(t.hash)=lower(m.magnet_hash) AND COALESCE(t.metadata_json,'') != '')",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, title) in movies {
+            if let Some(quality) = meaningful_quality(&title) {
+                changed += self.conn.execute(
+                    "UPDATE movies SET quality_score=?1 WHERE id=?2",
+                    params![quality.score_with_settings(settings), id],
+                )?;
+            }
         }
         Ok(changed)
     }
@@ -1180,16 +1551,21 @@ impl Database {
         let movie_clause = keyword_clause(&["COALESCE(title,name)"], keywords.len());
         let episode_clause = keyword_clause(&["s.name"], keywords.len());
         let series_clause = keyword_clause(&["name"], keywords.len());
+        let seen_clause = keyword_clause(&["COALESCE(name,title)"], keywords.len());
         let mut bindings = keyword_bindings(&keywords, &["name", "title", "series_name"]);
         bindings.extend(keyword_bindings(&keywords, &["COALESCE(title,name)"]));
         bindings.extend(keyword_bindings(&keywords, &["s.name"]));
         bindings.extend(keyword_bindings(&keywords, &["name"]));
+        bindings.extend(keyword_bindings(&keywords, &["COALESCE(name,title)"]));
+        bindings.extend(keyword_bindings(&keywords, &["COALESCE(name,title)"]));
         let count: i64 = self.conn.query_row(
             &format!(
                 "SELECT (SELECT COUNT(*) FROM torrent_meta WHERE {torrent_clause}) \
                  + (SELECT COUNT(*) FROM movies WHERE {movie_clause}) \
                  + (SELECT COUNT(*) FROM episodes e JOIN series s ON s.id=e.series_id WHERE {episode_clause}) \
-                 + (SELECT COUNT(*) FROM series WHERE {series_clause})"
+                 + (SELECT COUNT(*) FROM series WHERE {series_clause}) \
+                 + (SELECT COUNT(*) FROM movie_feed_seen WHERE {seen_clause}) \
+                 + (SELECT COUNT(*) FROM series_feed_seen WHERE {seen_clause})"
             ),
             params_from_iter(bindings.iter()),
             |row| row.get(0),
@@ -1230,6 +1606,113 @@ impl Database {
         removed += self.conn.execute(
             &format!("DELETE FROM series WHERE {series_clause}"),
             params_from_iter(series_bindings.iter()),
+        )?;
+        let seen_clause = keyword_clause(&["COALESCE(name,title)"], keywords.len());
+        let seen_bindings = keyword_bindings(&keywords, &["COALESCE(name,title)"]);
+        removed += self.conn.execute(
+            &format!("DELETE FROM movie_feed_seen WHERE {seen_clause}"),
+            params_from_iter(seen_bindings.iter()),
+        )?;
+        removed += self.conn.execute(
+            &format!("DELETE FROM series_feed_seen WHERE {seen_clause}"),
+            params_from_iter(seen_bindings.iter()),
+        )?;
+        Ok(removed)
+    }
+
+    /// Anteprima della pulizia per parola chiave: elenca gli elementi che
+    /// corrispondono (torrent, film, episodi, serie e "visti nei feed") senza
+    /// rimuoverli, così l'utente vede *cosa* verrebbe eliminato.
+    pub fn search_keywords(
+        &self,
+        keywords: &[String],
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let keywords = normalized_keyword_terms(keywords);
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 1000);
+        let queries: Vec<(&str, &str, &[&str])> = vec![
+            (
+                "Torrent",
+                "SELECT COALESCE(NULLIF(name,''),NULLIF(title,''),series_name,hash), COALESCE(status,'') FROM torrent_meta WHERE ",
+                &["name", "title", "series_name"],
+            ),
+            (
+                "Film",
+                "SELECT COALESCE(NULLIF(title,''),name,''), CAST(COALESCE(year,0) AS TEXT) FROM movies WHERE ",
+                &["COALESCE(title,name)"],
+            ),
+            (
+                "Episodio",
+                "SELECT s.name || ' S' || printf('%02d',e.season) || 'E' || printf('%02d',e.episode), COALESCE(e.title,'') FROM episodes e JOIN series s ON s.id=e.series_id WHERE ",
+                &["s.name"],
+            ),
+            (
+                "Serie",
+                "SELECT name, COALESCE(quality,'') FROM series WHERE ",
+                &["name"],
+            ),
+            (
+                "Film (feed)",
+                "SELECT COALESCE(NULLIF(name,''),title), 'visto nei feed' FROM movie_feed_seen WHERE ",
+                &["COALESCE(name,title)"],
+            ),
+            (
+                "Serie (feed)",
+                "SELECT COALESCE(NULLIF(name,''),title), 'visto nei feed' FROM series_feed_seen WHERE ",
+                &["COALESCE(name,title)"],
+            ),
+        ];
+        let mut items = Vec::new();
+        for (source, sql, columns) in queries {
+            let clause = keyword_clause(columns, keywords.len());
+            let bindings = keyword_bindings(&keywords, columns);
+            let mut statement = self.conn.prepare(&format!("{sql}{clause} LIMIT {limit}"))?;
+            let rows = statement.query_map(params_from_iter(bindings.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (title, detail) = row?;
+                items.push(serde_json::json!({
+                    "source": source,
+                    "title": title,
+                    "detail": detail,
+                }));
+            }
+        }
+        Ok(items)
+    }
+
+    /// Numero di gruppi distinti "visti nei feed" (film, serie).
+    pub fn seen_counts(&self) -> Result<(i64, i64)> {
+        let movies: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT group_key) FROM movie_feed_seen WHERE group_key IS NOT NULL AND group_key <> ''",
+            [],
+            |row| row.get(0),
+        )?;
+        let series: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT group_key) FROM series_feed_seen WHERE group_key IS NOT NULL AND group_key <> ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((movies, series))
+    }
+
+    /// Elimina le release "viste" più vecchie di `days` giorni (0 = nessuna pulizia).
+    pub fn prune_seen_older_than(&self, days: i64) -> Result<usize> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(days.max(1))).to_rfc3339();
+        let mut removed = self.conn.execute(
+            "DELETE FROM movie_feed_seen WHERE found_at < ?1",
+            [&cutoff],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM series_feed_seen WHERE found_at < ?1",
+            [&cutoff],
         )?;
         Ok(removed)
     }
@@ -1355,6 +1838,240 @@ impl Database {
         )?;
         Ok(reset)
     }
+
+    /// Registra nel "visto nei feed" tutte le release di un ciclo, in un'unica
+    /// transazione. Le release già note vengono aggiornate (found_at, magnet,
+    /// qualità) mantenendo `first_seen_at` originale.
+    pub fn record_seen_batch(&self, releases: &[Release]) -> Result<()> {
+        if releases.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        for release in releases {
+            if release.kind == "series" {
+                insert_series_seen(&transaction, release)?;
+            } else {
+                insert_movie_seen(&transaction, release)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn movies_seen_grouped(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: &str,
+    ) -> Result<(Vec<FeedSeenGroup>, i64)> {
+        let like = seen_like_pattern(query);
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT group_key) FROM movie_feed_seen
+             WHERE group_key IS NOT NULL AND group_key <> '' AND COALESCE(name,title) LIKE ?1",
+            [&like],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            "SELECT group_key,
+                    MAX(COALESCE(NULLIF(name,''),title)) AS group_name,
+                    MAX(year) AS year,
+                    0 AS season,
+                    COUNT(*) AS cnt,
+                    MAX(quality_score) AS best_score,
+                    SUBSTR(MAX(PRINTF('%010d', quality_score) || COALESCE(resolution,'unknown')),11) AS best_resolution,
+                    MAX(found_at) AS latest_found,
+                    MIN(COALESCE(first_seen_at,found_at)) AS first_found
+             FROM movie_feed_seen
+             WHERE group_key IS NOT NULL AND group_key <> '' AND COALESCE(name,title) LIKE ?3
+             GROUP BY group_key ORDER BY latest_found DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![limit.clamp(1, 500) as i64, offset as i64, like],
+            feed_seen_group_from_row,
+        )?;
+        let groups = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((groups, total))
+    }
+
+    pub fn series_seen_grouped(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: &str,
+    ) -> Result<(Vec<FeedSeenGroup>, i64)> {
+        let like = seen_like_pattern(query);
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT group_key) FROM series_feed_seen
+             WHERE group_key IS NOT NULL AND group_key <> '' AND COALESCE(name,title) LIKE ?1",
+            [&like],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            "SELECT group_key,
+                    MAX(COALESCE(NULLIF(name,''),title)) AS group_name,
+                    0 AS year,
+                    MAX(season) AS season,
+                    COUNT(*) AS cnt,
+                    MAX(quality_score) AS best_score,
+                    SUBSTR(MAX(PRINTF('%010d', quality_score) || COALESCE(resolution,'unknown')),11) AS best_resolution,
+                    MAX(found_at) AS latest_found,
+                    MIN(COALESCE(first_seen_at,found_at)) AS first_found
+             FROM series_feed_seen
+             WHERE group_key IS NOT NULL AND group_key <> '' AND COALESCE(name,title) LIKE ?3
+             GROUP BY group_key ORDER BY latest_found DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![limit.clamp(1, 500) as i64, offset as i64, like],
+            feed_seen_group_from_row,
+        )?;
+        let groups = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((groups, total))
+    }
+
+    /// Release di un gruppo "visto" (film o serie), dalla migliore qualità.
+    pub fn seen_by_group(&self, kind: &str, group_key: &str, limit: usize) -> Result<Vec<FeedSeenEntry>> {
+        let table = if kind == "series" {
+            "series_feed_seen"
+        } else {
+            "movie_feed_seen"
+        };
+        let sql = format!(
+            "SELECT id,title,COALESCE(name,''),{year},{season},{episode},COALESCE(resolution,'unknown'),COALESCE(codec,'unknown'),COALESCE(audio,'unknown'),COALESCE(quality_score,0),COALESCE(magnet,''),COALESCE(source,''),found_at
+             FROM {table} WHERE group_key=?1 ORDER BY quality_score DESC, found_at DESC LIMIT ?2",
+            year = if kind == "series" { "0" } else { "COALESCE(year,0)" },
+            season = if kind == "series" { "COALESCE(season,0)" } else { "0" },
+            episode = if kind == "series" { "COALESCE(episode,0)" } else { "0" }
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![group_key, limit.clamp(1, 1000) as i64],
+            feed_seen_entry_from_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+/// Pattern LIKE per la ricerca nei gruppi "visti", con la stessa semantica del
+/// legacy: `*`/`?` sono wildcard, altrimenti la parola è cercata come sottostringa.
+fn seen_like_pattern(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return "%".to_string();
+    }
+    if trimmed.contains('*') || trimmed.contains('?') {
+        trimmed.replace('*', "%").replace('?', "_")
+    } else {
+        format!("%{trimmed}%")
+    }
+}
+
+fn insert_movie_seen(conn: &Connection, release: &Release) -> Result<()> {
+    let name = crate::utils::extract_clean_movie_name(&release.title);
+    let group_key = crate::utils::condensed_key(&name);
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO movie_feed_seen (title,name,year,resolution,codec,audio,quality_score,magnet,source,found_at,first_seen_at,group_key)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11)
+         ON CONFLICT(title) DO UPDATE SET
+             found_at=excluded.found_at,
+             magnet=excluded.magnet,
+             source=excluded.source,
+             name=excluded.name,
+             year=excluded.year,
+             quality_score=excluded.quality_score,
+             resolution=excluded.resolution,
+             codec=excluded.codec,
+             audio=excluded.audio,
+             group_key=excluded.group_key,
+             first_seen_at=COALESCE(movie_feed_seen.first_seen_at, excluded.first_seen_at)",
+        params![
+            release.title,
+            name,
+            release.year.unwrap_or(0),
+            release.quality.resolution,
+            release.quality.codec,
+            release.quality.audio,
+            release.quality.score(),
+            release.magnet,
+            release.source,
+            now,
+            group_key,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_series_seen(conn: &Connection, release: &Release) -> Result<()> {
+    let name = release
+        .series
+        .clone()
+        .unwrap_or_else(|| release.title.clone());
+    let group_key = crate::utils::condensed_key(&name);
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO series_feed_seen (title,name,season,episode,resolution,codec,audio,quality_score,magnet,source,found_at,first_seen_at,group_key)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12)
+         ON CONFLICT(title) DO UPDATE SET
+             found_at=excluded.found_at,
+             magnet=excluded.magnet,
+             source=excluded.source,
+             name=excluded.name,
+             season=excluded.season,
+             episode=excluded.episode,
+             quality_score=excluded.quality_score,
+             resolution=excluded.resolution,
+             codec=excluded.codec,
+             audio=excluded.audio,
+             group_key=excluded.group_key,
+             first_seen_at=COALESCE(series_feed_seen.first_seen_at, excluded.first_seen_at)",
+        params![
+            release.title,
+            name,
+            release.season.unwrap_or(0),
+            release.episode.unwrap_or(0),
+            release.quality.resolution,
+            release.quality.codec,
+            release.quality.audio,
+            release.quality.score(),
+            release.magnet,
+            release.source,
+            now,
+            group_key,
+        ],
+    )?;
+    Ok(())
+}
+
+fn feed_seen_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedSeenGroup> {
+    Ok(FeedSeenGroup {
+        group_key: row.get(0)?,
+        group_name: row.get(1)?,
+        year: row.get(2)?,
+        season: row.get(3)?,
+        count: row.get(4)?,
+        best_score: row.get(5)?,
+        best_resolution: row.get(6)?,
+        latest_found: row.get(7)?,
+        first_found: row.get(8)?,
+    })
+}
+
+fn feed_seen_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedSeenEntry> {
+    Ok(FeedSeenEntry {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        name: row.get(2)?,
+        year: row.get(3)?,
+        season: row.get(4)?,
+        episode: row.get(5)?,
+        resolution: row.get(6)?,
+        codec: row.get(7)?,
+        audio: row.get(8)?,
+        quality_score: row.get(9)?,
+        magnet: row.get(10)?,
+        source: row.get(11)?,
+        found_at: row.get(12)?,
+    })
 }
 
 fn normalized_keyword_terms(keywords: &[String]) -> Vec<String> {
@@ -1733,6 +2450,270 @@ mod tests {
         assert!(downloads
             .iter()
             .any(|item| item.kind == "movie" && item.size_bytes == 99));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn records_and_groups_seen_movies_and_series() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-seen-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let movie = |title: &str, resolution: &str| Release {
+            title: title.into(),
+            magnet: format!(
+                "magnet:?xt=urn:btih:{}",
+                crate::utils::stable_id(title)
+            ),
+            source: "rss".into(),
+            quality: Quality {
+                resolution: resolution.into(),
+                ..Default::default()
+            },
+            kind: "movie".into(),
+            series: None,
+            season: None,
+            episode: None,
+            is_pack: false,
+            episode_range: Vec::new(),
+            year: Some(2024),
+            discovered_at: Utc::now(),
+        };
+        let mut series_release = release();
+        series_release.series = Some("Example Show".into());
+        db.record_seen_batch(&[
+            movie("The.Veil.2024.1080p.BluRay", "1080p"),
+            movie("The.Veil.2024.2160p.WEB-DL", "2160p"),
+            series_release,
+        ])
+        .unwrap();
+        let (groups, total) = db.movies_seen_grouped(0, 50, "").unwrap();
+        assert_eq!(total, 1, "le due release dello stesso film formano un gruppo");
+        assert_eq!(groups[0].group_name, "The Veil");
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[0].best_resolution, "2160p");
+        let entries = db.seen_by_group("movie", &groups[0].group_key, 50).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].resolution, "2160p");
+        let (series_groups, series_total) = db.series_seen_grouped(0, 50, "").unwrap();
+        // La ricerca testuale filtra i gruppi.
+        let (filtered, filtered_total) = db.movies_seen_grouped(0, 50, "veil").unwrap();
+        assert_eq!(filtered_total, 1);
+        assert_eq!(filtered[0].count, 2);
+        let (none, none_total) = db.movies_seen_grouped(0, 50, "inesistente").unwrap();
+        assert_eq!(none_total, 0);
+        assert!(none.is_empty());
+        assert_eq!(series_total, 1);
+        assert_eq!(series_groups[0].group_name, "Example Show");
+        assert_eq!(series_groups[0].season, 1);
+        // Pulizia per età: le righe retrodatate vengono rimosse.
+        db.conn
+            .execute(
+                "UPDATE movie_feed_seen SET found_at='2000-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.prune_seen_older_than(30).unwrap(), 2);
+        assert_eq!(db.seen_counts().unwrap(), (0, 1));
+        assert_eq!(db.prune_seen_older_than(0).unwrap(), 0);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn extracts_renamed_title_from_archive_path() {
+        assert_eq!(
+            renamed_file_title("/home/user/SerieTV/Show - S01E01 - Pilot - [1080p].mkv"),
+            "Show - S01E01 - Pilot - [1080p]"
+        );
+        // Le cartelle (import vecchi) e i percorsi vuoti non hanno un nome file.
+        assert_eq!(renamed_file_title("/home/user/SerieTV/Show/"), "");
+        assert_eq!(renamed_file_title(""), "");
+    }
+
+    #[test]
+    fn season_pack_inferior_to_existing_episodes_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-pack-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Reacher')", [])
+            .unwrap();
+        // Episodi 2160p già archiviati (score alto).
+        for episode in 1..=3 {
+            db.conn
+                .execute(
+                    "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path) VALUES (1,4,?1,?2,1510,datetime('now'),'/x')",
+                    params![
+                        episode,
+                        format!("Reacher.S04E0{episode}.ITA.ENG.2160p.AMZN.WEB-DL.DDP5.1.DV.HDR.H.265-MeM")
+                    ],
+                )
+                .unwrap();
+        }
+        let pack = Release {
+            title: "Reacher - Season 04 (2026) [1080p H265 ITA ENG EAC3 SUB ITA ENG WEB-DL]".into(),
+            magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".into(),
+            source: "ExtTo".into(),
+            quality: parse_quality(
+                "Reacher - Season 04 (2026) [1080p H265 ITA ENG EAC3 SUB ITA ENG WEB-DL]",
+            ),
+            kind: "series".into(),
+            series: Some("Reacher".into()),
+            season: Some(4),
+            episode: Some(0),
+            is_pack: true,
+            episode_range: vec![0],
+            year: Some(2026),
+            discovered_at: Utc::now(),
+        };
+        let score = pack.quality.score();
+        assert!(score < 1510, "il pack 1080p deve avere score inferiore");
+        let (approved, reason) = db.check_series_scored(&pack, score, 50).unwrap();
+        assert!(!approved, "pack inferiore non deve essere approvato");
+        assert_eq!(reason, "duplicate");
+
+        // Pack per una stagione senza episodi: approvato (gap fill).
+        let mut gap = pack.clone();
+        gap.season = Some(5);
+        gap.title = "Reacher - Season 05 (2027) [1080p H265 ITA ENG]".into();
+        gap.magnet = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".into();
+        let (approved_gap, _) = db.check_series_scored(&gap, score, 50).unwrap();
+        assert!(approved_gap, "pack per stagione vuota deve essere approvato");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn season_pack_can_be_retried_when_placeholder_not_downloaded() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-retry-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Neagley')", [])
+            .unwrap();
+        let hash = "3333333333333333333333333333333333333333";
+        let magnet = format!("magnet:?xt=urn:btih:{hash}");
+        // Placeholder del pack precedente: esistono ma NON scaricati.
+        for episode in 1..=2 {
+            // Come nel flusso reale: solo il primo episodio porta il magnet_hash.
+            let episode_hash: Option<&str> = if episode == 1 { Some(hash) } else { None };
+            db.conn
+                .execute(
+                    "INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link,downloaded_at) VALUES (1,1,?1,?2,1680,?3,?4,NULL)",
+                    params![
+                        episode,
+                        format!("Neagley.S01E0{episode}.2160p.DV.HDR.H.265-G66"),
+                        episode_hash,
+                        magnet
+                    ],
+                )
+                .unwrap();
+        }
+        let pack = Release {
+            title: "Neagley.S01E01-02.2160p.AMZN.WEB-DL.ITA.ENG.DDP5.1.DV.HDR.H.265-G66".into(),
+            magnet: magnet.clone(),
+            source: "ExtTo".into(),
+            quality: parse_quality(
+                "Neagley.S01E01-02.2160p.AMZN.WEB-DL.ITA.ENG.DDP5.1.DV.HDR.H.265-G66",
+            ),
+            kind: "series".into(),
+            series: Some("Neagley".into()),
+            season: Some(1),
+            episode: Some(1),
+            is_pack: true,
+            episode_range: vec![1, 2],
+            year: Some(2026),
+            discovered_at: Utc::now(),
+        };
+        let score = pack.quality.score();
+        // Retry consentito: i placeholder non sono "già scaricati".
+        let (approved, _) = db.check_series_scored(&pack, score, 50).unwrap();
+        assert!(approved, "un placeholder non scaricato non deve bloccare il retry");
+        // Ora l'episodio risulta scaricato: stesso magnet -> duplicato.
+        db.conn
+            .execute(
+                "UPDATE episodes SET downloaded_at=datetime('now') WHERE magnet_hash=?1 OR magnet_link=?2",
+                params![hash, magnet],
+            )
+            .unwrap();
+        let (approved_again, reason) = db.check_series_scored(&pack, score, 50).unwrap();
+        assert!(!approved_again);
+        assert_eq!(reason, "duplicate");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn rescore_normalizes_base_scores_with_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-rescore-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Show')", [])
+            .unwrap();
+        // Titolo generico: la qualità va recuperata dal nome file.
+        db.conn
+            .execute(
+                "INSERT INTO episodes(id,series_id,season,episode,title,quality_score,archive_path,downloaded_at) VALUES (1,1,1,1,'Prova di fiducia',980,'/nas/Show - S01E01 - Prova - [1080p][h265].mkv',datetime('now'))",
+                [],
+            )
+            .unwrap();
+        // Titolo con qualità.
+        db.conn
+            .execute(
+                "INSERT INTO episodes(id,series_id,season,episode,title,quality_score,downloaded_at) VALUES (2,1,1,2,'Show.S01E02.1080p.WEB-DL.H.265',1000,datetime('now'))",
+                [],
+            )
+            .unwrap();
+        // Niente qualità né file: resta invariato.
+        db.conn
+            .execute(
+                "INSERT INTO episodes(id,series_id,season,episode,title,quality_score) VALUES (3,1,1,3,'Episodio 3',500)",
+                [],
+            )
+            .unwrap();
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert("score_res_1080p".to_string(), "1500".to_string());
+        db.rescore(&settings).unwrap();
+        let score = |id: i64| -> i64 {
+            db.conn
+                .query_row("SELECT quality_score FROM episodes WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(score(1), 1700, "1080p h265 base 1200 + 500");
+        assert_eq!(score(2), 1900, "1080p webdl h265 1400 + 500");
+        assert_eq!(score(3), 500, "senza qualità non va toccato");
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

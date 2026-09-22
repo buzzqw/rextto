@@ -160,6 +160,22 @@ pub struct ArchiveQuery {
     pub limit: Option<usize>,
 }
 #[derive(serde::Deserialize)]
+pub struct SeenQuery {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
+    /// Ricerca testuale nei gruppi (`*`/`?` come wildcard).
+    pub q: Option<String>,
+    /// Chiave di gruppo (`group_key`) per il dettaglio di un titolo.
+    pub key: Option<String>,
+    pub group: Option<String>,
+    pub kind: Option<String>,
+}
+#[derive(serde::Deserialize)]
+pub struct HistoryQuery {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
+}
+#[derive(serde::Deserialize)]
 pub struct LogQuery {
     pub limit: Option<usize>,
 }
@@ -382,6 +398,10 @@ pub struct PruneInput {
     pub retain_cycles: Option<i64>,
     #[serde(default)]
     pub error_age_days: Option<i64>,
+    /// Età in giorni oltre la quale eliminare le release "viste nei feed"
+    /// (assente o 0 = conserva tutto).
+    #[serde(default)]
+    pub seen_retention_days: Option<i64>,
 }
 #[derive(serde::Deserialize, Default)]
 pub struct DbActionInput {
@@ -559,6 +579,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/health", get(sources_health))
         .route("/api/flaresolverr/test", post(flaresolverr_test))
         .route("/api/config/check-ports", get(check_ports))
+        .route("/api/network/interfaces", get(network_interfaces_view))
         .route("/api/db/info", get(db_info))
         .route("/api/db/action", post(db_action))
         .route("/api/db/prune", post(db_prune))
@@ -604,6 +625,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/archive/add", post(add_archive_entry))
         .route("/api/archive/delete", post(delete_archive_entry))
         .route("/api/archive/batch-download", post(batch_archive_download))
+        .route("/api/movies/seen/grouped", get(movies_seen_grouped_view))
+        .route("/api/movies/seen", get(movies_seen_view))
+        .route("/api/series/seen/grouped", get(series_seen_grouped_view))
+        .route("/api/series/seen", get(series_seen_view))
         .route("/api/torrent-events", get(torrent_events))
         .route("/api/torrents", post(add_torrent))
         .route("/api/blocklist", get(blocklist_entries))
@@ -613,6 +638,11 @@ pub fn router(state: AppState) -> Router {
             post(mark_torrent_failed),
         )
         .route("/api/maintenance/clean-trash", post(clean_trash))
+        .route(
+            "/api/maintenance/clean-duplicates",
+            post(clean_duplicates),
+        )
+        .route("/api/maintenance/restore-source", post(restore_source))
         .route("/api/search", post(manual_search))
         .route("/api/manual-search", get(manual_search_get))
         .route("/api/search/add", post(add_search_result))
@@ -977,10 +1007,12 @@ async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
 }
 async fn status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
+    let (seen_movies, seen_series) = s.db.lock().unwrap().seen_counts().unwrap_or((0, 0));
     Json(serde_json::json!({
         "name":"rextto", "version":format!("1.0.{}", env!("REXTTO_BUILD")), "active":cfg.active,
         "dry_run":cfg.dry_run, "setup_completed":setup_complete(&cfg),
-        "last_cycle":*s.last_cycle.lock().unwrap(), "torrent_stats":s.torrents.stats()
+        "last_cycle":*s.last_cycle.lock().unwrap(), "torrent_stats":s.torrents.stats(),
+        "seen": {"movies": seen_movies, "series": seen_series, "groups": seen_movies + seen_series}
     }))
 }
 async fn logs(State(s): State<AppState>, Query(query): Query<LogQuery>) -> Json<serde_json::Value> {
@@ -1165,6 +1197,7 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
             "proxy_port": cfg.libtorrent.proxy_port,
             "ip_filter_path": cfg.libtorrent.ip_filter_path,
             "listen_interfaces": cfg.libtorrent.listen_interfaces,
+            "outgoing_interface": cfg.libtorrent.outgoing_interface,
             "dht_bootstrap_nodes": cfg.libtorrent.dht_bootstrap_nodes,
             "port_min": cfg.libtorrent.port_min,
             "port_max": cfg.libtorrent.port_max,
@@ -1784,6 +1817,9 @@ pub struct RenameInput {
     /// Rinomina anche i file già conformi al formato (default: no).
     #[serde(default)]
     pub force: bool,
+    /// Ripristina solo la sorgente andata persa nei nomi (usa il titolo DB).
+    #[serde(default)]
+    pub source_only: bool,
 }
 
 async fn series_rename_preview(
@@ -1795,7 +1831,8 @@ async fn series_rename_preview(
         &s,
         &name,
         false,
-        input.is_some_and(|Json(input)| input.force),
+        input.as_ref().is_some_and(|Json(input)| input.force),
+        input.as_ref().is_some_and(|Json(input)| input.source_only),
     )
     .await
 }
@@ -1808,7 +1845,8 @@ async fn series_rename_execute(
         &s,
         &name,
         true,
-        input.is_some_and(|Json(input)| input.force),
+        input.as_ref().is_some_and(|Json(input)| input.force),
+        input.as_ref().is_some_and(|Json(input)| input.source_only),
     )
     .await
 }
@@ -1817,7 +1855,8 @@ async fn series_rename_apply(
     name: &str,
     execute: bool,
     force: bool,
-) -> impl IntoResponse {
+    source_only: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
     let cfg = latest_config(s);
     let Some(series) = find_series(&cfg, name).cloned() else {
         return (
@@ -1880,13 +1919,18 @@ async fn series_rename_apply(
             configured_path.to_path_buf()
         };
         with_path += 1;
-        // Recover the technical quality (notably the source token, which
-        // MediaInfo cannot provide) from the current file name so the periodic
-        // rename uses the same particles as a fresh download rename.
-        let fallback_quality = crate::parser::parse_quality(
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default(),
+        // La sorgente (che MediaInfo non fornisce) va recuperata dal titolo
+        // ORIGINALE della release, non dal nome file attuale: se un rename
+        // precedente l'ha persa, così viene ripristinata invece di restare
+        // `unknown` per sempre. I campi assenti nel titolo originale ricadono
+        // sul nome file.
+        let fallback_quality = crate::parser::merge_quality(
+            crate::parser::parse_quality(&episode.title),
+            crate::parser::parse_quality(
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default(),
+            ),
         );
         let release = Release {
             title: episode.title.clone(),
@@ -1902,9 +1946,22 @@ async fn series_rename_apply(
             year: None,
             discovered_at: chrono::Utc::now(),
         };
-        // Salta (economico) i file già conformi al formato, senza interrogare
-        // TMDB né leggere i MediaInfo: come faceva legacy.
-        if !force && postprocess::episode_name_conforms(&path, &release, &cfg) {
+        // Modalità "ripristina sorgente": rinomina solo i file il cui nome ha
+        // perso la sorgente che invece il titolo originale (DB) conosce.
+        let db_source = crate::parser::parse_quality(&episode.title).source;
+        let file_source = crate::parser::parse_quality(
+            path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+        )
+        .source;
+        let needs_source = db_source != "unknown"
+            && !db_source.trim().is_empty()
+            && file_source == "unknown";
+        if source_only {
+            if !needs_source {
+                already_ok.push(archive_path);
+                continue;
+            }
+        } else if !force && postprocess::episode_name_conforms(&path, &release, &cfg) {
             // Il video è già corretto: in esecuzione ripulisci comunque i
             // sidecar spuri/doppi (operazione economica, senza TMDB/MediaInfo).
             if execute {
@@ -1977,7 +2034,14 @@ async fn series_rename_apply(
         .filter(|path| path.exists())
         .map(|path| path.to_path_buf())
         .collect::<HashSet<_>>();
-    if let Ok(files) = postprocess::video_files(FsPath::new(&series.archive_path)) {
+    // In modalità ripristino sorgente non scansioniamo i file non tracciati:
+    // la sorgente si recupera solo dal titolo originale nel DB.
+    let archive_scan = if source_only {
+        Ok(Vec::<std::path::PathBuf>::new())
+    } else {
+        postprocess::video_files(FsPath::new(&series.archive_path))
+    };
+    if let Ok(files) = archive_scan {
         let pattern = regex::Regex::new(
             r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<s>\d{1,2})e|(?P<ns>\d{1,2})x)(?P<e>\d{1,4})",
         )
@@ -2101,6 +2165,22 @@ async fn series_rename_apply(
             }
         }
     }
+    // Pulizia dei duplicati chiaramente inferiori (risoluzione più bassa) nella
+    // cartella della serie. Copre anche le librerie ereditate dove, accanto al
+    // 1080p, è rimasto il vecchio 480p/720p. Solo in esecuzione.
+    let mut duplicates_removed = 0usize;
+    if execute && cfg.cleanup_upgrades && !source_only {
+        let protected = protected_torrent_paths(&s.torrents);
+        match crate::cleaner::cleanup_inferior_duplicates_in_dir(
+            &cfg,
+            &series.name,
+            FsPath::new(&series.archive_path),
+            &protected,
+        ) {
+            Ok(removed) => duplicates_removed = removed,
+            Err(error) => tracing::warn!(series=%series.name, %error, "duplicate cleanup failed"),
+        }
+    }
     let already_ok_count = already_ok.len();
     let discarded_count = items
         .iter()
@@ -2112,14 +2192,14 @@ async fn series_rename_apply(
         .count();
     let renamed_count = items.len().saturating_sub(discarded_count + error_count);
     if execute {
-        tracing::info!(series=%series.name, episodes=considered, with_path, renamed=renamed_count, discarded=discarded_count, errors=error_count, already_ok=already_ok_count, force, "rename executed");
+        tracing::info!(series=%series.name, episodes=considered, with_path, renamed=renamed_count, discarded=discarded_count, duplicates_removed, errors=error_count, already_ok=already_ok_count, force, "rename executed");
     } else {
         tracing::info!(series=%series.name, episodes=considered, with_path, changes=items.len(), already_ok=already_ok_count, "rename preview");
     }
     (
         StatusCode::OK,
         Json(
-            serde_json::json!({"ok":true,"series":series.name,"execute":execute,"force":force,"episodes":considered,"with_path":with_path,"items":items,"already_ok":already_ok,"already_ok_count":already_ok_count,"renamed_count":renamed_count,"discarded_count":discarded_count,"error_count":error_count}),
+            serde_json::json!({"ok":true,"series":series.name,"execute":execute,"force":force,"episodes":considered,"with_path":with_path,"items":items,"already_ok":already_ok,"already_ok_count":already_ok_count,"renamed_count":renamed_count,"discarded_count":discarded_count,"duplicates_removed":duplicates_removed,"error_count":error_count}),
         ),
     )
 }
@@ -2445,6 +2525,20 @@ async fn check_ports(State(s): State<AppState>) -> impl IntoResponse {
         ),
     )
 }
+
+/// Elenca le interfacce di rete con IPv4 e tipo, per il killswitch VPN.
+/// Formato compatibile con il legacy: `{"interfaces": {"wg0": {"ip": "…", "type": "VPN"}}}`.
+async fn network_interfaces_view() -> Json<serde_json::Value> {
+    let mut interfaces = serde_json::Map::new();
+    for interface in crate::utils::network_interfaces() {
+        interfaces.insert(
+            interface.name,
+            serde_json::json!({"ip": interface.ip, "type": interface.kind}),
+        );
+    }
+    Json(serde_json::json!({"ok": true, "interfaces": interfaces}))
+}
+
 fn directory_size(path: &FsPath) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -2658,10 +2752,17 @@ async fn db_prune(State(s): State<AppState>, Json(input): Json<PruneInput>) -> i
     }
     let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
     let error_age = input.error_age_days.unwrap_or(7).max(1);
-    match s.db.lock().unwrap().cleanup(retain, error_age) {
-        Ok(report) => (
+    let seen_days = input.seen_retention_days.unwrap_or(0);
+    let result = (|| -> anyhow::Result<(crate::database::MaintenanceReport, usize)> {
+        let db = s.db.lock().unwrap();
+        let report = db.cleanup(retain, error_age)?;
+        let seen_removed = db.prune_seen_older_than(seen_days)?;
+        Ok((report, seen_removed))
+    })();
+    match result {
+        Ok((report, seen_removed)) => (
             StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"report":report})),
+            Json(serde_json::json!({"ok":true,"report":report,"seen_removed":seen_removed})),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2745,11 +2846,18 @@ async fn db_prune_keyword(
         );
     }
     if input.preview {
-        return match s.db.lock().unwrap().count_keywords(&keywords) {
-            Ok(count) => (
+        let result = {
+            let db = s.db.lock().unwrap();
+            db.count_keywords(&keywords).and_then(|count| {
+                db.search_keywords(&keywords, 300)
+                    .map(|items| (count, items))
+            })
+        };
+        return match result {
+            Ok((count, items)) => (
                 StatusCode::OK,
                 Json(
-                    serde_json::json!({"ok":true,"preview":true,"count":count,"keywords":keywords}),
+                    serde_json::json!({"ok":true,"preview":true,"count":count,"keywords":keywords,"items":items}),
                 ),
             ),
             Err(error) => (
@@ -2807,6 +2915,7 @@ async fn backup_settings(State(s): State<AppState>) -> Json<serde_json::Value> {
         "ok": true,
         "retention": value("backup_retention", "5"),
         "schedule_hours": value("backup_schedule_hours", "0"),
+        "schedule_at": value("backup_schedule_at", ""),
         "send_telegram": cfg.settings.get("backup_send_telegram").is_some_and(|value| matches!(value.as_str(), "yes" | "true" | "1")),
         "ftp_host": value("backup_ftp_host", ""),
         "ftp_user": value("backup_ftp_user", ""),
@@ -2830,6 +2939,7 @@ async fn save_backup_settings(
     let allowed = [
         "backup_retention",
         "backup_schedule_hours",
+        "backup_schedule_at",
         "backup_send_telegram",
         "backup_ftp_host",
         "backup_ftp_user",
@@ -5356,6 +5466,147 @@ fn backup_retention(cfg: &Config) -> usize {
         .clamp(1, 100)
 }
 
+/// Percorso del file di stato con l'ora dell'ultimo backup automatico.
+fn backup_state_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(".rextto-backup-last")
+}
+
+fn load_last_backup(data_dir: &std::path::Path) -> Option<chrono::DateTime<chrono::Local>> {
+    let text = std::fs::read_to_string(backup_state_path(data_dir)).ok()?;
+    chrono::DateTime::parse_from_rfc3339(text.trim())
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Local))
+}
+
+fn save_last_backup(data_dir: &std::path::Path, when: chrono::DateTime<chrono::Local>) {
+    let _ = std::fs::write(backup_state_path(data_dir), when.to_rfc3339());
+}
+
+/// True se è il momento di eseguire un backup automatico.
+///
+/// `backup_schedule_at` (HH:MM) ha la precedenza: backup giornaliero a
+/// quell'ora **locale**, al più uno al giorno. Altrimenti si usa l'intervallo
+/// `backup_schedule_hours` (0 = disattivo), misurato dall'ultimo backup.
+fn backup_due(cfg: &Config, last: Option<chrono::DateTime<chrono::Local>>) -> bool {
+    use chrono::{Local, NaiveTime};
+    if let Some(at) = cfg
+        .settings
+        .get("backup_schedule_at")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        // Formato non valido: ignora l'orario e ricadi sull'intervallo in ore.
+        if let Ok(time) = NaiveTime::parse_from_str(at, "%H:%M") {
+            let now = Local::now();
+            let already_today = last
+                .map(|value| value.date_naive() == now.date_naive())
+                .unwrap_or(false);
+            return !already_today && now.time() >= time;
+        }
+    }
+    let hours = cfg
+        .settings
+        .get("backup_schedule_hours")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if hours <= 0 {
+        return false;
+    }
+    match last {
+        None => true,
+        Some(value) => (Local::now() - value).num_seconds() >= hours * 3600,
+    }
+}
+
+/// Esegue un backup automatico: snapshot locale, FTP, copia cloud e notifiche.
+async fn execute_scheduled_backup(cfg: &Config, notifier: &Notifier) -> anyhow::Result<()> {
+    let data_dir = cfg.data_dir.clone();
+    let root = data_dir.join("backups");
+    let retain = backup_retention(cfg);
+    let ftp = backup_ftp_config(cfg);
+    let cloud_dir = backup_cloud_dir(cfg);
+    let send_telegram = cfg
+        .settings
+        .get("backup_send_telegram")
+        .is_some_and(|value| matches!(value.as_str(), "yes" | "true" | "1"));
+    let steps = tokio::task::spawn_blocking(move || {
+        run_backup_steps(&data_dir, &root, retain, ftp, cloud_dir)
+    })
+    .await??;
+    let telegram_uploaded = if send_telegram {
+        notifier
+            .notify_backup_document(
+                &steps.path,
+                &format!(
+                    "Rextto backup: {}",
+                    steps
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("snapshot.zip")
+                ),
+            )
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    tracing::info!(
+        path = %steps.path.display(),
+        ftp_uploaded = steps.ftp_uploaded,
+        ftp_error = ?steps.ftp_error,
+        cloud_copied = steps.cloud_copied,
+        cloud_error = ?steps.cloud_error,
+        telegram_uploaded,
+        "scheduled backup completed"
+    );
+    let _ = notifier
+        .notify_event(
+            "backup_completed",
+            serde_json::json!({
+                "path": steps.path,
+                "scheduled": true,
+                "ftp_uploaded": steps.ftp_uploaded,
+                "ftp_error": steps.ftp_error,
+                "cloud_copied": steps.cloud_copied,
+                "cloud_error": steps.cloud_error,
+                "telegram_uploaded": telegram_uploaded,
+            }),
+        )
+        .await;
+    Ok(())
+}
+
+/// Worker dedicato ai backup automatici: controlla ogni minuto, così l'orario
+/// giornaliero è preciso (il ciclo dello scheduler gira solo ogni
+/// `refresh_secs`). Persiste l'ora dell'ultimo backup per non ripeterlo ad ogni
+/// riavvio.
+async fn backup_worker(state: AppState) {
+    let mut last = load_last_backup(&state.cfg.data_dir);
+    loop {
+        let cfg = match Config::load(&state.config_path) {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                tracing::warn!(%error, "backup scheduler config reload failed");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+        if cfg.active && backup_due(&cfg, last) {
+            let notifier = Notifier::from_config(&cfg);
+            match execute_scheduled_backup(&cfg, &notifier).await {
+                Ok(()) => {
+                    let now = chrono::Local::now();
+                    last = Some(now);
+                    save_last_backup(&cfg.data_dir, now);
+                }
+                Err(error) => tracing::error!(%error, "scheduled backup failed"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn create_backup(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = latest_config(&s);
     let notifier = Notifier::from_config(&cfg);
@@ -5591,12 +5842,21 @@ fn dry_run_session_preview(s: &AppState) -> Vec<crate::models::TorrentView> {
 async fn torrent_stats(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok":true,"stats":s.torrents.stats()}))
 }
-async fn torrent_history(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.lock().unwrap().completed_torrents(500) {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"items":items})),
-        ),
+async fn torrent_history(
+    State(s): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(10).clamp(1, 200);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    match s.db.lock().unwrap().completed_torrents(offset, limit) {
+        Ok((items, total)) => {
+            let pages = ((total as usize + limit - 1) / limit).max(1);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"items":items,"total":total,"page":page,"pages":pages})),
+            )
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -5825,6 +6085,186 @@ fn remove_trash_contents(root: &FsPath, older_than_days: i64) -> anyhow::Result<
     }
     Ok((files, bytes))
 }
+#[derive(serde::Deserialize, Default)]
+pub struct DuplicatesInput {
+    /// `true` = sposta in trash; assente/`false` = anteprima.
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Percorsi assoluti dei file appartenti ai torrent attualmente in sessione:
+/// la pulizia dei duplicati non deve mai toccarli (romperebbe seed/download).
+fn protected_torrent_paths(
+    torrents: &crate::libtorrent::LibtorrentClient,
+) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut protected = std::collections::HashSet::new();
+    for torrent in torrents.list() {
+        let base = std::path::Path::new(&torrent.save_path);
+        if let Ok(Some(files)) = torrents.files(&torrent.hash) {
+            for file in files {
+                protected.insert(base.join(&file.path));
+            }
+        }
+    }
+    protected
+}
+
+/// Anteprima o pulizia dei duplicati video inferiori (risoluzione più bassa)
+/// nella libreria delle serie. Conservativo: non tocca la stessa risoluzione.
+async fn clean_duplicates(
+    State(s): State<AppState>,
+    input: Option<Json<DuplicatesInput>>,
+) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    let execute = input.map(|Json(input)| input.execute).unwrap_or(false);
+    let protected = protected_torrent_paths(&s.torrents);
+    let preferred = cfg.default_language();
+    let mut candidates = Vec::new();
+    let mut removed = 0usize;
+    for series in cfg
+        .series
+        .iter()
+        .filter(|series| !series.archive_path.trim().is_empty())
+    {
+        let directory = FsPath::new(&series.archive_path);
+        if execute {
+            match crate::cleaner::cleanup_inferior_duplicates_in_dir(
+                &cfg,
+                &series.name,
+                directory,
+                &protected,
+            ) {
+                Ok(count) => removed += count,
+                Err(error) => tracing::warn!(series=%series.name, %error, "duplicate cleanup failed"),
+            }
+        } else {
+            match crate::cleaner::find_inferior_duplicates_in_dir(
+                &series.name,
+                directory,
+                &protected,
+                &preferred,
+            ) {
+                Ok(found) => candidates.extend(found),
+                Err(error) => tracing::warn!(series=%series.name, %error, "duplicate scan failed"),
+            }
+        }
+    }
+    if execute {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"execute":true,"removed":removed})),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({"ok":true,"execute":false,"count":candidates.len(),"items":candidates}),
+            ),
+        )
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct RestoreSourceInput {
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Ripristina il token sorgente nei nomi dei file archiviati che l'hanno perso,
+/// recuperandolo dal titolo originale della release nel DB (non lo inventa).
+async fn restore_source(
+    State(s): State<AppState>,
+    input: Option<Json<RestoreSourceInput>>,
+) -> impl IntoResponse {
+    let execute = input.map(|Json(input)| input.execute).unwrap_or(false);
+    if execute && s.cfg.dry_run {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"dry-run does not modify files"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    let mut items = Vec::new();
+    let mut renamed = 0usize;
+    let mut errors = 0usize;
+    let mut series_count = 0usize;
+    for series in cfg
+        .series
+        .iter()
+        .filter(|series| series.enabled && !series.archive_path.trim().is_empty())
+    {
+        series_count += 1;
+        let episodes = s
+            .db
+            .lock()
+            .unwrap()
+            .episodes_for_series(&series.name, &series.ignored_seasons)
+            .unwrap_or_default();
+        for episode in episodes {
+            let Some(archive_path) = episode
+                .archive_path
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let source = crate::parser::parse_quality(&episode.title).source;
+            if source.trim().is_empty() || source.eq_ignore_ascii_case("unknown") {
+                continue;
+            }
+            let path = FsPath::new(&archive_path);
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(new_name) = postprocess::restore_source_token(name, &source) else {
+                continue;
+            };
+            let target = path.parent().unwrap_or_else(|| FsPath::new(".")).join(&new_name);
+            if target == path {
+                continue;
+            }
+            if execute {
+                if let Err(error) = postprocess::rename_sidecars(path, &target, &cfg) {
+                    tracing::warn!(%error, "restore source: sidecar rename failed");
+                }
+                match std::fs::rename(path, &target) {
+                    Ok(()) => {
+                        let _ = s.db.lock().unwrap().set_episode_archive_path(
+                            &series.name,
+                            episode.season,
+                            episode.episode,
+                            &target.display().to_string(),
+                        );
+                        renamed += 1;
+                        items.push(serde_json::json!({"series": series.name, "season": episode.season, "episode": episode.episode, "from": archive_path, "to": target.display().to_string()}));
+                    }
+                    Err(error) => {
+                        errors += 1;
+                        tracing::warn!(%error, "restore source: rename failed");
+                    }
+                }
+            } else {
+                items.push(serde_json::json!({"series": series.name, "season": episode.season, "episode": episode.episode, "from": archive_path, "to": target.display().to_string()}));
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "execute": execute,
+            "series": series_count,
+            "renamed": renamed,
+            "errors": errors,
+            "count": items.len(),
+            "items": items,
+        })),
+    )
+}
+
 async fn clean_trash(State(s): State<AppState>) -> impl IntoResponse {
     if s.cfg.dry_run {
         return (
@@ -5857,6 +6297,101 @@ async fn clean_trash(State(s): State<AppState>) -> impl IntoResponse {
         ),
     }
 }
+/// Elenca i gruppi "visti nei feed" (film o serie) con paginazione.
+fn seen_grouped(
+    state: &AppState,
+    kind: &str,
+    query: &SeenQuery,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    let query_text = query.q.clone().unwrap_or_default();
+    let result = {
+        let db = state.db.lock().unwrap();
+        if kind == "series" {
+            db.series_seen_grouped(offset, limit, &query_text)
+        } else {
+            db.movies_seen_grouped(offset, limit, &query_text)
+        }
+    };
+    match result {
+        Ok((groups, total)) => {
+            let pages = ((total as usize + limit - 1) / limit).max(1);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"groups":groups,"total":total,"page":page,"pages":pages})),
+            )
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+/// Release di un singolo gruppo "visto" (film o serie).
+fn seen_entries(
+    state: &AppState,
+    kind: &str,
+    query: &SeenQuery,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let group = query
+        .key
+        .clone()
+        .or_else(|| query.group.clone())
+        .unwrap_or_default();
+    if group.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"key required"})),
+        );
+    }
+    match state
+        .db
+        .lock()
+        .unwrap()
+        .seen_by_group(kind, group.trim(), query.limit.unwrap_or(500))
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"items":items})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+async fn movies_seen_grouped_view(
+    State(s): State<AppState>,
+    Query(query): Query<SeenQuery>,
+) -> impl IntoResponse {
+    seen_grouped(&s, "movie", &query)
+}
+
+async fn series_seen_grouped_view(
+    State(s): State<AppState>,
+    Query(query): Query<SeenQuery>,
+) -> impl IntoResponse {
+    seen_grouped(&s, "series", &query)
+}
+
+async fn movies_seen_view(
+    State(s): State<AppState>,
+    Query(query): Query<SeenQuery>,
+) -> impl IntoResponse {
+    seen_entries(&s, "movie", &query)
+}
+
+async fn series_seen_view(
+    State(s): State<AppState>,
+    Query(query): Query<SeenQuery>,
+) -> impl IntoResponse {
+    seen_entries(&s, "series", &query)
+}
+
 async fn torrent_events(State(s): State<AppState>) -> Json<Vec<crate::models::TorrentEvent>> {
     // Return a snapshot (do not drain): the Activity page polls periodically and
     // a drained buffer left it empty whenever no event happened since the last
@@ -8624,7 +9159,6 @@ async fn run_now(State(s): State<AppState>, Query(query): Query<RunNowQuery>) ->
 }
 
 async fn cycle_worker(state: AppState) {
-    let mut last_backup = Instant::now() - Duration::from_secs(86_400);
     let mut last_rename_check = Instant::now() - Duration::from_secs(6 * 3600);
     let mut last_inactive_log: Option<Instant> = None;
     loop {
@@ -8666,76 +9200,6 @@ async fn cycle_worker(state: AppState) {
                 }
                 Err(error) => tracing::error!(%error, "scheduled cycle failed"),
             }
-            let backup_hours = cfg
-                .settings
-                .get("backup_schedule_hours")
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-            if backup_hours > 0
-                && last_backup.elapsed() >= Duration::from_secs(backup_hours.saturating_mul(3600))
-            {
-                let data_dir = cfg.data_dir.clone();
-                let root = data_dir.join("backups");
-                let retain = backup_retention(&cfg);
-                let ftp = backup_ftp_config(&cfg);
-                let cloud_dir = backup_cloud_dir(&cfg);
-                let send_telegram = cfg
-                    .settings
-                    .get("backup_send_telegram")
-                    .is_some_and(|value| matches!(value.as_str(), "yes" | "true" | "1"));
-                match tokio::task::spawn_blocking(move || {
-                    run_backup_steps(&data_dir, &root, retain, ftp, cloud_dir)
-                })
-                .await
-                {
-                    Ok(Ok(steps)) => {
-                        last_backup = Instant::now();
-                        let telegram_uploaded = if send_telegram {
-                            notifier
-                                .notify_backup_document(
-                                    &steps.path,
-                                    &format!(
-                                        "Rextto backup: {}",
-                                        steps
-                                            .path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("snapshot.zip")
-                                    ),
-                                )
-                                .await
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        tracing::info!(
-                            path = %steps.path.display(),
-                            ftp_uploaded = steps.ftp_uploaded,
-                            ftp_error = ?steps.ftp_error,
-                            cloud_copied = steps.cloud_copied,
-                            cloud_error = ?steps.cloud_error,
-                            telegram_uploaded,
-                            "scheduled backup completed"
-                        );
-                        let _ = notifier
-                            .notify_event(
-                                "backup_completed",
-                                serde_json::json!({
-                                    "path": steps.path,
-                                    "scheduled": true,
-                                    "ftp_uploaded": steps.ftp_uploaded,
-                                    "ftp_error": steps.ftp_error,
-                                    "cloud_copied": steps.cloud_copied,
-                                    "cloud_error": steps.cloud_error,
-                                    "telegram_uploaded": telegram_uploaded,
-                                }),
-                            )
-                            .await;
-                    }
-                    Ok(Err(error)) => tracing::error!(%error, "scheduled backup failed"),
-                    Err(error) => tracing::error!(%error, "scheduled backup task failed"),
-                }
-            }
             let rename_hours = cfg
                 .settings
                 .get("rename_verify_interval")
@@ -8751,7 +9215,7 @@ async fn cycle_worker(state: AppState) {
                     // database paths. Reuse the same guarded implementation
                     // exposed by the manual series-rename endpoint.
                     for series in &cfg.series {
-                        let _ = series_rename_apply(&state, &series.name, true, false).await;
+                        let _ = series_rename_apply(&state, &series.name, true, false, false).await;
                     }
                     tracing::info!(
                         series = cfg.series.len(),
@@ -8807,6 +9271,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         state.torrent_events.clone(),
     ));
     let cycle = tokio::spawn(cycle_worker(state.clone()));
+    let backups = tokio::spawn(backup_worker(state.clone()));
     let app = router(state);
     let result = tokio::try_join!(
         axum::serve(web_listener, app.clone()),
@@ -8814,6 +9279,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     );
     worker.abort();
     cycle.abort();
+    backups.abort();
     result?;
     Ok(())
 }
@@ -9155,5 +9621,26 @@ mod tests {
             "en"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_due_interval_and_daily_time() {
+        use chrono::{Duration as ChronoDuration, Local};
+        let mut cfg = Config::default();
+        // Nessuna schedulazione.
+        assert!(!backup_due(&cfg, None));
+        // Intervallo in ore: mai fatto -> subito; recente -> no; vecchio -> sì.
+        cfg.settings.insert("backup_schedule_hours".into(), "24".into());
+        assert!(backup_due(&cfg, None));
+        assert!(!backup_due(&cfg, Some(Local::now() - ChronoDuration::hours(1))));
+        assert!(backup_due(&cfg, Some(Local::now() - ChronoDuration::hours(25))));
+        // Orario giornaliero con precedenza: a mezzanotte è sempre "passato".
+        cfg.settings.insert("backup_schedule_at".into(), "00:00".into());
+        assert!(backup_due(&cfg, None));
+        assert!(!backup_due(&cfg, Some(Local::now())));
+        assert!(backup_due(&cfg, Some(Local::now() - ChronoDuration::days(1))));
+        // Orario non valido: ricade sull'intervallo (recente -> no).
+        cfg.settings.insert("backup_schedule_at".into(), "boh".into());
+        assert!(!backup_due(&cfg, Some(Local::now() - ChronoDuration::hours(1))));
     }
 }

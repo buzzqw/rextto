@@ -2,6 +2,44 @@ use crate::models::{Quality, Release};
 use crate::utils::sanitize_magnet;
 use chrono::Utc;
 
+/// Combina due `Quality`: usa i campi di `primary` quando valorizzati, altrimenti
+/// quelli di `fallback`. Serve a recuperare sorgente/codec/ecc. dal titolo
+/// originale della release quando il nome file attuale li ha persi.
+pub fn merge_quality(primary: Quality, fallback: Quality) -> Quality {
+    fn pick(primary: &str, fallback: &str) -> String {
+        if primary.trim().is_empty() || primary.eq_ignore_ascii_case("unknown") {
+            fallback.to_string()
+        } else {
+            primary.to_string()
+        }
+    }
+    Quality {
+        resolution: pick(&primary.resolution, &fallback.resolution),
+        source: pick(&primary.source, &fallback.source),
+        codec: pick(&primary.codec, &fallback.codec),
+        audio: pick(&primary.audio, &fallback.audio),
+        hdr: pick(&primary.hdr, &fallback.hdr),
+        group: pick(&primary.group, &fallback.group),
+        is_ita: primary.is_ita || fallback.is_ita,
+        is_dv: primary.is_dv || fallback.is_dv,
+        is_repack: primary.is_repack || fallback.is_repack,
+        is_proper: primary.is_proper || fallback.is_proper,
+        is_real: primary.is_real || fallback.is_real,
+        language: pick(&primary.language, &fallback.language),
+        languages: if primary.languages.is_empty() {
+            fallback.languages
+        } else {
+            primary.languages
+        },
+        has_subtitle: primary.has_subtitle || fallback.has_subtitle,
+        subtitle_languages: if primary.subtitle_languages.is_empty() {
+            fallback.subtitle_languages
+        } else {
+            primary.subtitle_languages
+        },
+    }
+}
+
 pub fn normalize_series_name(value: &str) -> String {
     // Memoised: series matching normalises every configured series name for
     // every candidate release (series × releases per cycle). The function is
@@ -337,6 +375,11 @@ pub fn parse_release_at(
     source: &str,
     discovered_at: chrono::DateTime<Utc>,
 ) -> Option<Release> {
+    // Alcune fonti (es. BTDigg) usano un magnet troncato come testo del link:
+    // non è un titolo valido, scartalo prima di creare una release.
+    if title.trim().to_ascii_lowercase().starts_with("magnet:") {
+        return None;
+    }
     let magnet = sanitize_magnet(magnet, Some(title))?;
     // Ordine di riconoscimento come legacy: range, multi-episodio concatenato,
     // SxxExx singolo, NxNN, data (YYYY-MM-DD), stagione completa.
@@ -479,6 +522,30 @@ mod tests {
         let subtitles = parse_quality("Movie.2024.1080p.WEB-DL.SUB.ITA.SUB.ENG");
         assert_eq!(subtitles.subtitle_languages, vec!["ita", "eng"]);
         assert!(subtitles.languages.is_empty());
+    }
+
+    #[test]
+    fn rejects_magnet_truncated_titles() {
+        // BTDigg a volte usa un magnet troncato come testo del link: non è un
+        // titolo valido e non deve produrre una release.
+        assert!(parse_release(
+            "magnet:?xt=urn:btih:0006c977cb45...",
+            "magnet:?xt=urn:btih:0006c977cb45abcdefabcdefabcdefabcdefabcdef",
+            "BTDigg"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn merges_source_from_original_release_title() {
+        // Il nome file ha perso la sorgente; il titolo originale la conserva.
+        let file = parse_quality("Show - S01E01 - Titolo - [1080p][h264][AAC][IT].mkv");
+        let original = parse_quality("Show.S01E01.1080p.WEB-DL.H.264.ITA.AAC");
+        assert_eq!(file.source, "unknown");
+        let merged = merge_quality(original, file);
+        assert_eq!(merged.source, "webdl");
+        assert_eq!(merged.resolution, "1080p");
+        assert_eq!(merged.codec, "h264");
     }
 
     #[test]

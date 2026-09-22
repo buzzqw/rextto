@@ -31,8 +31,15 @@ a ogni release, scarica la migliore e la rinomina/archivia nella libreria.
 - **Fumetti** — monitoraggio GetComics e weekly pack.
 - **Integrazioni** — Trakt, Simkl, Jellyfin, Plex, notifiche Telegram/e-mail/
   webhook.
+- **Privacy** — killswitch VPN: vincola ascolto e traffico in uscita di
+  libtorrent a un'interfaccia scelta (`tun0`/`wg0`), selezionabile dalla UI.
 - **UI web** — single-page responsive (tema chiaro/scuro) con localizzazione
   **italiano e inglese**; log viewer, salute, grafici, manutenzione.
+- **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per
+  titolo e consultabile in *Archivio → Visti dai feed*, anche se non monitorata.
+- **Manutenzione e backup** — pulizia duplicati video, ripristino del token
+  sorgente perso, prune dei database e backup manuali/programmati (locale, FTP,
+  cartella cloud, Telegram).
 - **Feed** — feed magnet RSS rolling su `/feed.xml`, per consumer esterni.
 
 ## Requisiti
@@ -123,6 +130,9 @@ principali:
 - `GET /api/torrents`, `POST /api/send-magnet`, azioni torrent sotto
   `/api/torrents/{hash}/...`
 - `GET /api/archive`, `POST /api/archive/batch-download`
+- `GET /api/series/seen/grouped`, `GET /api/movies/seen/grouped` (visti dai feed)
+- `GET /api/network/interfaces`
+- `POST /api/maintenance/clean-duplicates`, `POST /api/maintenance/restore-source`
 - `GET /api/comics`, `POST /api/comics/explore`
 - `POST /api/search`, `GET /api/sources/health`
 - `GET /api/logs/stream` (SSE), `GET /feed.xml` (feed magnet RSS)

@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, LibtorrentSettings},
     models::{FileView, PeerView, TorrentEvent, TorrentView, TrackerView},
     utils::{atomic_write, magnet_hash, sanitize_magnet},
 };
@@ -739,7 +739,13 @@ impl LibtorrentClient {
             text(&mut lines, "proxy_password", &lt.proxy_password);
         }
         text(&mut lines, "ip_filter_path", &lt.ip_filter_path);
-        text(&mut lines, "listen_interfaces", &lt.listen_interfaces);
+        text(
+            &mut lines,
+            "listen_interfaces",
+            &effective_listen_interfaces(lt),
+        );
+        // Killswitch VPN: forza il traffico in uscita sulla scheda scelta.
+        text(&mut lines, "outgoing_interfaces", &lt.outgoing_interface);
         text(&mut lines, "dht_bootstrap_nodes", &lt.dht_bootstrap_nodes);
         for line in extra_settings_lines(
             cfg.settings
@@ -1433,6 +1439,25 @@ impl LibtorrentClient {
     }
 }
 
+/// `listen_interfaces` effettivo. Se è configurata un'interfaccia di uscita
+/// (killswitch VPN) e l'ascolto non specifica già una porta, l'ascolto viene
+/// legato alla stessa scheda, come nel legacy EXTTO (`iface:porta_min`).
+fn effective_listen_interfaces(lt: &LibtorrentSettings) -> String {
+    let listen = lt.listen_interfaces.trim();
+    let outgoing = lt.outgoing_interface.trim();
+    if !listen.is_empty() {
+        // Nome di interfaccia "nudo" senza porta (es. `eth0`, `wg0`, `tun0`).
+        if !listen.contains(':') && !listen.contains(',') && !listen.contains('[') {
+            return format!("{listen}:{}", lt.port_min);
+        }
+        return listen.to_owned();
+    }
+    if !outgoing.is_empty() {
+        return format!("{outgoing}:{}", lt.port_min);
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,5 +1616,22 @@ mod tests {
         assert!(!saved.contains("ABCDEF"));
         drop(client);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn killswitch_binds_listen_to_outgoing_interface() {
+        let mut lt = LibtorrentSettings::default();
+        lt.port_min = 6881;
+        assert_eq!(effective_listen_interfaces(&lt), "");
+        // Interfaccia nuda: viene completata con la porta minima.
+        lt.listen_interfaces = "wg0".into();
+        assert_eq!(effective_listen_interfaces(&lt), "wg0:6881");
+        // Interfaccia di uscita senza listen esplicito: ascolto legato alla VPN.
+        lt.listen_interfaces = String::new();
+        lt.outgoing_interface = "tun0".into();
+        assert_eq!(effective_listen_interfaces(&lt), "tun0:6881");
+        // Listen esplicito con porta: resta invariato.
+        lt.listen_interfaces = "0.0.0.0:6881-6891".into();
+        assert_eq!(effective_listen_interfaces(&lt), "0.0.0.0:6881-6891");
     }
 }

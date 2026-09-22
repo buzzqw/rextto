@@ -428,7 +428,9 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 
 /* Torrent table: keep state badges and numbers aligned */
 .data-table .badge { white-space: nowrap; }
-.data-table td:first-child { min-width: 220px; }
+.data-table:not(.lib-table) td:first-child { min-width: 220px; }
+/* Tabelle libreria: la prima cella è una checkbox, non va allargata a 220px. */
+.data-table.lib-table td:first-child { min-width: 0; }
 .data-table.torrent-table { table-layout: fixed; min-width: 1240px; }
 .data-table.torrent-table td:first-child { min-width: 0; }
 .data-table.torrent-table th:nth-child(1), .data-table.torrent-table td:nth-child(1) { width: 3%; }
@@ -575,6 +577,28 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
   .torrent-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .optimize-result { grid-template-columns: 1fr; }
   .table-wrap { -webkit-overflow-scrolling: touch; }
+}
+
+/* Liste Serie TV / Film su mobile: niente colonne secondarie, azioni a capo. */
+@media (max-width: 700px) {
+  .form-grid { grid-template-columns: 1fr; }
+  .data-table.lib-table td:first-child { min-width: 0; width: 34px; }
+  .data-table.lib-table th:nth-child(2),
+  .data-table.lib-table td:nth-child(2) { min-width: 0; }
+  .data-table.lib-table td { padding: 9px 8px; }
+  .data-table.series-table th:nth-child(3), .data-table.series-table td:nth-child(3),
+  .data-table.series-table th:nth-child(4), .data-table.series-table td:nth-child(4),
+  .data-table.series-table th:nth-child(5), .data-table.series-table td:nth-child(5),
+  .data-table.series-table th:nth-child(7), .data-table.series-table td:nth-child(7),
+  .data-table.series-table th:nth-child(8), .data-table.series-table td:nth-child(8) { display: none; }
+  .data-table.movie-table th:nth-child(3), .data-table.movie-table td:nth-child(3),
+  .data-table.movie-table th:nth-child(4), .data-table.movie-table td:nth-child(4),
+  .data-table.movie-table th:nth-child(5), .data-table.movie-table td:nth-child(5) { display: none; }
+  .data-table.episode-table th:nth-child(4), .data-table.episode-table td:nth-child(4),
+  .data-table.episode-table th:nth-child(5), .data-table.episode-table td:nth-child(5) { display: none; }
+  .data-table.episode-table td:nth-child(2) { white-space: normal; }
+  .data-table.lib-table .row-actions { flex-wrap: wrap; }
+  .data-table.lib-table td:nth-child(2) button { white-space: normal; text-align: left; }
 }
 
 /* Small phones: make tiles and frames proportional. */

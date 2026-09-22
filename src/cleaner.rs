@@ -5,9 +5,87 @@ use crate::{
 };
 use anyhow::Result;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
+
+/// Motivi di upgrade considerati "forti" anche quando la differenza di score è
+/// sotto la soglia configurata (parità con EXTTO `_HARD_UPGRADE_REASONS`).
+const HARD_UPGRADE_REASONS: [&str; 4] = ["resolution", "source", "hdr", "repack"];
+
+/// True se `new` migliora `old` per un motivo forte (risoluzione, sorgente,
+/// HDR o repack), indipendentemente dal delta di score.
+fn hard_upgrade(new: &crate::models::Quality, old: &crate::models::Quality, min_diff: i64) -> bool {
+    matches!(
+        new.upgrade_reason(old, new.score(), old.score(), min_diff),
+        Some(reason) if HARD_UPGRADE_REASONS.contains(&reason)
+    )
+}
+
+/// Esito del confronto lingua di un file rispetto a quella preferita.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum LanguageMatch {
+    /// Il file dichiara esplicitamente la lingua preferita.
+    Preferred,
+    /// Il file dichiara esplicitamente un'altra lingua (nessuna preferita).
+    Other,
+    /// Nessuna informazione di lingua nel nome: neutro, non si tocca.
+    Unknown,
+}
+
+/// Classifica la lingua dichiarata nel nome file. `Unknown` quando il nome non
+/// contiene tag lingua (in quel caso non si applica alcuna preferenza).
+fn language_match(name: &str, preferred: &str) -> LanguageMatch {
+    let preferred = preferred.trim().to_ascii_lowercase();
+    if preferred.is_empty() {
+        return LanguageMatch::Unknown;
+    }
+    let quality = parse_quality(name);
+    let mut detected: Vec<String> = Vec::new();
+    if quality.is_ita {
+        detected.push("ita".to_string());
+    }
+    if !quality.language.trim().is_empty() {
+        detected.push(quality.language.to_ascii_lowercase());
+    }
+    detected.extend(quality.languages.iter().map(|code| code.to_ascii_lowercase()));
+    detected.retain(|code| !code.is_empty());
+    if detected.is_empty() {
+        return LanguageMatch::Unknown;
+    }
+    let matches = |code: &str| {
+        code == preferred
+            || (preferred == "ita" && code == "it")
+            || (preferred == "eng" && code == "en")
+            || (preferred == "spa" && code == "es")
+            || (preferred == "deu" && code == "de")
+            || (preferred == "fra" && code == "fr")
+    };
+    if detected.iter().any(|code| matches(code)) {
+        LanguageMatch::Preferred
+    } else {
+        LanguageMatch::Other
+    }
+}
+
+/// Rimuove le cartelle svuotate dopo uno spostamento, fermandosi prima della
+/// radice della serie/film (parità con EXTTO).
+fn remove_empty_parents(path: &Path, stop_at: &Path) {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory == stop_at || !directory.starts_with(stop_at) {
+            break;
+        }
+        let empty = fs::read_dir(directory)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !empty || fs::remove_dir(directory).is_err() {
+            break;
+        }
+        current = directory.parent();
+    }
+}
 
 fn local_path(path: &Path) -> bool {
     let value = path.to_string_lossy().to_ascii_lowercase();
@@ -132,6 +210,7 @@ pub fn cleanup_old_episode(
         r"(?i)^(?P<name>.+?)[ ._-]+s(?P<season>\d{1,2})e(?P<episode>\d{1,4})(?:[ ._-]|$)",
     )?;
     let normalized = normalize_series_name(series);
+    let preferred = cfg.default_language();
     let mut removed = 0;
     for file in video_files(archive_path)? {
         if file == new_file || file.file_name() == new_file.file_name() {
@@ -161,12 +240,199 @@ pub fn cleanup_old_episode(
         if !series_names_match(&normalized, file_series) {
             continue;
         }
-        let old_score = parse_quality(name).score();
-        if old_score + cfg.cleanup_min_score_diff >= new_score {
+        let old_quality = parse_quality(name);
+        let old_score = old_quality.score();
+        let new_quality = new_file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(parse_quality)
+            .unwrap_or_default();
+        let new_name = new_file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        // A parità di risoluzione preferisci la lingua voluta: non scartare un
+        // file nella lingua preferita e rimuovi quello che non lo è.
+        if old_quality.resolution_rank() > 0
+            && old_quality.resolution_rank() == new_quality.resolution_rank()
+        {
+            match (
+                language_match(name, &preferred),
+                language_match(new_name, &preferred),
+            ) {
+                (LanguageMatch::Preferred, LanguageMatch::Other) => continue,
+                (LanguageMatch::Other, LanguageMatch::Preferred) => {
+                    handle_duplicate(&file, cfg)?;
+                    remove_empty_parents(&file, archive_path);
+                    removed += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        // Si scarta il vecchio se lo score è chiaramente inferiore, oppure se il
+        // nuovo rappresenta un upgrade "forte" (risoluzione/sorgente/HDR/repack).
+        if old_score + cfg.cleanup_min_score_diff >= new_score
+            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        {
             continue;
         }
         handle_duplicate(&file, cfg)?;
+        remove_empty_parents(&file, archive_path);
         removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Duplicato chiaramente inferiore rilevato nella libreria.
+#[derive(Debug, serde::Serialize)]
+pub struct DuplicateCandidate {
+    pub series: String,
+    pub season: i64,
+    pub episode: i64,
+    pub path: String,
+    pub resolution_rank: i32,
+    pub best_rank: i32,
+}
+
+/// Cerca i duplicati a risoluzione **strettamente più bassa** per episodio
+/// nella cartella di una serie. Volutamente conservativo: non segnala file con
+/// la stessa risoluzione (es. versioni in lingue diverse) né file dalla
+/// risoluzione non riconosciuta. Serve a ripulire le librerie ereditate dove,
+/// accanto al 1080p, è rimasto il vecchio 480p/720p.
+pub fn find_inferior_duplicates_in_dir(
+    series: &str,
+    archive_path: &Path,
+    protected: &std::collections::HashSet<PathBuf>,
+    preferred_language: &str,
+) -> Result<Vec<DuplicateCandidate>> {
+    if !local_path(archive_path) || !archive_path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let pattern = crate::utils::cached_regex(
+        r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<s>\d{1,2})e|(?P<ns>\d{1,2})x)(?P<e>\d{1,4})",
+    )?;
+    let normalized = normalize_series_name(series);
+    // Raggruppa per (cartella, stagione, episodio): il confronto avviene solo
+    // tra file nella stessa cartella, così non si toccano i file delle cartelle
+    // di pack/sorgente che stanno ancora in seed.
+    type GroupKey = (PathBuf, i64, i64);
+    let mut groups: HashMap<GroupKey, Vec<(i32, PathBuf)>> = HashMap::new();
+    for file in video_files(archive_path)? {
+        // Non toccare file appartenti a torrent ancora in sessione (seed/seed
+        // in corso): verrebbero invalidati.
+        if protected.contains(&file) {
+            continue;
+        }
+        let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(captures) = pattern.captures(name) else {
+            continue;
+        };
+        let Some(file_series) = captures.name("name").map(|value| value.as_str()) else {
+            continue;
+        };
+        if !series_names_match(&normalized, file_series) {
+            continue;
+        }
+        let Some(season) = captures
+            .name("s")
+            .or_else(|| captures.name("ns"))
+            .and_then(|value| value.as_str().parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let Some(episode) = captures
+            .name("e")
+            .and_then(|value| value.as_str().parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let rank = parse_quality(name).resolution_rank();
+        let directory = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| archive_path.to_path_buf());
+        groups
+            .entry((directory, season, episode))
+            .or_default()
+            .push((rank, file));
+    }
+    let mut candidates = Vec::new();
+    for ((_, season, episode), files) in groups {
+        if files.len() < 2 {
+            continue;
+        }
+        let best = files.iter().map(|(rank, _)| *rank).max().unwrap_or(0);
+        if best <= 0 {
+            continue;
+        }
+        // Alla risoluzione migliore esiste almeno una versione nella lingua
+        // preferita? Se sì, le altre versioni a pari risoluzione sono candidate
+        // (es. 1080p ITA tenuto, 1080p EN da ripulire).
+        let best_has_preferred = files.iter().any(|(rank, file)| {
+            *rank == best
+                && file
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|name| language_match(name, preferred_language) == LanguageMatch::Preferred)
+                    .unwrap_or(false)
+        });
+        for (rank, file) in files {
+            let name = file
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let lower_resolution = rank > 0 && rank < best;
+            // Segnala solo chi dichiara *esplicitamente* un'altra lingua: i file
+            // senza tag lingua restano intatti.
+            let wrong_language = best_has_preferred
+                && rank == best
+                && language_match(name, preferred_language) == LanguageMatch::Other;
+            if lower_resolution || wrong_language {
+                candidates.push(DuplicateCandidate {
+                    series: series.to_string(),
+                    season,
+                    episode,
+                    path: file.display().to_string(),
+                    resolution_rank: rank,
+                    best_rank: best,
+                });
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Sposta in trash i duplicati inferiori trovati da `find_inferior_duplicates_in_dir`.
+pub fn cleanup_inferior_duplicates_in_dir(
+    cfg: &Config,
+    series: &str,
+    archive_path: &Path,
+    protected: &std::collections::HashSet<PathBuf>,
+) -> Result<usize> {
+    if !cfg.cleanup_upgrades {
+        return Ok(0);
+    }
+    let preferred = cfg.default_language();
+    let mut removed = 0;
+    for candidate in
+        find_inferior_duplicates_in_dir(series, archive_path, protected, &preferred)?
+    {
+        let file = PathBuf::from(&candidate.path);
+        handle_duplicate(&file, cfg)?;
+        remove_empty_parents(&file, archive_path);
+        removed += 1;
+        tracing::info!(
+            series = %candidate.series,
+            season = candidate.season,
+            episode = candidate.episode,
+            file = %candidate.path,
+            rank = candidate.resolution_rank,
+            best = candidate.best_rank,
+            "inferior duplicate moved to trash"
+        );
     }
     Ok(removed)
 }
@@ -187,6 +453,7 @@ pub fn discard_if_inferior(
         r"(?i)^(?P<name>.+?)[ ._-]+s(?P<season>\d{1,2})e(?P<episode>\d{1,4})(?:[ ._-]|$)",
     )?;
     let normalized = normalize_series_name(series);
+    let preferred = cfg.default_language();
     for file in video_files(archive_path)? {
         if file == new_file || file.file_name() == new_file.file_name() {
             continue;
@@ -215,8 +482,36 @@ pub fn discard_if_inferior(
         if !series_names_match(&normalized, file_series) {
             continue;
         }
-        let old_score = parse_quality(name).score();
-        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff) {
+        let old_quality = parse_quality(name);
+        let old_score = old_quality.score();
+        let new_name = new_file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let new_quality = parse_quality(new_name);
+        // A parità di risoluzione preferisci la lingua voluta: scarta il nuovo
+        // solo se l'esistente è nella lingua preferita e il nuovo no.
+        if old_quality.resolution_rank() > 0
+            && old_quality.resolution_rank() == new_quality.resolution_rank()
+        {
+            match (
+                language_match(name, &preferred),
+                language_match(new_name, &preferred),
+            ) {
+                (LanguageMatch::Preferred, LanguageMatch::Other) => {
+                    handle_duplicate(new_file, cfg)?;
+                    remove_empty_parents(new_file, archive_path);
+                    return Ok(true);
+                }
+                (LanguageMatch::Other, LanguageMatch::Preferred) => return Ok(false),
+                _ => {}
+            }
+        }
+        // Non scartare il nuovo se rappresenta un upgrade "forte" anche quando
+        // il suo score non supera la soglia rispetto all'esistente.
+        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
+            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        {
             handle_duplicate(new_file, cfg)?;
             return Ok(true);
         }
@@ -240,6 +535,7 @@ pub fn cleanup_old_movie(
         .filter(|word| word.len() > 1)
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let preferred = cfg.default_language();
     let mut removed = 0;
     for file in video_files(archive_path)? {
         if file == new_file || file.file_name() == new_file.file_name() {
@@ -262,11 +558,37 @@ pub fn cleanup_old_movie(
                 continue;
             }
         }
-        let old_score = parse_quality(name).score();
-        if old_score.saturating_add(cfg.cleanup_min_score_diff) >= new_score {
+        let old_quality = parse_quality(name);
+        let old_score = old_quality.score();
+        let new_name = new_file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let new_quality = parse_quality(new_name);
+        if old_quality.resolution_rank() > 0
+            && old_quality.resolution_rank() == new_quality.resolution_rank()
+        {
+            match (
+                language_match(name, &preferred),
+                language_match(new_name, &preferred),
+            ) {
+                (LanguageMatch::Preferred, LanguageMatch::Other) => continue,
+                (LanguageMatch::Other, LanguageMatch::Preferred) => {
+                    handle_duplicate(&file, cfg)?;
+                    remove_empty_parents(&file, archive_path);
+                    removed += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if old_score.saturating_add(cfg.cleanup_min_score_diff) >= new_score
+            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        {
             continue;
         }
         handle_duplicate(&file, cfg)?;
+        remove_empty_parents(&file, archive_path);
         removed += 1;
     }
     Ok(removed)
@@ -289,6 +611,7 @@ pub fn discard_if_inferior_movie(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let year_pattern = crate::utils::cached_regex(r"\b(19\d{2}|20\d{2})\b")?;
+    let preferred = cfg.default_language();
     for file in video_files(archive_path)? {
         if file == new_file || file.file_name() == new_file.file_name() {
             continue;
@@ -310,8 +633,32 @@ pub fn discard_if_inferior_movie(
                 continue;
             }
         }
-        let old_score = parse_quality(name).score();
-        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff) {
+        let old_quality = parse_quality(name);
+        let old_score = old_quality.score();
+        let new_name = new_file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let new_quality = parse_quality(new_name);
+        if old_quality.resolution_rank() > 0
+            && old_quality.resolution_rank() == new_quality.resolution_rank()
+        {
+            match (
+                language_match(name, &preferred),
+                language_match(new_name, &preferred),
+            ) {
+                (LanguageMatch::Preferred, LanguageMatch::Other) => {
+                    handle_duplicate(new_file, cfg)?;
+                    remove_empty_parents(new_file, archive_path);
+                    return Ok(true);
+                }
+                (LanguageMatch::Other, LanguageMatch::Preferred) => return Ok(false),
+                _ => {}
+            }
+        }
+        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
+            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        {
             handle_duplicate(new_file, cfg)?;
             return Ok(true);
         }
@@ -391,6 +738,211 @@ mod tests {
         assert!(!new_file.exists());
         assert!(trash.join("Example - S01E01 - Title.mkv").is_file());
         assert!(archive.join("Example.S01E01.1080p.WEB-DL.mkv").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finds_and_trashes_only_lower_resolution_duplicates() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-dup-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        fs::create_dir_all(&archive).unwrap();
+        // Episodio 1: 1080p + vecchio 480p -> il 480p è un duplicato inferiore.
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [1080p][h265][AAC 5.1].mkv"),
+            b"new",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [480p][XviD][MP3].avi"),
+            b"old",
+        )
+        .unwrap();
+        // Episodio 2: due 1080p senza tag lingua -> nessun candidato.
+        fs::write(
+            archive.join("Example - S02E02 - Two - [1080p][h264][EAC3].mkv"),
+            b"one",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("Example - S02E02 - Two - [1080p][h265][EAC3 5.1].mkv"),
+            b"two",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.cleanup_action = "move".into();
+        cfg.trash_path = Some(trash.clone());
+        let no_protected = std::collections::HashSet::new();
+        let candidates =
+            find_inferior_duplicates_in_dir("Example", &archive, &no_protected, "").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].episode, 1);
+        // Un file protetto (torrent in sessione) non viene mai segnalato.
+        let mut protected = std::collections::HashSet::new();
+        protected.insert(archive.join("Example - S01E01 - Pilot - [480p][XviD][MP3].avi"));
+        assert!(
+            find_inferior_duplicates_in_dir("Example", &archive, &protected, "")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cleanup_inferior_duplicates_in_dir(&cfg, "Example", &archive, &no_protected).unwrap(),
+            1
+        );
+        assert!(!archive
+            .join("Example - S01E01 - Pilot - [480p][XviD][MP3].avi")
+            .exists());
+        assert!(archive
+            .join("Example - S01E01 - Pilot - [1080p][h265][AAC 5.1].mkv")
+            .is_file());
+        // Le due versioni 1080p senza lingua restano entrambe.
+        assert!(archive
+            .join("Example - S02E02 - Two - [1080p][h264][EAC3].mkv")
+            .is_file());
+        assert!(archive
+            .join("Example - S02E02 - Two - [1080p][h265][EAC3 5.1].mkv")
+            .is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hard_source_upgrade_trashes_old_below_score_threshold() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-hard-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        fs::create_dir_all(&archive).unwrap();
+        // Vecchio 1080p HDTV: score ~1100. Nuovo 1080p WEB-DL: ~1250. Con
+        // min_diff alto lo score non basta, ma hdtv->webdl è un upgrade "forte".
+        fs::write(archive.join("Example.S01E01.1080p.HDTV.x264.mkv"), b"old").unwrap();
+        let new_file = archive.join("Example - S01E01 - Title - [1080p][webdl][h264].mkv");
+        fs::write(&new_file, b"new").unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.cleanup_min_score_diff = 500;
+        cfg.trash_path = Some(trash.clone());
+        let new_score = parse_quality("Example - S01E01 - Title - [1080p][webdl][h264].mkv").score();
+        assert_eq!(
+            cleanup_old_episode(&cfg, "Example", 1, 1, new_score, &new_file, &archive).unwrap(),
+            1
+        );
+        assert!(!archive.join("Example.S01E01.1080p.HDTV.x264.mkv").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prefers_language_at_same_resolution() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-lang-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [1080p][h264][EAC3][IT+EN].mkv"),
+            b"ita",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [1080p][h265][EAC3 5.1][EN].mkv"),
+            b"eng",
+        )
+        .unwrap();
+        let none = std::collections::HashSet::new();
+        // Preferenza ITA: il file EN a pari risoluzione è candidato.
+        let candidates =
+            find_inferior_duplicates_in_dir("Example", &archive, &none, "ita").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].path.contains("[EN]"));
+        // Senza preferenza lingua, nessun candidato a pari risoluzione.
+        assert!(
+            find_inferior_duplicates_in_dir("Example", &archive, &none, "")
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discards_new_release_without_preferred_language() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-lang2-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        fs::create_dir_all(&archive).unwrap();
+        // Esistente ITA 1080p; arriva un EN 1080p: va scartato il nuovo.
+        fs::write(
+            archive.join("Example - S01E01 - Pilot - [1080p][h264][EAC3][IT+EN].mkv"),
+            b"ita",
+        )
+        .unwrap();
+        let new_file = archive.join("Example - S01E01 - Pilot - [1080p][h265][EAC3 5.1][EN].mkv");
+        fs::write(&new_file, b"eng").unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.trash_path = Some(trash.clone());
+        let new_score = parse_quality("Example - S01E01 - Pilot - [1080p][h265][EAC3 5.1][EN].mkv").score();
+        assert!(discard_if_inferior(
+            &cfg, "Example", 1, 1, new_score, &new_file, &archive
+        )
+        .unwrap());
+        assert!(!new_file.exists(), "il nuovo EN va nel trash");
+        assert!(archive
+            .join("Example - S01E01 - Pilot - [1080p][h264][EAC3][IT+EN].mkv")
+            .is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_emptied_subdirectories_after_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-emptydir-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        let season = archive.join("Season 1");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(
+            season.join("Example - S01E01 - Pilot - [480p][XviD][MP3].avi"),
+            b"old",
+        )
+        .unwrap();
+        let new_file = archive.join("Example - S01E01 - Pilot - [1080p][h265][AAC].mkv");
+        fs::write(&new_file, b"new").unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.trash_path = Some(trash.clone());
+        let new_score = parse_quality("Example - S01E01 - Pilot - [1080p][h265][AAC].mkv").score();
+        assert_eq!(
+            cleanup_old_episode(&cfg, "Example", 1, 1, new_score, &new_file, &archive).unwrap(),
+            1
+        );
+        assert!(!season.exists(), "la sottocartella svuotata va rimossa");
+        assert!(archive.is_dir(), "la radice della serie resta");
         let _ = fs::remove_dir_all(root);
     }
 }

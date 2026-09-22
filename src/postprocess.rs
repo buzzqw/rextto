@@ -159,16 +159,12 @@ fn copy_files(files: &[PathBuf], source: &Path, destination: &Path) -> Result<Ve
             .ok_or_else(|| anyhow::anyhow!("season pack file has no name"))?;
         let target = destination.join(name);
         if target.exists() {
-            let source_size = file.metadata()?.len();
-            let target_size = target.metadata()?.len();
-            if source_size == target_size {
-                copied.push(target);
-                continue;
-            }
-            bail!(
-                "refusing to overwrite existing season pack file: {}",
-                target.display()
-            );
+            // Il file è già in libreria: NON sovrascrivere e non fallire. Un
+            // errore qui bloccava il completamento del pack, lasciando gli
+            // episodi non marcati → il pack veniva riapprovato/riscaricato ad
+            // ogni ciclo. Si continua con l'esistente.
+            copied.push(target);
+            continue;
         }
         let mut input = fs::File::open(&file)?;
         let mut output = fs::OpenOptions::new()
@@ -470,22 +466,36 @@ async fn episode_target(
             "{} - S{:02}E{:02} - {} [{}][{}][{}][{}][{}]",
             series_name, season, episode, title, resolution, audio, hdr, codec, language
         ),
-        "custom" => cfg
-            .rename_template
-            .replace("{Serie}", &series_name)
-            .replace("{Stagione}", &format!("S{:02}", season))
-            .replace("{Episodio}", &format!("E{:02}", episode))
-            .replace("{Titolo}", &title)
-            .replace("{Source}", &source_tag)
-            .replace("{Sorgente}", &source_tag)
-            .replace("{Gruppo}", &release.quality.group)
-            .replace("{Risoluzione}", resolution)
-            .replace("{VideoCodec}", codec)
-            .replace("{Audio}", &audio_full)
-            .replace("{AudioCodec}", &audio_full)
-            .replace("{Canali}", media.channels.as_deref().unwrap_or(""))
-            .replace("{HDR}", hdr)
-            .replace("{Lingue}", language),
+        "custom" => {
+            // Un placeholder senza valore (vuoto o "unknown") diventa vuoto, così
+            // il blocco che lo avvolge — es. `[{Source}]` — viene rimosso del
+            // tutto da `cleanup_filename` invece di lasciare `[]` o `[unknown]`.
+            let token = |value: &str| -> String {
+                let value = value.trim();
+                if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
+                    String::new()
+                } else {
+                    value.to_string()
+                }
+            };
+            let language_token = token(language);
+            let source_token = token(&source_tag);
+            cfg.rename_template
+                .replace("{Serie}", &series_name)
+                .replace("{Stagione}", &format!("S{:02}", season))
+                .replace("{Episodio}", &format!("E{:02}", episode))
+                .replace("{Titolo}", &title)
+                .replace("{Source}", &source_token)
+                .replace("{Sorgente}", &source_token)
+                .replace("{Gruppo}", &token(&release.quality.group))
+                .replace("{Risoluzione}", &token(resolution))
+                .replace("{VideoCodec}", &token(codec))
+                .replace("{Audio}", &token(&audio_full))
+                .replace("{AudioCodec}", &token(&audio_full))
+                .replace("{Canali}", &token(media.channels.as_deref().unwrap_or("")))
+                .replace("{HDR}", &token(hdr))
+                .replace("{Lingue}", &language_token)
+        }
         _ => format!("{} - S{:02}E{:02} - {}", series_name, season, episode, title),
     };
     let target_stem = cleanup_filename(&sanitize_invalid(&target_stem));
@@ -590,6 +600,31 @@ pub async fn rename_movie(
     Ok(Some(target))
 }
 
+/// Ripristina il token sorgente in un nome file che l'ha perso, inserendo
+/// `[WEB-DL]`/`[HDTV]`… subito prima del primo tag di risoluzione (che nel
+/// template segue sempre la sorgente). Ritorna `None` se la sorgente non è
+/// nota, è già presente o non c'è un punto sicuro dove inserirla.
+pub fn restore_source_token(name: &str, source: &str) -> Option<String> {
+    let label = source_label(source);
+    let label = label.trim();
+    if label.is_empty() || label.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    if name.to_ascii_lowercase().contains(&label.to_ascii_lowercase()) {
+        return None;
+    }
+    let marker =
+        crate::utils::cached_regex(r"(?i)\[(?:2160p|1080p|720p|576p|480p|360p)\]").ok()?;
+    let found = marker.find(name)?;
+    let mut output = String::with_capacity(name.len() + label.len() + 2);
+    output.push_str(&name[..found.start()]);
+    output.push('[');
+    output.push_str(label);
+    output.push(']');
+    output.push_str(&name[found.start()..]);
+    Some(output)
+}
+
 fn move_across_devices(source: &Path, target: &Path) -> Result<()> {
     match fs::rename(source, target) {
         Ok(()) => Ok(()),
@@ -637,6 +672,14 @@ pub fn episode_name_conforms(path: &Path, release: &Release, cfg: &Config) -> bo
         }
         _ => format!("{} - S{:02}E{:02} - ", series.name, season, episode),
     };
+    // Nomi con gruppi vuoti (es. `[]` o `()`) sono artefatti di un template con
+    // placeholder senza valore: vanno rinominati per ripulirli.
+    if crate::utils::cached_regex(r"\[\s*\]|\(\s*\)")
+        .map(|regex| regex.is_match(&stem))
+        .unwrap_or(false)
+    {
+        return false;
+    }
     let prefix = prefix.trim().to_lowercase();
     !prefix.is_empty() && stem.starts_with(&prefix)
 }
@@ -1267,6 +1310,64 @@ mod tests {
         // Apostrophes are preserved (legacy test_sanitize_preserva_apostrofo).
         assert_eq!(sanitize_invalid("Widow's Bay"), "Widow's Bay");
         assert_eq!(sanitize_invalid(""), "");
+    }
+
+    #[test]
+    fn restores_source_before_resolution() {
+        assert_eq!(
+            restore_source_token("Show - S01E01 - Titolo - [1080p][h264][AAC][IT].mkv", "webdl"),
+            Some("Show - S01E01 - Titolo - [WEB-DL][1080p][h264][AAC][IT].mkv".to_string())
+        );
+        // Già presente: niente da fare.
+        assert_eq!(
+            restore_source_token("Show - S01E01 - T - [WEB-DL][720p].mkv", "webdl"),
+            None
+        );
+        // Sorgente sconosciuta o nessun tag risoluzione: niente.
+        assert_eq!(
+            restore_source_token("Show - S01E01 - T - [1080p].mkv", "unknown"),
+            None
+        );
+        assert_eq!(restore_source_token("Show - S01E01 - T.mkv", "webdl"), None);
+    }
+
+    #[test]
+    fn rejects_names_with_empty_bracket_artifacts() {
+        let mut cfg = Config::default();
+        cfg.rename_episodes = true;
+        cfg.rename_format = "custom".into();
+        cfg.rename_template =
+            "{Serie} - {Stagione}{Episodio} - {Titolo} - [{Source}][{Risoluzione}][{VideoCodec}][{HDR}][{Audio}][{Lingue}]"
+                .into();
+        cfg.series.push(SeriesConfig {
+            name: "Only Murders in the Building".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        let release = Release {
+            title: "Only Murders in the Building S01E01".into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: "rss".into(),
+            quality: Default::default(),
+            kind: "series".into(),
+            series: Some("Only Murders in the Building".into()),
+            season: Some(1),
+            episode: Some(1),
+            is_pack: false,
+            episode_range: vec![1],
+            year: None,
+            discovered_at: chrono::Utc::now(),
+        };
+        // Gruppi vuoti `[]`: NON conforme, va rinominato per ripulirlo.
+        let broken = Path::new(
+            "Only Murders in the Building - S01E01 - True Crime - [][480p][h264][][AAC][IT].mkv",
+        );
+        assert!(!episode_name_conforms(broken, &release, &cfg));
+        // Nome già pulito: conforme.
+        let clean = Path::new(
+            "Only Murders in the Building - S01E01 - True Crime - [480p][h264][AAC][IT].mkv",
+        );
+        assert!(episode_name_conforms(clean, &release, &cfg));
     }
 
     #[test]

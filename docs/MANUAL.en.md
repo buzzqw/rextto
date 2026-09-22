@@ -35,7 +35,7 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
 - **Cycle buttons** — run a full cycle or a single domain (Series, Movies,
   Comics) or a backup now.
 - **Stat cards** — configured series/movies, downloaded files, free space,
-  archive magnets, session torrents.
+  archive magnets, session torrents, seen-from-feed groups.
 - **Network and active downloads** — CPU/RAM plus a live network sparkline.
 - **Consumption and disks**, **upcoming releases**, **last downloads**,
   **recent activity** and **latest finds from sources**.
@@ -52,7 +52,10 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
 - **Details** tabs: General, Tracker, Content, Peers, Limits, Storage; includes
   copy magnet, per-torrent limits/seed-days, reannounce, pin, restart,
   mark-failed, move storage.
-- **Download history** lists completed downloads only.
+- **Download history** lists finished downloads (native completions and
+  migrated ones). Columns: name (with a **NAS** badge when the file has been
+  archived), type/season/episode, **NAS tag** (folder rule), score, status
+  (*Completed*), the **library/NAS path** and the completion time.
 
 ## 4. Series
 
@@ -85,6 +88,9 @@ aliases, exclusions, NAS path, subtitles, timeframe).
   search, generic release search, add-to-library.
 - **Archive** — full-text search of past releases with pagination, batch queue,
   copy magnet, delete; **Series/Movies from feed** tabs.
+- **Seen from feed** — every release seen in the sources, grouped by title
+  (movies/series) with count, best resolution and score; expand a group to
+  queue a single release. Populated by each cycle, even for unmonitored titles.
 - **Comics** — GetComics explore + quick add, monitored list, link extraction
   from a post, weekly-pack settings and history with resend/delete/force.
 
@@ -97,9 +103,15 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
   button, FlareSolverr URL + test, web engines, content filters, blacklist.
 - **libtorrent** — connections/performance, protocols/trackers, security/proxy,
   RAM disk and ports, speed limits and scheduler; apply/optimise/update check.
+  Under *Security, proxy and network* the **VPN killswitch interface** binds
+  listening and outgoing traffic to a chosen interface (e.g. `tun0`, `wg0`);
+  the list is read from the server, and the change applies after a restart.
 - **Scores** — weights per category, custom groups and a live simulator.
 - **Rename** — rename enable, template editor with tokens and live preview,
-  TMDB/TVDB keys, language, upgrade thresholds, API token.
+  TMDB/TVDB keys, language, upgrade thresholds, API token. Verification recovers
+  the source token from the original release title stored in the database and
+  drops empty placeholder blocks (`[]`), so a lost `[WEB-DL]` is restored instead
+  of staying `unknown`.
 - **Advanced** — free-space guard, trash retention, archive retention, feed
   pages, rename-verify interval, move episodes, debug flags.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
@@ -114,11 +126,26 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
 
 - Backup now, clean trash, rescore, scan archives, import legacy data, restart
   the service.
-- **Database**: prune by cycles/error age, keyword prune with preview, and
+- **Video duplicates** — *Preview duplicates* and *Clean duplicates* find video
+  files clearly inferior (strictly lower resolution) left next to the best
+  version in the same folder, e.g. an old 480p next to the new 1080p, and move
+  them to the trash. At the **same resolution** the version matching the
+  preferred language (*Configuration → Rename → default language*) is kept and a
+  duplicate that explicitly declares a different language is moved to trash;
+  files with no language tag are left untouched. Files of torrents still in the
+  session are protected, and emptied sub-folders are removed. The rename
+  verification also performs this cleanup automatically, and upgrade cleanup now
+  also honours the "hard" upgrade reasons (resolution/source/HDR/repack).
+- **Restore source** — *Restore source* remounts the `[Source]` token (WEB-DL,
+  HDTV, BluRay…) in archived names that lost it, recovering it from the original
+  release title in the database. It never invents a source: unknown stays
+  untouched. Preview first, then execute; no re-download is involved.
+- **Database**: prune by cycles/error age, **seen-from-feed retention** (days; 0
+  keeps everything), keyword prune with a list of the matching rows, and
   **VACUUM / ANALYZE** across all databases.
-- **Backups**: retention, schedule (manual/daily/weekly), FTP host/user/path +
-  **Test FTP** (checks connection, path and a probe upload), cloud/sync folder
-  copy, Telegram delivery, list of available backups.
+- **Backups**: retention, schedule (manual, every N hours or a fixed daily
+  HH:MM), FTP host/user/path + **Test FTP** (checks connection, path and a probe
+  upload), cloud/sync folder copy, Telegram delivery, list of available backups.
 
 ## 10. Health, Logs, Charts
 

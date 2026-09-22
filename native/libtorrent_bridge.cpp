@@ -347,6 +347,8 @@ int rextto_lt_apply_settings(rextto_lt_session* session, const char* settings, c
             else if (key == "proxy_username") { pack.set_str(lt::settings_pack::proxy_username, value); known = true; }
             else if (key == "proxy_password") { pack.set_str(lt::settings_pack::proxy_password, value); known = true; }
             else if (key == "listen_interfaces") { pack.set_str(lt::settings_pack::listen_interfaces, value); known = true; }
+            // Killswitch VPN: forza il traffico in uscita su una scheda (estensione legacy).
+            else if (key == "outgoing_interfaces") { pack.set_str(lt::settings_pack::outgoing_interfaces, value); known = true; }
             else if (key == "ip_filter_path") { load_ipfilter_into_session(session, value); known = true; }
             else if (key == "dht_bootstrap_nodes") { pack.set_str(lt::settings_pack::dht_bootstrap_nodes, value); known = true; }
             else if (key == "max_peerlist_size") { pack.set_int(lt::settings_pack::max_peerlist_size, number); known = true; }
@@ -677,10 +679,8 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
         const int connection_limit = std::max(1, settings.get_int(lt::settings_pack::connections_limit));
         const int upload_limit = std::max(1, settings.get_int(lt::settings_pack::unchoke_slots_limit));
         int total_weight = 0;
-        int downloading_count = 0;
         for (auto const& item : active) {
             total_weight += item.tier == 0 ? 3 : (item.tier == 1 ? 2 : 1);
-            if (item.tier == 0) ++downloading_count;
         }
         const int available_connections = std::max(static_cast<int>(connection_limit * 0.7), 10 * static_cast<int>(active.size()));
         const int available_uploads = std::max(static_cast<int>(upload_limit * 0.7), 2 * static_cast<int>(active.size()));
@@ -688,11 +688,14 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
             const int weight = item.tier == 0 ? 3 : (item.tier == 1 ? 2 : 1);
             item.handle.set_max_connections(std::max(10, available_connections * weight / std::max(1, total_weight)));
             item.handle.set_max_uploads(std::max(2, available_uploads * weight / std::max(1, total_weight)));
-            if (global_download_limit > 0) {
-                item.handle.set_download_limit(item.tier == 0
-                    ? std::max(1024, global_download_limit / std::max(1, downloading_count))
-                    : 1024);
-            }
+            // Non imporre un tetto per-torrent basato sul numero di download
+            // attivi: con molti torrent che scambiano pochi KB/s il pool globale
+            // veniva diviso fra tutti, strozzando i torrent veloci e lasciando
+            // inutilizzata parte della banda. Il tetto globale della sessione
+            // (download_rate_limit) limita già il totale, quindi il singolo
+            // torrent resta illimitato (0). Questo azzera anche eventuali limiti
+            // per-torrent installati dalla versione precedente.
+            item.handle.set_download_limit(0);
         }
         for (auto const& handle : session->session.get_torrents()) {
             auto status = handle.status();

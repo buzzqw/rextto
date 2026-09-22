@@ -292,6 +292,11 @@ async fn search_btdig(
     for link in document.select(&selector) {
         let magnet = link.value().attr("href").unwrap_or_default();
         let title = link.text().collect::<String>().trim().to_owned();
+        // Alcuni link BTDigg hanno come testo un magnet troncato (`magnet:?xt=…`):
+        // non è un titolo, salta la voce.
+        if title.to_ascii_lowercase().starts_with("magnet:") {
+            continue;
+        }
         if !title.is_empty() && sanitize_magnet(magnet, Some(&title)).is_some() {
             output.push((title, magnet.to_owned(), "BTDigg".into()));
         }

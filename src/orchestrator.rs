@@ -96,6 +96,11 @@ pub async fn run_cycle_domain(
         releases.retain(|release| release.kind == "movie");
     }
     archive.lock().unwrap().save_batch(&releases)?;
+    // "Visti nei feed": memorizza ogni release raccolta (anche quelle non
+    // monitorate) per la consultazione nell'archivio.
+    if let Err(error) = db.lock().unwrap().record_seen_batch(&releases) {
+        tracing::debug!(%error, "feed seen recording failed");
+    }
     let mut archive_queries = Vec::new();
     for series in cfg
         .series
