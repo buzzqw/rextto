@@ -361,11 +361,12 @@ impl Database {
     pub const DEFAULT_UPGRADE_MIN_SCORE_DIFF: i64 = 200;
 
     pub fn check_series(&self, release: &Release) -> Result<(bool, String)> {
-        self.check_series_scored(
+        self.check_series_scored_inner(
             release,
             release.quality.score(),
             Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF,
             &crate::models::ApprovalContext::default(),
+            false,
         )
     }
 
@@ -375,6 +376,32 @@ impl Database {
         score: i64,
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
+    ) -> Result<(bool, String)> {
+        self.check_series_scored_inner(release, score, min_score_diff, context, false)
+    }
+
+    /// Approvazione dell'azione esplicita “Accoda”. Per questa azione un
+    /// download incompleto (anche presente nel client) non equivale a una copia:
+    /// blocchiamo solo una release già archiviata sul NAS, lo stesso hash attivo
+    /// o una release in blacklist. Il ciclo automatico mantiene i controlli
+    /// conservativi di `check_series_scored`.
+    pub fn check_series_manual_scored(
+        &self,
+        release: &Release,
+        score: i64,
+        min_score_diff: i64,
+        context: &crate::models::ApprovalContext,
+    ) -> Result<(bool, String)> {
+        self.check_series_scored_inner(release, score, min_score_diff, context, true)
+    }
+
+    fn check_series_scored_inner(
+        &self,
+        release: &Release,
+        score: i64,
+        min_score_diff: i64,
+        context: &crate::models::ApprovalContext,
+        manual: bool,
     ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
@@ -386,7 +413,7 @@ impl Database {
             return Ok((false, "active_episode".into()));
         }
         if release.is_pack {
-            return self.check_series_pack(release, &hash, score, min_score_diff, context);
+            return self.check_series_pack(release, &hash, score, min_score_diff, context, manual);
         }
         let season = release.season.context("series release has no season")?;
         let episode = release.episode.context("series release has no episode")?;
@@ -400,30 +427,41 @@ impl Database {
             params![series_name],
             |r| r.get(0),
         )?;
-        if context.live.episodes.contains(&(
+        if !manual && context.live.episodes.contains(&(
             crate::parser::normalize_series_name(series_name),
             season,
             episode,
         )) {
             return Ok((false, "active_episode".into()));
         }
-        if self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
+        if !manual && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
         // Considera duplicato solo un episodio già scaricato/archiviato: una
         // riga placeholder (downloaded_at NULL) non deve impedire un retry.
-        if self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))",
+        let same_hash_is_archived: bool = self.conn.query_row(
+            if manual {
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 AND COALESCE(archive_path,'') <> '')"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE magnet_hash=?1 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))"
+            },
             [&hash],
             |row| row.get::<_, bool>(0),
-        )? {
+        )?;
+        if same_hash_is_archived {
             return Ok((false, "duplicate".into()));
         }
-        let db_row: Option<(i64, i64, String)> = self.conn.query_row("SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))).optional()?;
+        let db_row: Option<(i64, i64, String, String)> = self.conn.query_row("SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).optional()?;
         // Intelligenza archivio (parità col legacy `_best_quality_in_path`): se
         // su disco c'è già un file di qualità uguale o superiore, non scaricare
         // anche se il DB non lo conosce. Se il file su disco è inferiore, il
         // candidato resta valido.
         if let Some((disk_quality, disk_score)) = context.archive.best_for(season, episode) {
-            let db_score = db_row.as_ref().map(|(_, value, _)| *value).unwrap_or(i64::MIN);
+            if manual {
+                return Ok((false, "duplicate".into()));
+            }
+            let db_score = db_row
+                .as_ref()
+                .map(|(_, value, _, _)| *value)
+                .unwrap_or(i64::MIN);
             if *disk_score > db_score
                 && release
                     .quality
@@ -433,11 +471,14 @@ impl Database {
                 return Ok((false, "duplicate".into()));
             }
         }
-        if let Some((id, existing_score, existing_title)) = db_row {
+        if let Some((id, existing_score, existing_title, archive_path)) = db_row {
+            if manual && !archive_path.is_empty() {
+                return Ok((false, "duplicate".into()));
+            }
             // legacy upgrade_reason: resolution jump, HDTV→WEB-DL, HDR, first
             // REPACK, or a score gain of at least `min_score_diff`.
             let old_quality = parse_quality(&existing_title);
-            if release
+            if !manual && release
                 .quality
                 .upgrade_reason(&old_quality, score, existing_score, min_score_diff)
                 .is_none()
@@ -479,6 +520,7 @@ impl Database {
         score: i64,
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
+        manual: bool,
     ) -> Result<(bool, String)> {
         let season = release.season.context("season pack has no season")?;
         let series_name = release.series.as_deref().unwrap_or(&release.title);
@@ -501,11 +543,16 @@ impl Database {
         )?;
         // Duplicato solo se il pack è già stato scaricato/archiviato: i
         // placeholder non devono impedire un secondo tentativo (retry).
-        if tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM episodes WHERE (magnet_hash=?1 OR magnet_link=?2) AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))",
+        let same_pack_is_archived: bool = tx.query_row(
+            if manual {
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE (magnet_hash=?1 OR magnet_link=?2) AND COALESCE(archive_path,'') <> '')"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE (magnet_hash=?1 OR magnet_link=?2) AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'') <> ''))"
+            },
             params![hash, release.magnet],
             |row| row.get::<_, bool>(0),
-        )? {
+        )?;
+        if same_pack_is_archived {
             return Ok((false, "duplicate".into()));
         }
         let mut targets: Vec<i64> = explicit.clone();
@@ -543,7 +590,7 @@ impl Database {
         )?;
         for episode in &targets {
             // Non toccare gli episodi con un download ancora attivo (DB o sessione).
-            let active = tx.query_row(
+            let active = !manual && (tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))",
                 params![series_name, season, episode],
                 |row| row.get::<_, bool>(0),
@@ -552,14 +599,14 @@ impl Database {
                     crate::parser::normalize_series_name(series_name),
                     season,
                     *episode,
-                ));
+                )));
             if active {
                 continue;
             }
-            let existing: Option<(i64, i64, String)> = tx.query_row(
-                "SELECT id,quality_score,COALESCE(title,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3",
+            let existing: Option<(i64, i64, String, String)> = tx.query_row(
+                "SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3",
                 params![series_id, season, episode],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional()?;
             match existing {
                 None => {
@@ -583,7 +630,10 @@ impl Database {
                     tx.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![series_id, season, episode, release.title, score, episode_hash, release.magnet])?;
                     inserted += 1;
                 }
-                Some((id, existing_score, existing_title)) => {
+                Some((id, existing_score, existing_title, archive_path)) => {
+                    if manual && (!archive_path.is_empty() || context.archive.best_for(season, *episode).is_some()) {
+                        continue;
+                    }
                     // Confronta col migliore tra la riga DB e il file su disco.
                     let (old_quality, old_score) = match context.archive.best_for(season, *episode) {
                         Some((disk_quality, disk_score)) if *disk_score > existing_score => {
@@ -591,7 +641,7 @@ impl Database {
                         }
                         _ => (parse_quality(&existing_title), existing_score),
                     };
-                    if release
+                    if manual || release
                         .quality
                         .upgrade_reason(&old_quality, score, old_score, min_score_diff)
                         .is_some()
@@ -902,6 +952,64 @@ impl Database {
             }
         }
         Ok(gaps)
+    }
+
+    /// Episodi attesi di una serie che non hanno ancora un percorso di archivio.
+    /// È il criterio del pulsante manuale “Cerca mancanti”: una puntata ancora
+    /// nel client può avere alternative nei feed, ma una puntata sul NAS no.
+    pub fn unarchived_episodes_for_series(
+        &self,
+        series_name: &str,
+        ignored_seasons: &[i64],
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut targets = std::collections::BTreeMap::<i64, i64>::new();
+        let mut metadata = self.conn.prepare(
+            "SELECT season,episode_count FROM series_metadata WHERE series_name=?1",
+        )?;
+        for row in metadata.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (season, count) = row?;
+            targets.entry(season).and_modify(|value| *value = (*value).max(count)).or_insert(count);
+        }
+        let mut known = self.conn.prepare(
+            "SELECT e.season,MAX(e.episode) FROM episodes e
+             JOIN series s ON s.id=e.series_id
+             WHERE s.name=?1 AND e.episode>0 GROUP BY e.season",
+        )?;
+        for row in known.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (season, count) = row?;
+            targets.entry(season).and_modify(|value| *value = (*value).max(count)).or_insert(count);
+        }
+        let mut archived = self.conn.prepare(
+            "SELECT e.season,e.episode FROM episodes e
+             JOIN series s ON s.id=e.series_id
+             WHERE s.name=?1 AND e.episode>0 AND COALESCE(e.archive_path,'')<>''",
+        )?;
+        let archived = archived
+            .query_map([series_name], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        let mut missing = Vec::new();
+        for (season, count) in targets {
+            if ignored_seasons.contains(&season) {
+                continue;
+            }
+            for episode in 1..=count {
+                let ignored: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ignored_episodes WHERE series_name=?1 AND season=?2 AND episode=?3)",
+                    params![series_name, season, episode],
+                    |row| row.get(0),
+                )?;
+                if !ignored && !archived.contains(&(season, episode)) {
+                    missing.push((season, episode));
+                }
+            }
+        }
+        Ok(missing)
     }
 
     /// Episodi della serie; `extra_ignored` sono le stagioni ignorate dalla
@@ -2126,6 +2234,29 @@ impl Database {
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Release di una puntata già viste durante le scansioni RSS/HTML. Il nome
+    /// della serie viene verificato dal chiamante, così può applicare anche gli
+    /// alias configurati con la stessa normalizzazione del parser.
+    pub fn series_feed_for_episode(
+        &self,
+        season: i64,
+        episode: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT title,COALESCE(magnet,''),COALESCE(source,'')
+             FROM series_feed_seen
+             WHERE season=?1 AND episode=?2
+             ORDER BY quality_score DESC, found_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![season, episode, limit.clamp(1, 200) as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 /// Pattern LIKE per la ricerca nei gruppi "visti", con la stessa semantica del
@@ -2448,6 +2579,7 @@ mod tests {
                 score,
                 200,
                 &crate::models::ApprovalContext::default(),
+                false,
             )
             .unwrap();
         assert!(approved, "il 1080p deve essere approvato: {reason}");
@@ -2697,6 +2829,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(size, 42);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn manual_missing_search_uses_archive_presence_not_client_state() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-manual-gaps-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn.execute("INSERT INTO series(id,name) VALUES (1,'Example')", []).unwrap();
+        db.save_series_metadata("Example", &[(1, 3)]).unwrap();
+        // La puntata 1 è solo nel client: va ancora proposta dalla ricerca manuale.
+        db.conn.execute("INSERT INTO episodes(series_id,season,episode,title,archive_path) VALUES (1,1,1,'Example S01E01','')", []).unwrap();
+        // La puntata 2 è sul NAS: non va cercata.
+        db.conn.execute("INSERT INTO episodes(series_id,season,episode,title,archive_path) VALUES (1,1,2,'Example S01E02','/nas/Example S01E02.mkv')", []).unwrap();
+        assert_eq!(
+            db.unarchived_episodes_for_series("Example", &[]).unwrap(),
+            vec![(1, 1), (1, 3)]
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
@@ -3017,6 +3175,36 @@ mod tests {
         gap.magnet = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".into();
         let (approved_gap, _) = db.check_series_scored(&gap, score, 50, &crate::models::ApprovalContext::default()).unwrap();
         assert!(approved_gap, "pack per stagione vuota deve essere approvato");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn manual_pack_can_replace_unarchived_higher_quality_placeholders() {
+        let path = std::env::temp_dir().join(format!("rextto-manual-pack-{}", uuid::Uuid::new_v4()));
+        let db = Database::open(&path).unwrap();
+        db.conn.execute("INSERT INTO series(id,name) VALUES (1,'Neagley')", []).unwrap();
+        db.save_series_metadata("Neagley", &[(1, 2)]).unwrap();
+        for episode in 1..=2 {
+            db.conn.execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score) VALUES (1,1,?1,?2,1880)",
+                params![episode, format!("Neagley.S01E0{episode}.2160p.DV.HDR.H.265")],
+            ).unwrap();
+        }
+        let pack = Release {
+            title: "Neagley.S01E01-02.1080p.AMZN.WEB-DL.ITA.ENG.DDP5.1.H.264-G66".into(),
+            magnet: "magnet:?xt=urn:btih:abababababababababababababababababababab".into(),
+            source: "ExtTo".into(),
+            quality: parse_quality("Neagley.S01E01-02.1080p.AMZN.WEB-DL.ITA.ENG.DDP5.1.H.264-G66"),
+            kind: "series".into(), series: Some("Neagley".into()), season: Some(1), episode: Some(1),
+            is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: Utc::now(),
+        };
+        let (approved, reason) = db.check_series_manual_scored(
+            &pack, pack.quality.score(), 200, &crate::models::ApprovalContext::default(),
+        ).unwrap();
+        assert!(approved, "un pack manuale deve poter sostituire placeholder non archiviati: {reason}");
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

@@ -1558,36 +1558,84 @@ async fn series_search_missing(
             Json(serde_json::json!({"ok":false,"error":"series not found"})),
         );
     };
-    let gaps =
-        s.db.lock()
-            .unwrap()
-            .archive_gaps()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(series_name, _, _)| series_name == &series.name)
-            .take(3)
-            .collect::<Vec<_>>();
+    let gaps = s
+        .db
+        .lock()
+        .unwrap()
+        .unarchived_episodes_for_series(&series.name, &series.ignored_seasons)
+        .unwrap_or_default()
+        .into_iter()
+        // Come il flusso legacy, cerca una porzione significativa della serie
+        // senza trasformare una singola azione UI in centinaia di query.
+        .take(15)
+        .collect::<Vec<_>>();
+    // Le ricerche locali (feed/archivio) restano puntuali; per le sorgenti
+    // remote usiamo invece una sola query della serie, poi distribuiamo le
+    // release alle puntate corrispondenti. Evita 15 ricerche web/indexer in
+    // sequenza per un singolo clic.
+    let live_releases = if gaps.is_empty() {
+        Vec::new()
+    } else {
+        s.engine.search_query_manual(&cfg, &series.name).await
+    };
     let mut results = Vec::new();
-    for (_, season, episode) in &gaps {
-        let query = format!("{} S{:02}E{:02}", series.name, season, episode);
-        for release in s.engine.search_query(&cfg, &query).await {
-            results.push(serde_json::json!({"season":season,"episode":episode,"title":release.title,"magnet":release.magnet,"source":release.source}));
-        }
-        for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default()
+    for (season, episode) in &gaps {
+        let mut episode_results = stored_series_episode_sources(&s, &series, *season, *episode);
+        for release in live_releases
+            .iter()
+            .filter(|release| release_matches_series_episode(release, &series, *season, *episode))
         {
-            results.push(serde_json::json!({"season":season,"episode":episode,"title":title,"magnet":magnet,"source":source}));
+            episode_results
+                .push(serde_json::json!({"release":release,"origin":"Indexer / web"}));
+        }
+        for mut result in finalize_episode_search_results(episode_results, &cfg) {
+            result["season"] = serde_json::json!(season);
+            result["episode"] = serde_json::json!(episode);
+            results.push(result);
         }
     }
+    let mut seen = HashSet::new();
+    results.retain(|result| {
+        result
+            .get("release")
+            .and_then(|release| release.get("magnet"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::utils::magnet_hash)
+            .is_some_and(|hash| {
+                let origin = result
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                seen.insert(format!("{hash}:{origin}"))
+            })
+    });
+    results.sort_by_key(|result| {
+        std::cmp::Reverse(
+            result
+                .get("release")
+                .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
+                .map(|release| release.quality.score_with_settings(&cfg.settings))
+                .unwrap_or_default(),
+        )
+    });
     {
         let db = s.db.lock().unwrap();
-        for (_, season, episode) in &gaps {
+        for (season, episode) in &gaps {
             let _ = db.mark_gap_searched(&series.name, *season, *episode);
         }
     }
     (
         StatusCode::OK,
         Json(
-            serde_json::json!({"ok":true,"series":series.name,"searched":gaps.len(),"results":results}),
+            serde_json::json!({
+                "ok": true,
+                "series": series.name,
+                "searched": gaps.len(),
+                "episodes": gaps.into_iter().map(|(season, episode)| {
+                    serde_json::json!({"season": season, "episode": episode})
+                }).collect::<Vec<_>>(),
+                "results": results,
+            }),
         ),
     )
 }
@@ -2292,7 +2340,16 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
     }
     let mut seen = HashSet::new();
     results.retain(|release| {
-        crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
+        // Il pulsante “Accoda” usa gli stessi requisiti del film monitorato.
+        // Senza questo filtro la ricerca poteva mostrare (ad es.) una release
+        // solo ENG o sotto la qualità minima, per poi rifiutarla al clic.
+        release.kind == "movie"
+            && cfg
+                .find_movie_match(&release.title, release.year)
+                .is_some_and(|matched| {
+                    matched.id == movie.id && Config::movie_release_allowed(movie, &release.quality)
+                })
+            && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
         std::cmp::Reverse(release.quality.score_with_settings(&cfg.settings))
@@ -4603,55 +4660,17 @@ async fn search_episode(
         );
     };
     let query = format!("{} S{season:02}E{episode:02}", series.name);
-    let matches_episode = |release: &Release| {
-        release.kind == "series"
-            && release.season == Some(season)
-            && release.episode == Some(episode)
-            && release.series.as_deref().is_some_and(|name| {
-                name.eq_ignore_ascii_case(&series.name)
-                    || series
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(name))
-            })
-    };
-    let mut results = s
-        .engine
-        .search_query(&cfg, &query)
-        .await
-        .into_iter()
-        .filter(matches_episode)
-        .map(|release| serde_json::json!({"release":release,"from_feed":false}))
-        .collect::<Vec<_>>();
-    for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default() {
-        if let Some(release) = crate::parser::parse_release(&title, &magnet, &source) {
-            if matches_episode(&release) {
-                let from_feed = !source.starts_with("archive:") && !source.starts_with("timeframe");
-                results.push(serde_json::json!({"release":release,"from_feed":from_feed}));
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    results.retain(|result| {
-        result
-            .get("release")
-            .and_then(|release| release.get("magnet"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(crate::utils::magnet_hash)
-            .is_some_and(|hash| seen.insert(hash))
-    });
-    results.sort_by_key(|result| {
-        std::cmp::Reverse(
-            result
-                .get("release")
-                .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
-                .map(|release| release.quality.score_with_settings(&cfg.settings))
-                .unwrap_or_default(),
-        )
-    });
+    let results = search_series_episode_sources(
+        &s,
+        &cfg,
+        &series,
+        season,
+        episode,
+    )
+    .await;
     let feed_matches = results
         .iter()
-        .filter(|result| result.get("from_feed").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter(|result| result.get("origin").and_then(serde_json::Value::as_str) == Some("Feed RSS"))
         .count();
     let _ =
         s.db.lock()
@@ -4663,6 +4682,124 @@ async fn search_episode(
             serde_json::json!({"ok":true,"query":query,"results":results,"feed_matches":feed_matches}),
         ),
     )
+}
+
+/// Cerca una puntata nei feed RSS già acquisiti, nell'archivio storico e nelle
+/// sorgenti live (indexer/web). I risultati mantengono l'origine per mostrarla
+/// nella riga dell'episodio e permettere all'utente di scegliere consapevolmente.
+async fn search_series_episode_sources(
+    s: &AppState,
+    cfg: &Config,
+    series: &SeriesConfig,
+    season: i64,
+    episode: i64,
+) -> Vec<serde_json::Value> {
+    let mut results = stored_series_episode_sources(s, series, season, episode);
+    let query = format!("{} S{season:02}E{episode:02}", series.name);
+
+    // Ricerca live sugli indexer Torznab e sui motori web configurati. I
+    // motori web sono limitati a 15 s, gli indexer no.
+    for release in s.engine.search_query_manual(cfg, &query).await {
+        if release_matches_series_episode(&release, series, season, episode) {
+            results.push(serde_json::json!({"release":release,"origin":"Indexer / web"}));
+        }
+    }
+    finalize_episode_search_results(results, cfg)
+}
+
+fn release_matches_series_episode(
+    release: &Release,
+    series: &SeriesConfig,
+    season: i64,
+    episode: i64,
+) -> bool {
+    release.kind == "series"
+        && release.season == Some(season)
+        // Una ricerca puntuale deve proporre anche i pack che contengono la
+        // puntata (S01E01-08) e i pack completi di stagione (S01). Prima
+        // venivano accettate solo release con `episode` identico, perciò una
+        // puntata 5 risultava senza alternative quando era disponibile solo
+        // un pack iniziato dalla puntata 1.
+        && if release.episode_range.is_empty() {
+            release.episode == Some(episode)
+        } else {
+            release.episode_range.contains(&episode) || release.episode_range.contains(&0)
+        }
+        && release.series.as_deref().is_some_and(|name| {
+            crate::parser::series_names_match(&series.name, name)
+                || series
+                    .aliases
+                    .iter()
+                    .any(|alias| crate::parser::series_names_match(alias, name))
+        })
+}
+
+/// Risultati già disponibili localmente: non produce mai traffico di rete.
+fn stored_series_episode_sources(
+    s: &AppState,
+    series: &SeriesConfig,
+    season: i64,
+    episode: i64,
+) -> Vec<serde_json::Value> {
+    let query = format!("{} S{season:02}E{episode:02}", series.name);
+    let mut results = Vec::new();
+
+    // Feed RSS/HTML già scanditi dal ciclo: sono immediati da interrogare e
+    // non richiedono un nuovo polling della sorgente remota.
+    for (title, magnet, source) in s
+        .db
+        .lock()
+        .unwrap()
+        .series_feed_for_episode(season, episode, 200)
+        .unwrap_or_default()
+    {
+        if let Some(release) = crate::parser::parse_release(&title, &magnet, &source) {
+            if release_matches_series_episode(&release, series, season, episode) {
+                results.push(serde_json::json!({"release":release,"origin":"Feed RSS"}));
+            }
+        }
+    }
+
+    // Archivio delle release precedentemente acquisite da feed/indexer/web.
+    for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default() {
+        if let Some(release) = crate::parser::parse_release(&title, &magnet, &source) {
+            if release_matches_series_episode(&release, series, season, episode) {
+                results.push(serde_json::json!({"release":release,"origin":"Archivio"}));
+            }
+        }
+    }
+    results
+}
+
+fn finalize_episode_search_results(
+    mut results: Vec<serde_json::Value>,
+    cfg: &Config,
+) -> Vec<serde_json::Value> {
+    let mut seen = HashSet::new();
+    results.retain(|result| {
+        result
+            .get("release")
+            .and_then(|release| release.get("magnet"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::utils::magnet_hash)
+            .is_some_and(|hash| {
+                let origin = result
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                seen.insert(format!("{hash}:{origin}"))
+            })
+    });
+    results.sort_by_key(|result| {
+        std::cmp::Reverse(
+            result
+                .get("release")
+                .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
+                .map(|release| release.quality.score_with_settings(&cfg.settings))
+                .unwrap_or_default(),
+        )
+    });
+    results
 }
 async fn delete_episode(
     State(s): State<AppState>,
@@ -4700,7 +4837,7 @@ async fn search_missing(
         input.season,
         input.episode
     );
-    let mut results = s.engine.search_query(&s.cfg, &query).await;
+    let mut results = s.engine.search_query_manual(&s.cfg, &query).await;
     for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default() {
         if let Some(release) =
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))
@@ -6796,7 +6933,7 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
             archive: archive_index,
             live,
         };
-        s.db.lock().unwrap().check_series_scored(
+        s.db.lock().unwrap().check_series_manual_scored(
             &release,
             release.quality.score_with_settings(&s.cfg.settings),
             s.cfg.upgrade_min_score_diff,
@@ -9465,6 +9602,31 @@ mod tests {
         assert!(!needs_infinite_seed_resume(&torrent_view("paused", false, 3)));
         // Already seeding: nothing to do.
         assert!(!needs_infinite_seed_resume(&torrent_view("seeding", false, 0)));
+    }
+
+    #[test]
+    fn episode_search_matches_partial_and_complete_season_packs() {
+        let series = SeriesConfig {
+            name: "Example Show".into(),
+            ..Default::default()
+        };
+        let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+        let partial = crate::parser::parse_release(
+            "Example.Show.S01E01-08.1080p.WEB-DL.ITA",
+            magnet,
+            "test",
+        )
+        .unwrap();
+        let complete = crate::parser::parse_release(
+            "Example.Show.S01.1080p.WEB-DL.ITA",
+            magnet,
+            "test",
+        )
+        .unwrap();
+
+        assert!(release_matches_series_episode(&partial, &series, 1, 5));
+        assert!(release_matches_series_episode(&complete, &series, 1, 5));
+        assert!(!release_matches_series_episode(&partial, &series, 1, 9));
     }
 
     #[test]

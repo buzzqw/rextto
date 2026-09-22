@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::Result;
 use reqwest::Client;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -17,6 +17,9 @@ pub struct Engine {
 
 const QUERY_CONCURRENCY: usize = 8;
 const FEED_CONCURRENCY: usize = 10;
+/// Le ricerche avviate dall'interfaccia non devono attendere gli indexer/web
+/// lenti. I cicli automatici mantengono invece il timeout HTTP più generoso.
+const MANUAL_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Engine {
     pub fn new() -> Self {
@@ -31,6 +34,7 @@ impl Engine {
                 .expect("http client"),
         }
     }
+
     pub async fn scrape_all(&self, cfg: &Config) -> Result<Vec<Release>> {
         let mut all = Vec::new();
         let flaresolverr = cfg.flaresolverr_url.clone();
@@ -147,7 +151,7 @@ impl Engine {
                 if let Some((query, ids)) = iter.next() {
                     let client = self.client.clone();
                     let cfg = cfg.clone();
-                    set.spawn(async move { search_one(&client, &cfg, &query, &ids).await });
+                    set.spawn(async move { search_one(&client, &cfg, &query, &ids, None).await });
                 }
             };
         for _ in 0..QUERY_CONCURRENCY {
@@ -196,6 +200,12 @@ impl Engine {
         self.search_query_ids(cfg, query, &[]).await
     }
 
+    /// Ricerca interattiva: gli indexer Torznab restano disponibili per tutta
+    /// la loro ricerca, mentre i motori web hanno un budget complessivo breve.
+    pub async fn search_query_manual(&self, cfg: &Config, query: &str) -> Vec<Release> {
+        search_one(&self.client, cfg, query, &[], Some(MANUAL_SEARCH_TIMEOUT)).await
+    }
+
     pub async fn search_query_ids(
         &self,
         cfg: &Config,
@@ -206,7 +216,7 @@ impl Engine {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        search_one(&self.client, cfg, query, &owned).await
+        search_one(&self.client, cfg, query, &owned, None).await
     }
 }
 
@@ -215,56 +225,93 @@ async fn search_one(
     cfg: &Config,
     query: &str,
     external_ids: &[(String, String)],
+    web_timeout: Option<Duration>,
 ) -> Vec<Release> {
     let mut all = Vec::new();
-    let borrowed: Vec<(&str, &str)> = external_ids
+    let indexers = cfg
+        .indexers
         .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    for indexer in cfg.indexers.iter().filter(|indexer| indexer.enabled) {
-        tracing::debug!(indexer = %indexer.name, query, "indexer search started");
-        match fetch_torznab_flaresolverr(
-            client,
-            indexer,
-            query,
-            &borrowed,
-            cfg.flaresolverr_url.as_deref(),
-        )
-        .await
-        {
-            Ok(items) => {
-                tracing::debug!(indexer = %indexer.name, results = items.len(), query, "indexer search completed");
-                all.extend(items);
-            }
-            Err(error) => {
-                let error = crate::utils::redact_url_secrets(&error.to_string());
-                tracing::warn!(indexer=%indexer.name, query, error = %error, "indexer search failed")
-            }
+        .filter(|indexer| indexer.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    let web_engines = cfg.websearch_engines.clone();
+    let flaresolverr = cfg.flaresolverr_url.clone();
+    let indexer_client = client.clone();
+    let indexer_query = query.to_owned();
+    let indexer_ids = external_ids.to_vec();
+    let indexer_search = async move {
+        let mut set = tokio::task::JoinSet::new();
+        for indexer in indexers {
+            let client = indexer_client.clone();
+            let query = indexer_query.clone();
+            let ids = indexer_ids.clone();
+            let flaresolverr = flaresolverr.clone();
+            set.spawn(async move {
+                tracing::debug!(indexer = %indexer.name, query, "indexer search started");
+                let borrowed = ids
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                let result = fetch_torznab_flaresolverr(
+                    &client,
+                    &indexer,
+                    &query,
+                    &borrowed,
+                    flaresolverr.as_deref(),
+                )
+                .await;
+                (indexer.name, query, result)
+            });
         }
-    }
-    if !cfg.websearch_engines.is_empty() {
-        match websearch::search(
-            client,
-            &cfg.websearch_engines,
-            query,
-            cfg.flaresolverr_url.as_deref(),
-        )
-        .await
-        {
-            Ok(items) => {
-                tracing::debug!(query, results = items.len(), "web search completed");
-                for (title, magnet, source) in items {
-                    if let Some(release) = parse_release(&title, &magnet, &source) {
-                        all.push(release);
-                    }
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((name, query, Ok(items))) => {
+                    tracing::debug!(indexer = %name, results = items.len(), query, "indexer search completed");
+                    results.extend(items);
                 }
+                Ok((name, query, Err(error))) => {
+                    let error = crate::utils::redact_url_secrets(&error.to_string());
+                    tracing::warn!(indexer = %name, query, error = %error, "indexer search failed");
+                }
+                Err(error) => tracing::warn!(%error, "indexer search task failed"),
+            }
+        }
+        results
+    };
+    let web_client = client.clone();
+    let web_query = query.to_owned();
+    let web_flaresolverr = cfg.flaresolverr_url.clone();
+    let web_search = async move {
+        if web_engines.is_empty() {
+            return Vec::new();
+        }
+        match websearch::search_with_timeout(
+            &web_client,
+            &web_engines,
+            &web_query,
+            web_flaresolverr.as_deref(),
+            web_timeout,
+        )
+        .await
+        {
+            Ok(items) => {
+                tracing::debug!(query = %web_query, results = items.len(), "web search completed");
+                items
+                    .into_iter()
+                    .filter_map(|(title, magnet, source)| parse_release(&title, &magnet, &source))
+                    .collect()
             }
             Err(error) => {
                 let error = crate::utils::redact_url_secrets(&error.to_string());
-                tracing::warn!(query, error = %error, "web search failed")
+                tracing::warn!(query = %web_query, error = %error, "web search failed");
+                Vec::new()
             }
         }
-    }
+    };
+    let (indexer_results, web_results) = tokio::join!(indexer_search, web_search);
+    all.extend(indexer_results);
+    all.extend(web_results);
     let mut seen = std::collections::HashSet::new();
     all.retain(|release| {
         cfg.release_allowed(release)

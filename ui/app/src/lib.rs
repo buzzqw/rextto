@@ -3131,6 +3131,10 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
     let rename_message = RwSignal::new(String::new());
     let rename_already_ok = RwSignal::new(0usize);
     let rename_open = RwSignal::new(false);
+    let missing_busy = RwSignal::new(false);
+    let missing_message = RwSignal::new(String::new());
+    let missing_results = RwSignal::new(Vec::<Value>::new());
+    let missing_searched = RwSignal::new(Vec::<Value>::new());
     let baseline = RwSignal::new(String::new());
     let signature = move || {
         format!(
@@ -3298,12 +3302,40 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                     </div>
                     <div class="toolbar">
                         <button class="btn sm" on:click=move |_| selected.set(None)>{ctx_tr("← Torna all'elenco")}</button>
-                        <button class="btn sm" on:click=move |_| {
+                        <button class="btn sm" disabled=move || missing_busy.get() on:click=move |_| {
                             if let Some(name) = selected.get() {
                                 let path = format!("/api/series/{}/search-missing", urlencoding::encode(&name));
-                                run_post(data, &path, None, "Ricerca mancanti completata");
+                                let busy = missing_busy;
+                                let message = missing_message;
+                                let results = missing_results;
+                                busy.set(true);
+                                message.set("Ricerca episodi mancanti in corso…".into());
+                                results.set(Vec::new());
+                                spawn_local(async move {
+                                    match send("POST", &path, None).await {
+                                        Ok(value) => {
+                                            let searched = value
+                                                .get("searched")
+                                                .and_then(Value::as_i64)
+                                                .unwrap_or(0);
+                                            let found = array(&value, "results");
+                                            let count = found.len();
+                                            results.set(found);
+                                            missing_searched.set(array(&value, "episodes"));
+                                            message.set(if searched == 0 {
+                                                "Nessun episodio mancante da cercare.".into()
+                                            } else if count == 0 {
+                                                format!("Cercati {searched} episodi mancanti: nessuna release compatibile trovata.")
+                                            } else {
+                                                format!("Cercati {searched} episodi mancanti: trovate {count} release compatibili.")
+                                            });
+                                        }
+                                        Err(error) => message.set(format!("Ricerca mancanti non riuscita: {error}")),
+                                    }
+                                    busy.set(false);
+                                });
                             }
-                        }>{ctx_tr("Cerca mancanti")}</button>
+                        }>{move || if missing_busy.get() { ctx_tr("Ricerca…").get() } else { ctx_tr("Cerca mancanti").get() }}</button>
                         <button class="btn sm" disabled=move || scan_busy.get() on:click=move |_| {
                             if let Some(name) = selected.get() {
                                 let path = format!("/api/series/{}/scan-archive", urlencoding::encode(&name));
@@ -3377,6 +3409,9 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                     </Show>
                     <Show when=move || !scan_busy.get() && !scan_message.get().is_empty()>
                         <div class="notice" style="margin-top:8px">{move || scan_message.get()}</div>
+                    </Show>
+                    <Show when=move || !missing_message.get().is_empty()>
+                        <div class="notice" style="margin-top:8px">{move || missing_message.get()}</div>
                     </Show>
                     <Show when=move || edit_open.get()>
                     <form class="form" on:submit=move |event| {
@@ -3459,7 +3494,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                         </div>
                     </div>
                     </Show>
-                    <EpisodeTable data detail selected />
+                    <EpisodeTable data detail selected missing_results missing_searched />
                     <Show when=move || rename_open.get()>
                         <div class="modal-backdrop" on:click=move |_| rename_open.set(false)>
                             <div class="modal" style="width:min(1500px,96vw)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
@@ -3560,9 +3595,12 @@ fn EpisodeTable(
     data: RwSignal<Data>,
     detail: RwSignal<Value>,
     selected: RwSignal<Option<String>>,
+    missing_results: RwSignal<Vec<Value>>,
+    missing_searched: RwSignal<Vec<Value>>,
 ) -> impl IntoView {
     let search_results = RwSignal::new(Vec::<Value>::new());
     let search_label = RwSignal::new(String::new());
+    let search_target = RwSignal::new(None::<(i64, i64)>);
     // Stagioni collassate di default: si espandono una alla volta.
     let expanded_seasons = RwSignal::new(Vec::<i64>::new());
     view! {
@@ -3578,6 +3616,11 @@ fn EpisodeTable(
                         season_list.dedup();
                         let expanded = expanded_seasons.get();
                         let metadata = array(&detail.get(), "metadata");
+                        let missing_items = missing_results.get();
+                        let missing_targets = missing_searched.get();
+                        let manual_target = search_target.get();
+                        let manual_items = search_results.get();
+                        let manual_label = search_label.get();
                         let mut rows = Vec::new();
                         for season_group in season_list {
                             let season_items = episodes.iter().filter(|item| item.get("season").and_then(Value::as_i64) == Some(season_group)).cloned().collect::<Vec<_>>();
@@ -3614,6 +3657,24 @@ fn EpisodeTable(
                             let series_re = series.clone();
                             let series_del = series.clone();
                             let series_search = series.clone();
+                            let missing_for_episode = missing_items
+                                .iter()
+                                .filter(|result| {
+                                    result.get("season").and_then(Value::as_i64) == Some(season)
+                                        && result.get("episode").and_then(Value::as_i64) == Some(episode)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let missing_searched_for_episode = missing_targets.iter().any(|target| {
+                                target.get("season").and_then(Value::as_i64) == Some(season)
+                                    && target.get("episode").and_then(Value::as_i64) == Some(episode)
+                            });
+                            let manual_searched_for_episode = manual_target == Some((season, episode));
+                            let manual_for_episode = if manual_searched_for_episode {
+                                manual_items.clone()
+                            } else {
+                                Vec::new()
+                            };
                             let ignore_label = if ignored { "Riattiva" } else { "Ignora" };
                             let on_nas = !text(&item, "archive_path", "").is_empty();
                             // "downloaded" + "NAS" era ridondante: basta "NAS".
@@ -3650,6 +3711,8 @@ fn EpisodeTable(
                                                 let path = format!("/api/episodes/{}/{}/{}/search", urlencoding::encode(&series_search), season, episode);
                                                 let results = search_results;
                                                 let label = search_label;
+                                                let target = search_target;
+                                                target.set(Some((season, episode)));
                                                 spawn_local(async move {
                                                     match send("POST", &path, None).await {
                                                         Ok(value) => {
@@ -3683,6 +3746,64 @@ fn EpisodeTable(
                                     </td>
                                 </tr>
                             }.into_any());
+                            if missing_searched_for_episode {
+                                rows.push(view! {
+                                    <tr class="episode-search-row">
+                                        <td colspan="6">
+                                            <strong>{format!("Cerca mancanti · S{season:02}E{episode:02}")}</strong>
+                                            {if missing_for_episode.is_empty() {
+                                                view! { <p class="muted">"Nessuna release compatibile trovata."</p> }.into_any()
+                                            } else {
+                                                view! {
+                                                    <div class="episode-search-list">
+                                                        {missing_for_episode.into_iter().map(|item| {
+                                                            let release = item.get("release").cloned().unwrap_or_default();
+                                                            let queued = release.clone();
+                                                            let origin = text(&item, "origin", "");
+                                                            view! {
+                                                                <div class="episode-search-item">
+                                                                    <span class="truncate">{text(&release, "title", "Release")}</span>
+                                                                    <span class="muted">{text(&release, "source", "-")}{if origin.is_empty() { String::new() } else { format!(" · {origin}") }}</span>
+                                                                    <button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
+                                                                </div>
+                                                            }
+                                                        }).collect_view()}
+                                                    </div>
+                                                }.into_any()
+                                            }}
+                                        </td>
+                                    </tr>
+                                }.into_any());
+                            }
+                            if manual_searched_for_episode {
+                                rows.push(view! {
+                                    <tr class="episode-search-row">
+                                        <td colspan="6">
+                                            <strong>{manual_label.clone()}</strong>
+                                            {if manual_for_episode.is_empty() {
+                                                view! { <p class="muted">"Nessuna release compatibile trovata."</p> }.into_any()
+                                            } else {
+                                                view! {
+                                                    <div class="episode-search-list">
+                                                        {manual_for_episode.into_iter().map(|item| {
+                                                            let release = item.get("release").cloned().unwrap_or_default();
+                                                            let queued = release.clone();
+                                                            let origin = text(&item, "origin", "");
+                                                            view! {
+                                                                <div class="episode-search-item">
+                                                                    <span class="truncate">{text(&release, "title", "Release")}</span>
+                                                                    <span class="muted">{text(&release, "source", "-")}{if origin.is_empty() { String::new() } else { format!(" · {origin}") }}</span>
+                                                                    <button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
+                                                                </div>
+                                                            }
+                                                        }).collect_view()}
+                                                    </div>
+                                                }.into_any()
+                                            }}
+                                        </td>
+                                    </tr>
+                                }.into_any());
+                            }
                             }
                         }
                         rows.collect_view()
@@ -3690,32 +3811,6 @@ fn EpisodeTable(
                 </tbody>
             </table>
         </div>
-        <Show when=move || !search_label.get().is_empty()>
-            <div class="table-wrap" style="margin-top:12px">
-                <h4 style="margin:0 0 8px">{move || search_label.get()}</h4>
-                <Show when=move || search_results.get().is_empty()>
-                    <Empty text="Nessuna release compatibile trovata." />
-                </Show>
-                <Show when=move || !search_results.get().is_empty()>
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Fonte")}</th><th>{ctx_tr("Feed")}</th><th></th></tr></thead>
-                        <tbody>{move || search_results.get().iter().cloned().map(|item| {
-                            let release = item.get("release").cloned().unwrap_or_default();
-                            let queued = release.clone();
-                            let from_feed = item.get("from_feed").and_then(Value::as_bool).unwrap_or(false);
-                            view! {
-                                <tr>
-                                    <td class="truncate">{text(&release, "title", "Release")}</td>
-                                    <td class="muted">{text(&release, "source", "-")}</td>
-                                    <td>{if from_feed { "Sì" } else { "No" }}</td>
-                                    <td><button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button></td>
-                                </tr>
-                            }
-                        }).collect_view()}</tbody>
-                    </table>
-                </Show>
-            </div>
-        </Show>
     }
 }
 
@@ -3881,6 +3976,25 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                     <Panel title="Dettaglio film">
                         <div class="toolbar" style="margin-bottom:12px">
                             <button class="btn" title=ctx_tr("Torna all'elenco dei film monitorati") on:click=move |_| selected.set(None)>{ctx_tr("← Torna all'elenco")}</button>
+                            {move || {
+                                let movie = detail.get().get("movie").cloned().unwrap_or_default();
+                                let metadata = detail.get().get("metadata").cloned().unwrap_or_default();
+                                let name = text(&movie, "name", "");
+                                let year = text(&movie, "year", "");
+                                let query = if year.is_empty() { name.clone() } else { format!("{name} {year}") };
+                                let tmdb_url = metadata
+                                    .get("id")
+                                    .and_then(Value::as_i64)
+                                    .map(|id| format!("https://www.themoviedb.org/movie/{id}"))
+                                    .unwrap_or_else(|| format!("https://www.themoviedb.org/search?query={}", urlencoding::encode(&query)));
+                                // I film monitorati non hanno un ID TVDB persistito: il
+                                // link apre la ricerca TVDB già compilata come fallback.
+                                let tvdb_url = format!("https://thetvdb.com/search?query={}", urlencoding::encode(&query));
+                                view! {
+                                    <a class="btn sm" href=tmdb_url target="_blank" rel="noopener" title=ctx_tr("Apri i dettagli del film su TMDB")>{ctx_tr("TMDB")}</a>
+                                    <a class="btn sm" href=tvdb_url target="_blank" rel="noopener" title=ctx_tr("Cerca il film su TheTVDB")>{ctx_tr("TVDB")}</a>
+                                }
+                            }}
                         </div>
                         <div class="detail-head">
                             {move || match detail.get().get("metadata").and_then(|item| item.get("poster_path")).and_then(Value::as_str) {
@@ -4282,6 +4396,9 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
 
 #[component]
 fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
+    // La cronologia dei feed è consultabile solo quando l'utente la apre:
+    // non carichiamo centinaia di gruppi ad ogni ingresso in Archivio.
+    let tab = RwSignal::new("archive".to_string());
     let query = RwSignal::new(String::new());
     let selected = RwSignal::new(Vec::<i64>::new());
     let manual_magnet = RwSignal::new(String::new());
@@ -4289,7 +4406,11 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
     let feed_tab = RwSignal::new("series".to_string());
     view! {
         <div class="view">
-            <FeedSeenPanel data />
+            <div class="tabs">
+                <button class="tab" class:active=move || tab.get() == "archive" on:click=move |_| tab.set("archive".into())>{ctx_tr("Archivio torrent")}</button>
+                <button class="tab" class:active=move || tab.get() == "seen" on:click=move |_| tab.set("seen".into())>{ctx_tr("Visti dal feed")}</button>
+            </div>
+            <Show when=move || tab.get() == "archive">
             <Panel title="Archivio torrent">
                 <form class="toolbar" on:submit=move |event| {
                     event.prevent_default();
@@ -4426,6 +4547,10 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                     </table>
                 </div>
             </Panel>
+            </Show>
+            <Show when=move || tab.get() == "seen">
+                <FeedSeenPanel data />
+            </Show>
         </div>
     }
 }
@@ -4435,36 +4560,32 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
 /// `movie_feed_seen` / `series_feed_seen` del legacy.
 #[component]
 fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
-    let kind = RwSignal::new("movie".to_string());
+    // Nessuna richiesta finché non viene scelto esplicitamente Film o Serie.
+    let kind = RwSignal::new(String::new());
     let groups = RwSignal::new(Vec::<Value>::new());
     let total = RwSignal::new(0_i64);
     let expanded = RwSignal::new(String::new());
     let entries = RwSignal::new(Vec::<Value>::new());
+    let entries_loading = RwSignal::new(false);
     let query = RwSignal::new(String::new());
-    Effect::new(move |_| {
-        load_seen_groups(
-            kind.get_untracked(),
-            query.get_untracked(),
-            groups,
-            total,
-            data,
-        )
-    });
     view! {
-        <Panel title="Visti dai feed">
+        <Panel title="Visti dal feed">
             <div class="toolbar">
                 <button class="btn" class:primary=move || kind.get()=="movie" on:click=move |_| {
                     kind.set("movie".into());
                     expanded.set(String::new());
                     entries.set(Vec::new());
+                    entries_loading.set(false);
                     load_seen_groups("movie".into(), query.get(), groups, total, data);
                 }>{ctx_tr("Film visti")}</button>
                 <button class="btn" class:primary=move || kind.get()=="series" on:click=move |_| {
                     kind.set("series".into());
                     expanded.set(String::new());
                     entries.set(Vec::new());
+                    entries_loading.set(false);
                     load_seen_groups("series".into(), query.get(), groups, total, data);
                 }>{ctx_tr("Serie viste")}</button>
+                <Show when=move || !kind.get().is_empty()>
                 <form on:submit=move |event| {
                     event.prevent_default();
                     expanded.set(String::new());
@@ -4473,12 +4594,17 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                 }>
                     <input prop:value=query on:input=move |event| query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca per titolo… (* e ? come wildcard)") title=ctx_tr("Filtra i gruppi visti per parole nel titolo") />
                 </form>
-                <button class="btn sm" on:click=move |_| load_seen_groups(kind.get(), query.get(), groups, total, data)>{ctx_tr("Aggiorna")}</button>
-                <span class="muted">{move || format!("{} gruppi", total.get())}</span>
+                    <button class="btn sm" on:click=move |_| load_seen_groups(kind.get(), query.get(), groups, total, data)>{ctx_tr("Aggiorna")}</button>
+                    <span class="muted">{move || format!("{} gruppi", total.get())}</span>
+                </Show>
             </div>
-            <Show when=move || groups.get().is_empty()>
+            <Show when=move || kind.get().is_empty()>
+                <Empty text="Scegli Film visti o Serie viste per consultare lo storico dei feed." />
+            </Show>
+            <Show when=move || !kind.get().is_empty() && groups.get().is_empty()>
                 <Empty text="Nessuna release registrata dai feed: verranno raccolte al prossimo ciclo." />
             </Show>
+            <Show when=move || !kind.get().is_empty()>
             <div class="table-wrap" style="margin-top:10px">
                 <table class="data-table">
                     <thead><tr><th>{ctx_tr("Titolo")}</th><th>{ctx_tr("Anno/Stagione")}</th><th>{ctx_tr("N.")}</th><th>{ctx_tr("Migliore")}</th><th>{ctx_tr("Score")}</th><th>{ctx_tr("Ultimo")}</th><th></th></tr></thead>
@@ -4492,6 +4618,7 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                         let score = number(&group, "best_score");
                         let latest = text(&group, "latest_found", "");
                         let is_series = kind.get() == "series";
+                        let kind_for_click = if is_series { "series" } else { "movie" }.to_string();
                         let key_for_click = key.clone();
                         view! {
                             <tr>
@@ -4503,7 +4630,9 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                                 <td class="muted truncate">{latest}</td>
                                 <td><button class="btn sm" on:click=move |_| {
                                     expanded.set(key_for_click.clone());
-                                    load_seen_entries(kind.get(), key_for_click.clone(), entries, data);
+                                    entries.set(Vec::new());
+                                    entries_loading.set(true);
+                                    load_seen_entries(kind_for_click.clone(), key_for_click.clone(), entries, entries_loading, data);
                                 }>{ctx_tr("Mostra")}</button></td>
                             </tr>
                         }
@@ -4511,6 +4640,12 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                 </table>
             </div>
             <Show when=move || !expanded.get().is_empty()>
+                <Show when=move || entries_loading.get()>
+                    <div class="search-status" style="margin-top:10px"><span class="spinner"></span>{ctx_tr("Caricamento release dai feed…")}</div>
+                </Show>
+                <Show when=move || !entries_loading.get() && entries.get().is_empty()>
+                    <Empty text="Nessuna release trovata per questo gruppo." />
+                </Show>
                 <div class="table-wrap" style="margin-top:10px">
                     <table class="data-table">
                         <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Fonte")}</th><th>{ctx_tr("Qualità")}</th><th>{ctx_tr("Score")}</th><th>{ctx_tr("Vista")}</th><th></th></tr></thead>
@@ -4538,6 +4673,7 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                     </table>
                 </div>
             </Show>
+            </Show>
         </Panel>
     }
 }
@@ -4550,8 +4686,9 @@ fn load_seen_groups(
     data: RwSignal<Data>,
 ) {
     spawn_local(async move {
+        let resource = if kind == "series" { "series" } else { "movies" };
         match get(&format!(
-            "/api/{kind}s/seen/grouped?limit=100&q={}",
+            "/api/{resource}/seen/grouped?limit=100&q={}",
             urlencoding::encode(&query)
         ))
         .await
@@ -4569,13 +4706,16 @@ fn load_seen_entries(
     kind: String,
     key: String,
     entries: RwSignal<Vec<Value>>,
+    loading: RwSignal<bool>,
     data: RwSignal<Data>,
 ) {
     spawn_local(async move {
-        match get(&format!("/api/{kind}s/seen?key={}", urlencoding::encode(&key))).await {
+        let resource = if kind == "series" { "series" } else { "movies" };
+        match get(&format!("/api/{resource}/seen?key={}", urlencoding::encode(&key))).await {
             Ok(value) => entries.set(array(&value, "items")),
             Err(error) => data.update(|current| current.error = error),
         }
+        loading.set(false);
     });
 }
 

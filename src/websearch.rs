@@ -2,7 +2,7 @@ use crate::utils::{magnet_hash, sanitize_magnet};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 const TRACKERS: [&str; 3] = [
@@ -32,6 +32,18 @@ pub async fn search(
     engines: &[String],
     query: &str,
     flaresolverr_url: Option<&str>,
+) -> Result<Vec<(String, String, String)>> {
+    search_with_timeout(client, engines, query, flaresolverr_url, None).await
+}
+
+/// Ricerca web con un budget totale opzionale. A differenza di un timeout
+/// esterno, conserva le risposte già arrivate dalle sorgenti veloci.
+pub async fn search_with_timeout(
+    client: &Client,
+    engines: &[String],
+    query: &str,
+    flaresolverr_url: Option<&str>,
+    timeout: Option<Duration>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut set = tokio::task::JoinSet::new();
     let limiter = Arc::new(Semaphore::new(4));
@@ -89,7 +101,23 @@ pub async fn search(
         });
     }
     let mut results = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
+    while !set.is_empty() {
+        let joined = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, set.join_next()).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    tracing::warn!(query, timeout_secs = timeout.unwrap().as_secs(), "web search timed out; keeping completed sources");
+                    set.abort_all();
+                    break;
+                }
+            }
+        } else {
+            set.join_next().await
+        };
+        let Some(joined) = joined else {
+            break;
+        };
         if let Ok((found, failure)) = joined {
             results.extend(found);
             if let Some(engine) = failure {
