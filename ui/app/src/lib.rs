@@ -1292,7 +1292,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         <button class="btn" on:click=move |_| { run_post(data, "/api/backup", None, "Backup creato"); }>{ctx_tr("Backup")}</button>
                     </div>
                     <div class="stack" style="margin-top:12px">
-                        <StatLine label="Ultimo ciclo" value=Signal::derive(move || text(&last.get(), "last_started_at", "non avviato")) />
+                        <StatLine label="Ultimo ciclo" value=Signal::derive(move || short_datetime(&text(&last.get(), "last_started_at", ""))) />
                         <StatLine label="Candidati / avviati" value=Signal::derive(move || format!("{} / {}", number(&last.get(), "candidates"), number(&last.get(), "downloads_started"))) />
                         <StatLine label="Gap riempiti" value=Signal::derive(move || number(&last.get(), "gaps_filled")) />
                         <StatLine label="Feed RSS / Indexer" value=Signal::derive(move || format!("{} / {}", array(&data.get().config, "feed_urls").len(), array(&data.get().config, "indexers").len())) />
@@ -1368,15 +1368,6 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                                     <div style="flex:1"><strong>{name_label}</strong><small>{detail}</small></div>
                                 </div>
                             }
-                        }).collect_view()}
-                    </div>
-                </Panel>
-                <Panel title="Attività recente">
-                    <div class="list">
-                        {move || data.get().events.iter().rev().take(6).cloned().map(|event| view! {
-                            <div class="list-item">
-                                <div><strong>{text(&event, "kind", "evento")}</strong><small>{text(&event, "name", &text(&event, "hash", "torrent"))}</small></div>
-                            </div>
                         }).collect_view()}
                     </div>
                 </Panel>
@@ -1472,6 +1463,27 @@ fn short_date(value: &str) -> String {
         .next()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// Data e ora leggibili da un timestamp ISO/SQL, nel fuso orario del browser.
+fn short_datetime(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "non avviato".into();
+    }
+    let timestamp = js_sys::Date::parse(trimmed);
+    if timestamp.is_nan() {
+        return trimmed.to_string();
+    }
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp));
+    format!(
+        "{:02}/{:02}/{:04} {:02}:{:02}",
+        date.get_date(),
+        date.get_month() + 1,
+        date.get_full_year(),
+        date.get_hours(),
+        date.get_minutes(),
+    )
 }
 
 /// Mostra le lingue da `language_requirements` (JSON o lista separata da virgola).
