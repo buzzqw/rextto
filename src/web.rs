@@ -8973,11 +8973,11 @@ async fn handle_torrent_event(
                     }
                     true
                 } else {
-                    complete_torrent(cfg, db, &event, &metadata.release, tmdb).await?
+                    complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
                 }
             } else if let Some(destination) = destination {
                 if postprocess::same_path(current, &destination) {
-                    complete_torrent(cfg, db, &event, &metadata.release, tmdb).await?
+                    complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
                 } else if move_requests.insert(event.hash.clone()) {
                     postprocess::validate_destination_from(current, &destination)?;
                     if !torrents.move_storage(&event.hash, &destination)? {
@@ -8988,7 +8988,7 @@ async fn handle_torrent_event(
                     false
                 }
             } else {
-                complete_torrent(cfg, db, &event, &metadata.release, tmdb).await?
+                complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
             }
         }
         "storage_moved" => {
@@ -9012,7 +9012,7 @@ async fn handle_torrent_event(
                 return Ok(false);
             }
             move_requests.remove(&event.hash);
-            complete_torrent(cfg, db, &event, &metadata.release, tmdb).await?
+            complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
         }
         _ => false,
     })
@@ -9021,6 +9021,7 @@ async fn handle_torrent_event(
 async fn complete_torrent(
     cfg: &Config,
     db: &Arc<Mutex<Database>>,
+    torrents: &LibtorrentClient,
     event: &TorrentEvent,
     release: &crate::models::Release,
     tmdb: &TmdbClient,
@@ -9119,6 +9120,22 @@ async fn complete_torrent(
         size,
     )?;
     tracing::info!(hash=%event.hash, path=%processed_path.display(), size_bytes=size, renamed=renamed.is_some(), "torrent completion persisted");
+    // Se il file è stato rinominato o spostato, il torrent non trova più i suoi
+    // dati al percorso atteso e ripartirebbe da 0 (banda sprecata). Va tolto:
+    // il file è già in libreria. Vale sia per gli episodi singoli sia per i film
+    // rinominati; i pack vengono gestiti a parte (copia, sorgente conservata).
+    if !path.exists() {
+        match torrents.remove(&event.hash, false) {
+            Ok(true) => tracing::info!(
+                hash = %event.hash,
+                "torrent removed after rename: source no longer in place"
+            ),
+            Ok(false) => tracing::debug!(hash=%event.hash, "renamed torrent already removed"),
+            Err(error) => {
+                tracing::warn!(hash=%event.hash, %error, "renamed torrent removal failed")
+            }
+        }
+    }
     Ok(true)
 }
 #[axum::debug_handler]
