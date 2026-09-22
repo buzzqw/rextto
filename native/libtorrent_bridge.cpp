@@ -937,14 +937,29 @@ int rextto_lt_save_resume(rextto_lt_session* session, const char* state_dir, cha
         const std::filesystem::path directory(state_dir);
         std::filesystem::create_directories(directory);
         std::unordered_set<std::string> pending;
+        std::unordered_set<std::string> present;
         for (const auto& handle : session->session.get_torrents()) {
             if (!handle.is_valid()) continue;
-            pending.insert(hex_hash(handle));
+            const auto hash = hex_hash(handle);
+            pending.insert(hash);
+            present.insert(hash);
             // NOTE: do not request flush_disk_cache here: on shutdown it makes
             // libtorrent allocate/flush the whole disk cache and can fail with
             // std::bad_alloc for large sessions. The regular shutdown flush is
             // enough to persist progress.
             handle.save_resume_data(lt::torrent_handle::save_info_dict);
+        }
+        // Rimuove i resume dei torrent non più in sessione: senza questa pulizia
+        // un torrent rimosso (o fallito) verrebbe ripristinato al riavvio.
+        std::error_code iterate_ec;
+        for (const auto& entry : std::filesystem::directory_iterator(directory, iterate_ec)) {
+            if (iterate_ec) break;
+            if (!entry.is_regular_file()) continue;
+            const auto extension = entry.path().extension();
+            if (extension != ".fastresume" && extension != ".torrent") continue;
+            if (present.find(entry.path().stem().string()) != present.end()) continue;
+            std::error_code remove_ec;
+            std::filesystem::remove(entry.path(), remove_ec);
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         std::string failure;

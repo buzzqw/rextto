@@ -88,6 +88,22 @@ pub async fn run_cycle_domain(
         db.lock().unwrap().save_cycle(&stats)?;
         return Ok(stats);
     }
+    // Torrent tracciati ma non più presenti nella sessione: senza riconciliazione
+    // restano "in corso" e bloccano per sempre il ri-scaricamento.
+    {
+        let live = torrents
+            .list()
+            .into_iter()
+            .map(|torrent| torrent.hash.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        match db.lock().unwrap().reconcile_missing_torrents(&live) {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, "torrents reconciled: marked missing from session")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "torrent reconciliation failed"),
+        }
+    }
     let mut releases = engine.scrape_all(cfg).await?;
     if domain == Some("series") {
         releases.retain(|release| release.kind == "series");

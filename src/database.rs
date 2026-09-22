@@ -1194,6 +1194,68 @@ impl Database {
         Ok(None)
     }
 
+    /// Riconcilia i torrent tracciati ma assenti dalla sessione libtorrent.
+    ///
+    /// Una riga `torrent_meta` in stato attivo (`queued`/`downloading`/…)
+    /// rimasta orfana dopo una rimozione manuale o un riavvio blocca per sempre
+    /// il ri-scaricamento (check `active_episode`), e i suoi episodi placeholder
+    /// fanno risultare il candidato `duplicate`. Qui la riga viene marcata
+    /// `error` e i placeholder non scaricati della stessa release rimossi, così
+    /// il ciclo successivo può riprovare.
+    pub fn reconcile_missing_torrents(
+        &self,
+        live_hashes: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut statement = self.conn.prepare(
+            "SELECT hash FROM torrent_meta WHERE status NOT IN ('completed','error','removed')",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut missing = Vec::new();
+        for row in rows {
+            let hash = row?;
+            if !live_hashes.contains(&hash.to_ascii_lowercase()) {
+                missing.push(hash);
+            }
+        }
+        drop(statement);
+        let mut reconciled = 0;
+        for hash in missing {
+            let release = self.torrent_meta(&hash)?.map(|meta| meta.release);
+            self.conn.execute(
+                "UPDATE torrent_meta SET status='error', error=CASE WHEN COALESCE(error,'')='' THEN 'missing from session' ELSE error END, updated_at=?2 WHERE hash=?1",
+                params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
+            )?;
+            if let Some(release) = release {
+                let digest = magnet_hash(&release.magnet).unwrap_or_default();
+                self.conn.execute(
+                    "DELETE FROM episodes WHERE (lower(magnet_hash)=lower(?1) OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
+                    params![digest, release.magnet],
+                )?;
+            }
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
+    /// Segna come `removed` un torrent non concluso tolto dalla sessione e
+    /// cancella i suoi placeholder non scaricati: evita che resti "in corso"
+    /// nel DB e che il candidato venga visto come `active_episode`/`duplicate`.
+    pub fn mark_torrent_removed(&self, hash: &str) -> Result<()> {
+        let release = self.torrent_meta(hash)?.map(|meta| meta.release);
+        self.conn.execute(
+            "UPDATE torrent_meta SET status='removed', updated_at=?2 WHERE hash=?1 AND status NOT IN ('completed','error','removed')",
+            params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
+        )?;
+        if let Some(release) = release {
+            let digest = magnet_hash(&release.magnet).unwrap_or_default();
+            self.conn.execute(
+                "DELETE FROM episodes WHERE (lower(magnet_hash)=lower(?1) OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
+                params![digest, release.magnet],
+            )?;
+        }
+        Ok(())
+    }
+
     /// `created_at` / `completed_at` for a torrent (used for download duration).
     pub fn torrent_times(&self, hash: &str) -> Result<Option<(String, Option<String>)>> {
         Ok(self
@@ -2132,6 +2194,64 @@ mod tests {
             year: None,
             discovered_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn reconciles_torrents_missing_from_session() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-reconcile-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let release = release();
+        let digest = magnet_hash(&release.magnet).unwrap();
+        db.register_torrent(&release).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Example')", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (1,1,1,'Example.S01E01.1080p',100,?1,?2)",
+                params![digest, release.magnet],
+            )
+            .unwrap();
+
+        // Sessione vuota: il torrent è orfano → marcato error e placeholder rimosso.
+        let removed = db
+            .reconcile_missing_torrents(&std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            db.torrent_status(&digest).unwrap().as_deref(),
+            Some("error")
+        );
+        let leftover: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodes WHERE magnet_hash=?1",
+                [&digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "placeholder rimosso per permettere il retry");
+
+        // Con il torrent vivo nella sessione non viene toccato.
+        db.register_torrent(&release).unwrap();
+        let mut live = std::collections::HashSet::new();
+        live.insert(digest.clone());
+        assert_eq!(db.reconcile_missing_torrents(&live).unwrap(), 0);
+        assert_eq!(
+            db.torrent_status(&digest).unwrap().as_deref(),
+            Some("queued")
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
