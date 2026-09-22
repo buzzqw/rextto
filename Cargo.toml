@@ -47,14 +47,17 @@ cc = "1"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
+# Privilegiamo build e linking rapidi anche per il binario di deploy. LTO e una
+# sola codegen unit riducono di poco dimensioni/prestazioni, ma rendono ogni
+# build molto più lenta.
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
+incremental = true
 strip = true
 
-# Iterazione veloce: stessa impostazione di release ma senza LTO e con più
-# unità di codegen. Il binario resta ottimizzato quanto basta per il daemon
-# (I/O-bound) e le build successive sfruttano la compilazione incrementale.
+# Iterazione ancora più veloce: minore ottimizzazione del codice per il daemon
+# (I/O-bound), mantenendo le build incrementali.
 #   cargo build --profile fast
 [profile.fast]
 inherits = "release"

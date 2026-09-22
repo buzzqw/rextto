@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Build di iterazione veloce.
 #
-# Usa il profilo `fast` (nessun LTO, codegen-units=16, compilazione
-# incrementale) invece di `release`: tipicamente pochi secondi per una
-# modifica a src/, contro minuti con `release`. Il binario finisce in
+# Usa il profilo `fast` (opt-level=2) invece di `release` (opt-level=3):
+# tipicamente pochi secondi per una modifica a src/. Il binario finisce in
 # target/fast/rexttod.
 #
 # Se `mold` o `lld` sono installati li usa per il link (link molto più rapido).

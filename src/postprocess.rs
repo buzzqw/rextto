@@ -675,11 +675,14 @@ pub fn episode_name_conforms(path: &Path, release: &Release, cfg: &Config) -> bo
         }
         _ => format!("{} - S{:02}E{:02} - ", series.name, season, episode),
     };
-    // Nomi con gruppi vuoti (es. `[]` o `()`) sono artefatti di un template con
-    // placeholder senza valore: vanno rinominati per ripulirli.
+    // Nomi con gruppi vuoti (es. `[]` o `()`) o placeholder letterali sono
+    // artefatti di un template applicato solo in parte: vanno rinominati per
+    // ripulirli. Il solo prefisso non basta, ad esempio per `[{Source}]`.
     if crate::utils::cached_regex(r"\[\s*\]|\(\s*\)")
         .map(|regex| regex.is_match(&stem))
         .unwrap_or(false)
+        || stem.contains('{')
+        || stem.contains('}')
     {
         return false;
     }
@@ -1366,6 +1369,16 @@ mod tests {
             "Only Murders in the Building - S01E01 - True Crime - [][480p][h264][][AAC][IT].mkv",
         );
         assert!(!episode_name_conforms(broken, &release, &cfg));
+        // Un placeholder non sostituito non è un nome conforme: altrimenti il
+        // controllo del solo prefisso salterebbe la rinomina.
+        let unrendered_placeholder = Path::new(
+            "Only Murders in the Building - S01E01 - True Crime - [{Source}][480p][h264][AAC][IT].mkv",
+        );
+        assert!(!episode_name_conforms(
+            unrendered_placeholder,
+            &release,
+            &cfg
+        ));
         // Nome già pulito: conforme.
         let clean = Path::new(
             "Only Murders in the Building - S01E01 - True Crime - [480p][h264][AAC][IT].mkv",

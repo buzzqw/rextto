@@ -67,7 +67,8 @@ cargo install cargo-leptos
 cd ui && cargo leptos build --frontend-only
 ```
 
-Per lo sviluppo c'è un profilo veloce (senza LTO) e degli script:
+Per lo sviluppo c'è un profilo ancora più veloce (minore ottimizzazione) e degli
+script:
 
 ```bash
 ./scripts/build-fast.sh          # target/fast/rexttod
