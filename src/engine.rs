@@ -1,0 +1,292 @@
+use crate::{
+    config::{Config, IndexerConfig},
+    models::Release,
+    parser::parse_release,
+    rss::{fetch_feed, fetch_torznab_flaresolverr},
+    utils::magnet_hash,
+    websearch,
+};
+use anyhow::Result;
+use reqwest::Client;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct Engine {
+    client: Client,
+}
+
+const QUERY_CONCURRENCY: usize = 8;
+const FEED_CONCURRENCY: usize = 10;
+
+impl Engine {
+    pub fn new() -> Self {
+        Self {
+            client: Client::builder()
+                .user_agent("rextto/0.1")
+                .connect_timeout(std::time::Duration::from_secs(10))
+                // Prowlarr can legitimately take up to one minute when it
+                // fans a query out to several indexers.
+                .timeout(std::time::Duration::from_secs(75))
+                .build()
+                .expect("http client"),
+        }
+    }
+    pub async fn scrape_all(&self, cfg: &Config) -> Result<Vec<Release>> {
+        let mut all = Vec::new();
+        let flaresolverr = cfg.flaresolverr_url.clone();
+        let max_pages = cfg.feed_max_pages();
+        let max_age_days = cfg.max_release_age_days;
+        let old_ratio = cfg.stop_on_old_page_ratio();
+        let phase1 = if crate::messages::is_english() {
+            format!("🔎 Step 1/2: scanning {} sources (HTML/RSS feeds)", cfg.feed_urls.len())
+        } else {
+            format!("🔎 Fase 1/2: scansione di {} sorgenti (feed HTML/RSS)", cfg.feed_urls.len())
+        };
+        tracing::info!("{phase1}");
+        let mut feed_set = tokio::task::JoinSet::new();
+        let mut feed_iter = cfg.feed_urls.clone().into_iter();
+        let schedule_feed = |set: &mut tokio::task::JoinSet<Result<Vec<Release>>>,
+                             iter: &mut std::vec::IntoIter<String>| {
+            if let Some(url) = iter.next() {
+                let client = self.client.clone();
+                let flaresolverr = flaresolverr.clone();
+                let feed = feed_label(&url);
+                set.spawn(async move {
+                    let result = fetch_feed(
+                        &client,
+                        &url,
+                        flaresolverr.as_deref(),
+                        max_pages,
+                        max_age_days,
+                        old_ratio,
+                    )
+                    .await;
+                    match &result {
+                        Ok(items) => {
+                            tracing::debug!(feed = %feed, items = items.len(), "rss feed analyzed")
+                        }
+                        Err(error) => tracing::warn!(feed = %feed, %error, "rss feed failed"),
+                    }
+                    result
+                });
+            }
+        };
+        for _ in 0..FEED_CONCURRENCY {
+            schedule_feed(&mut feed_set, &mut feed_iter);
+        }
+        while let Some(joined) = feed_set.join_next().await {
+            match joined {
+                Ok(Ok(items)) => all.extend(items),
+                Ok(Err(_)) => {}
+                Err(error) => tracing::warn!(%error, "rss feed task failed"),
+            }
+            schedule_feed(&mut feed_set, &mut feed_iter);
+        }
+        // One readable summary instead of one line per feed.
+        let feeds_releases = all.len();
+        let mut by_source: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for release in &all {
+            let raw = release.source.split(" - ").next().unwrap_or("feed");
+            // Generic RSS feeds carry the whole URL as source: show just the host.
+            let label = url::Url::parse(raw)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_owned))
+                .unwrap_or_else(|| raw.to_string());
+            *by_source.entry(label).or_default() += 1;
+        }
+        let breakdown = by_source
+            .iter()
+            .map(|(label, count)| format!("{label}: {count}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let breakdown = if breakdown.is_empty() {
+            crate::messages::pick("nessuna", "none").to_string()
+        } else {
+            breakdown
+        };
+        let sources_summary = if crate::messages::is_english() {
+            format!("🌐 Sources: {feeds_releases} releases from {} feeds — {breakdown}", cfg.feed_urls.len())
+        } else {
+            format!("🌐 Sorgenti: {feeds_releases} release da {} feed — {breakdown}", cfg.feed_urls.len())
+        };
+        tracing::info!("{sources_summary}");
+        // Persist the detail-page cache right after the feed phase: the indexer
+        // searches below can take minutes, and a restart would otherwise throw
+        // away every magnet resolved in this cycle.
+        crate::cache::save();
+        let mut targets: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for series in cfg.series.iter().filter(|series| series.enabled) {
+            // Pass the real external ids to Torznab: `tvdbid` with the TVDB id
+            // and `tmdbid` with the TMDB id (previously the TMDB id was sent
+            // mislabelled as tvdbid).
+            let mut ids: Vec<(String, String)> = Vec::new();
+            if !series.tvdb_id.trim().is_empty() {
+                ids.push(("tvdbid".to_string(), series.tvdb_id.trim().to_string()));
+            }
+            if !series.tmdb_id.trim().is_empty() {
+                ids.push(("tmdbid".to_string(), series.tmdb_id.trim().to_string()));
+            }
+            targets.push((series.name.clone(), ids));
+        }
+        for movie in cfg.movies.iter().filter(|movie| movie.enabled) {
+            targets.push((format!("{} {}", movie.name, movie.year), Vec::new()));
+        }
+        let targets_total = targets.len();
+        let phase2 = if crate::messages::is_english() {
+            format!("🔎 Step 2/2: searching {} series/movies (Torznab indexers + web engines)", targets_total)
+        } else {
+            format!("🔎 Fase 2/2: ricerca su {} serie/film (indexer Torznab + motori web)", targets_total)
+        };
+        tracing::info!("{phase2}");
+        let cfg = Arc::new(cfg.clone());
+        let mut set = tokio::task::JoinSet::new();
+        let mut iter = targets.into_iter();
+        let schedule =
+            |set: &mut tokio::task::JoinSet<Vec<Release>>,
+             iter: &mut std::vec::IntoIter<(String, Vec<(String, String)>)>| {
+                if let Some((query, ids)) = iter.next() {
+                    let client = self.client.clone();
+                    let cfg = cfg.clone();
+                    set.spawn(async move { search_one(&client, &cfg, &query, &ids).await });
+                }
+            };
+        for _ in 0..QUERY_CONCURRENCY {
+            schedule(&mut set, &mut iter);
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok(items) = joined {
+                all.extend(items);
+            }
+            schedule(&mut set, &mut iter);
+        }
+        let search_summary = if crate::messages::is_english() {
+            format!("🔎 Indexer/web search: {} releases from {} queries (series+movies)", all.len().saturating_sub(feeds_releases), targets_total)
+        } else {
+            format!("🔎 Ricerca indexer/web: {} release da {} query (serie+film)", all.len().saturating_sub(feeds_releases), targets_total)
+        };
+        tracing::info!("{search_summary}");
+        let engine_failures = websearch::take_engine_failures();
+        if !engine_failures.is_empty() {
+            let detail = engine_failures
+                .iter()
+                .map(|(engine, count)| format!("{engine} ({count})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if crate::messages::is_english() {
+                tracing::warn!("⚠️ Unreachable web engines this cycle: {detail}");
+            } else {
+                tracing::warn!("⚠️ Motori web non raggiungibili in questo ciclo: {detail}");
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|release| {
+            cfg.release_allowed(release)
+                && magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
+        });
+        if crate::messages::is_english() {
+            tracing::info!("✅ Scraping: {} unique releases after filters", all.len());
+        } else {
+            tracing::info!("✅ Scraping: {} release uniche dopo i filtri", all.len());
+        }
+        crate::cache::save();
+        Ok(all)
+    }
+
+    pub async fn search_query(&self, cfg: &Config, query: &str) -> Vec<Release> {
+        self.search_query_ids(cfg, query, &[]).await
+    }
+
+    pub async fn search_query_ids(
+        &self,
+        cfg: &Config,
+        query: &str,
+        external_ids: &[(&str, &str)],
+    ) -> Vec<Release> {
+        let owned: Vec<(String, String)> = external_ids
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        search_one(&self.client, cfg, query, &owned).await
+    }
+}
+
+async fn search_one(
+    client: &Client,
+    cfg: &Config,
+    query: &str,
+    external_ids: &[(String, String)],
+) -> Vec<Release> {
+    let mut all = Vec::new();
+    let borrowed: Vec<(&str, &str)> = external_ids
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    for indexer in cfg.indexers.iter().filter(|indexer| indexer.enabled) {
+        tracing::debug!(indexer = %indexer.name, query, "indexer search started");
+        match fetch_torznab_flaresolverr(
+            client,
+            indexer,
+            query,
+            &borrowed,
+            cfg.flaresolverr_url.as_deref(),
+        )
+        .await
+        {
+            Ok(items) => {
+                tracing::debug!(indexer = %indexer.name, results = items.len(), query, "indexer search completed");
+                all.extend(items);
+            }
+            Err(error) => {
+                let error = crate::utils::redact_url_secrets(&error.to_string());
+                tracing::warn!(indexer=%indexer.name, query, error = %error, "indexer search failed")
+            }
+        }
+    }
+    if !cfg.websearch_engines.is_empty() {
+        match websearch::search(
+            client,
+            &cfg.websearch_engines,
+            query,
+            cfg.flaresolverr_url.as_deref(),
+        )
+        .await
+        {
+            Ok(items) => {
+                tracing::debug!(query, results = items.len(), "web search completed");
+                for (title, magnet, source) in items {
+                    if let Some(release) = parse_release(&title, &magnet, &source) {
+                        all.push(release);
+                    }
+                }
+            }
+            Err(error) => {
+                let error = crate::utils::redact_url_secrets(&error.to_string());
+                tracing::warn!(query, error = %error, "web search failed")
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|release| {
+        cfg.release_allowed(release)
+            && magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
+    });
+    all
+}
+
+#[allow(dead_code)]
+fn _indexer_name(indexer: &IndexerConfig) -> &str {
+    &indexer.name
+}
+
+fn feed_label(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.split('?').next().unwrap_or(url).to_string();
+    };
+    let host = parsed.host_str().unwrap_or("feed");
+    let path = parsed.path().trim_end_matches('/');
+    if path.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}{path}")
+    }
+}

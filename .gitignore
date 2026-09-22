@@ -1,0 +1,43 @@
+# Build output
+/target/
+/ui/target/
+/ui/end2end/
+**/*.profraw
+**/*.profdata
+
+# Runtime data: databases, logs, downloads, caches, state (never commit)
+/data/
+/import-source/
+/rextto.json
+/build_number
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+*.fastresume
+*.torrent
+*.part
+*.magnet
+ipfilter.dat
+
+# Frontend tooling
+node_modules/
+dist/
+.bin/
+
+# Secrets / local environment
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Extra safety: never commit key material even if renamed
+*apikey*
+*api_key*
+*token*

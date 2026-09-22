@@ -1,0 +1,6 @@
+# Usa mold come linker per la piattaforma host: link molto più rapido dei
+# binari Rust di grandi dimensioni (richiede `mold` installato: apt install mold).
+# Lo scope per target lascia intatte le build wasm della UI, che usano il loro
+# linker.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

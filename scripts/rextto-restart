@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Riavvia il servizio rextto senza privilegi interattivi.
+#
+# Installazione (una tantum, da root):
+#   sudo install -m 0755 scripts/rextto-restart /usr/local/bin/rextto-restart
+#   sudo install -m 0440 systemd/rextto.sudoers /etc/sudoers.d/rextto
+#
+# Lo script accetta un solo verbo opzionale (restart predefinito) per evitare
+# che una regola sudoers generica possa eseguire comandi arbitrari.
+set -euo pipefail
+
+action="${1:-restart}"
+case "$action" in
+    restart | start | stop | status)
+        exec systemctl --no-block "$action" rextto.service
+        ;;
+    *)
+        echo "uso: rextto-restart [restart|start|stop|status]" >&2
+        exit 2
+        ;;
+esac

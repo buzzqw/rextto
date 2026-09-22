@@ -1,0 +1,9 @@
+# Consente all'utente del daemon Rextto di riavviare il servizio senza password.
+#
+# Installazione (una tantum, da root):
+#   sudo install -m 0440 systemd/rextto.sudoers /etc/sudoers.d/rextto
+#
+# La regola è limitata all'helper installato in /usr/local/bin/rextto-restart,
+# che accetta solo i verbi restart|start|stop|status su rextto.service: nessun
+# comando arbitrario. Sostituire CHANGE_ME_USER con l'utente che esegue il daemon.
+CHANGE_ME_USER ALL=(root) NOPASSWD: /usr/local/bin/rextto-restart

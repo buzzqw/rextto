@@ -1,0 +1,18 @@
+// Consente all'utente del daemon Rextto di avviare/fermare/riavviare
+// rextto.service senza autenticazione interattiva (nessuna password per
+// `systemctl restart rextto.service`).
+//
+// Installazione (una tantum, da root):
+//   sudo install -m 0644 systemd/50-rextto.rules /etc/polkit-1/rules.d/50-rextto.rules
+//
+// Sostituire CHANGE_ME_USER con l'utente che esegue il daemon. La regola è limitata
+// alla sola unità rextto.service.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "CHANGE_ME_USER") {
+        var unit = action.lookup("unit");
+        if (unit == "rextto.service") {
+            return polkit.Result.YES;
+        }
+    }
+});

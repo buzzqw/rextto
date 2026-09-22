@@ -1,0 +1,65 @@
+[package]
+name = "rextto"
+version = "0.1.0"
+edition = "2021"
+description = "Rextto: monolithic Rust daemon for media acquisition and archiving"
+license = "EUPL-1.2"
+default-run = "rexttod"
+
+[[bin]]
+name = "rexttod"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+quick-xml = "0.37"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "gzip", "brotli", "deflate"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "backup"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha1 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+libc = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "=2.5.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+suppaftp = "6"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Iterazione veloce: stessa impostazione di release ma senza LTO e con più
+# unità di codegen. Il binario resta ottimizzato quanto basta per il daemon
+# (I/O-bound) e le build successive sfruttano la compilazione incrementale.
+#   cargo build --profile fast
+[profile.fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+strip = true
