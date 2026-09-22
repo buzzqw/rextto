@@ -9120,15 +9120,16 @@ async fn complete_torrent(
         size,
     )?;
     tracing::info!(hash=%event.hash, path=%processed_path.display(), size_bytes=size, renamed=renamed.is_some(), "torrent completion persisted");
-    // Se il file è stato rinominato o spostato, il torrent non trova più i suoi
-    // dati al percorso atteso e ripartirebbe da 0 (banda sprecata). Va tolto:
-    // il file è già in libreria. Vale sia per gli episodi singoli sia per i film
-    // rinominati; i pack vengono gestiti a parte (copia, sorgente conservata).
-    if !path.exists() {
+    // Se il file è stato rinominato o collegato a un file già esistente, i dati
+    // del torrent non sono più al nome atteso (o sono un doppione) e libtorrent
+    // ripartirebbe da 0: banda sprecata su contenuto già archiviato. Il torrent
+    // va tolto. Vale per episodi singoli e film; i pack sono gestiti a parte
+    // (copia con sorgente conservata per il seeding).
+    if renamed.is_some() && !postprocess::same_path(processed_path, &path) {
         match torrents.remove(&event.hash, false) {
             Ok(true) => tracing::info!(
                 hash = %event.hash,
-                "torrent removed after rename: source no longer in place"
+                "torrent removed after rename: archived under a different path"
             ),
             Ok(false) => tracing::debug!(hash=%event.hash, "renamed torrent already removed"),
             Err(error) => {
