@@ -1,86 +1,176 @@
 # Rextto
 
-**Rextto** is a self-hosted media acquisition and archive daemon. A single Rust
-process bundles the scraping engine, the SQLite storage, the web API/UI and an
-embedded libtorrent session — no external services required to run it.
+**Rextto** is a self-hosted daemon for the automatic acquisition and archiving of
+TV series, movies and comics.
 
-It watches the series and movies you configure, searches RSS/HTML sources,
-Torznab indexers and public search engines, scores every release by quality,
-downloads the best one and renames/archives it into your library.
+A single Rust process bundles everything: the scraping engine, the SQLite
+archive, the web UI/API and an embedded **libtorrent** session. No external
+services required.
 
-> 🇮🇹 Italiano: vedi [`README.it.md`](README.it.md).
-> Full user manual: [`docs/MANUAL.en.md`](docs/MANUAL.en.md) ·
-> [`docs/MANUAL.it.md`](docs/MANUAL.it.md).
+It watches what you configure, searches RSS/HTML sources, Torznab indexers
+(Jackett/Prowlarr) and public search engines, scores every release by quality,
+downloads the best one and renames/archives it into your library (NAS or local
+disk).
+
+> 🇮🇹 Italiano: [`README.it.md`](README.it.md)
+> 📖 Full manual: [`docs/MANUAL.en.md`](docs/MANUAL.en.md) ·
+> [`docs/MANUAL.it.md`](docs/MANUAL.it.md)
 
 ---
 
-## Features
+## What Rextto is
 
-- **Sources** — generic RSS feeds, HTML listings (with FlareSolverr fallback for
-  Cloudflare), Torznab indexers (Jackett/Prowlarr) and web search engines.
+- **One daemon, no external orchestrator** — scraping, downloading, renaming,
+  archiving and the UI live in the same process.
+- **Multiple sources** — generic RSS feeds, HTML listings (with FlareSolverr
+  fallback for Cloudflare), Torznab indexers (Jackett/Prowlarr) and web engines.
 - **Quality scoring** — resolution, source, codec, audio, HDR/Dolby Vision,
   groups and configurable weights, with a built-in simulator.
 - **Automatic upgrades** — replaces an archived file when a better release
-  appears, using legacy-style rules (resolution jump, HDTV→WEB-DL, HDR, repack)
-  plus a configurable score threshold.
+  appears (resolution jump, HDTV→WEB-DL, HDR, repack) beyond a configurable
+  score threshold.
 - **Series & movies** — TMDB metadata, posters, per-season monitoring, missing
   episode search, calendar, manual search.
-- **Torrents** — embedded libtorrent: queue, per-torrent limits, tags, peers,
-  trackers, files, storage moves, seed policy, fastresume.
+- **Torrents** — embedded libtorrent: queue, limits, tags, peers, trackers,
+  files, storage moves, seed policy, fastresume, VPN killswitch.
 - **Comics** — GetComics monitoring and weekly packs.
 - **Integrations** — Trakt, Simkl, Jellyfin, Plex, Telegram/e-mail/webhook
   notifications.
-- **Privacy** — VPN killswitch: binds libtorrent listening and outgoing traffic
-  to a chosen interface (`tun0`/`wg0`), selectable from the UI.
-- **Web UI** — responsive single-page app (dark/light theme) with **Italian and
-  English** localisation; log viewer, health, charts, maintenance tools.
-- **Seen from feed** — every release seen in the sources, grouped by title and
-  browsable under *Archive → Seen from feed*, even when not monitored.
-- **Maintenance & backups** — duplicate video cleanup, lost source-token restore,
-  database pruning, plus manual/scheduled backups (local, FTP, cloud folder,
-  Telegram).
-- **Feed** — rolling magnet RSS feed at `/feed.xml`, for external consumers.
+- **Web UI** — responsive single-page app, dark/light theme, **Italian and
+  English**, with log viewer, health, charts and maintenance tools.
+- **Seen from feed** — every release seen in the sources, grouped by title,
+  browsable even for titles you do not monitor.
+- **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
 
-## Requirements
+## Installation
+
+### Requirements
 
 - Linux, Rust stable (`rustc`/`cargo`).
-- `libtorrent-rasterbar` development headers and a C++17 compiler (the libtorrent
-  bridge is built by `build.rs`), plus OpenSSL headers.
+- `libtorrent-rasterbar` development headers and a C++17 compiler (the bridge is
+  built by `build.rs`), plus OpenSSL headers.
 - Optional: `mediainfo` (technical tags for renaming), `mold` (faster linking),
-  FlareSolverr (Cloudflare-protected sources), `cargo-leptos` + the
-  `wasm32-unknown-unknown` target (to build the UI).
+  FlareSolverr (Cloudflare-protected sources).
+- For the UI: `cargo-leptos` and the `wasm32-unknown-unknown` target.
 
 ```bash
 sudo apt-get install -y build-essential libtorrent-rasterbar-dev libssl-dev mediainfo
 ```
 
-## Build
+### 1. Build the daemon
 
 ```bash
-# Daemon (optimised, used by the systemd unit)
 cargo build --release
+# binary: target/release/rexttod
+```
 
-# Web UI (static bundle served by the daemon)
+### 2. Build the web UI
+
+The UI is a static bundle served by the daemon.
+
+```bash
 rustup target add wasm32-unknown-unknown
 cargo install cargo-leptos
-cd ui && cargo leptos build --frontend-only
+cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
 ```
 
-For the development loop there is an even faster profile (lower optimisation)
-and helper scripts:
+### 3. First try in dry-run
+
+No real downloads start and nothing outside its own directory is touched.
 
 ```bash
-./scripts/build-fast.sh          # target/fast/rexttod
-./scripts/dev-reload.sh --daemon # build + copy + restart the service
-./scripts/dev-reload.sh          # daemon + UI + restart
-cargo check                      # fastest feedback
+./run-safe.sh          # serves http://127.0.0.1:5000 with REXTTO_ACTIVE=0
 ```
 
-## Configuration
+### 4. Install as a service
 
-Rextto reads `rextto.json` (if present) and stores runtime settings in
-`rextto_config.db`. The data directory defaults to `data/` and can be overridden
-with environment variables:
+The script builds if needed, installs/refreshes the systemd unit and restarts it.
+
+```bash
+./start-rextto-service.sh
+sudo systemctl status rextto.service
+sudo journalctl -u rextto.service -f
+```
+
+### 5. Check it
+
+```bash
+curl --fail http://127.0.0.1:5000/api/status
+curl --fail http://127.0.0.1:5000/api/health
+```
+
+## How to use it
+
+Everything is managed from the web UI, on the configured address (default
+`http://<host>:5000`).
+
+### First run
+
+1. Open the UI. If no data directory exists yet, complete the **initial setup**.
+2. Keep the daemon in **dry-run** until your sources are configured: in dry-run
+   no downloads start.
+3. When ready, enable **active mode** in *Configuration → Daemon*.
+
+### Configure the sources
+
+In *Configuration → Sources* add:
+
+- RSS feeds / HTML listings (URL and pages to follow);
+- Torznab indexers (Jackett/Prowlarr) with the **Verify** button;
+- web search engines and, if needed, the FlareSolverr URL;
+- content filters and blocklist.
+
+The same section holds scoring, renaming, paths and libtorrent settings.
+
+### Add series and movies
+
+- From **Explore** (TMDB search) in one click, or
+- from **Series / Movies → Add** manually.
+
+For each title pick minimum quality, language, seasons/years, aliases, exclusions
+and the **NAS path**. Comics are managed from **Comics**.
+
+### Cycles and downloads
+
+Rextto works in cycles: search, evaluate, download, rename, archive.
+
+- From the **Dashboard** you can start a full cycle, a single domain (Series,
+  Movies, Comics) or an immediate backup.
+- Cycles also run automatically at the configured interval.
+- In **Downloads → Torrent session** you see the torrents in the client (with a
+  **NAS** badge when already archived); under the name you find the **reason** for
+  the download and its **source** (indexer/RSS/web). **Clean completed** removes
+  torrents that reached their seed limit.
+- **Download history** lists torrents that **left the session**, with the outcome
+  (NAS path or the reason they were rejected).
+
+### UI sections
+
+| Section | Purpose |
+|---|---|
+| **Dashboard** | Manual search, cycle buttons, stats, network, upcoming releases |
+| **Downloads** | Torrent session, add magnet/.torrent, history |
+| **Series / Movies** | Library, details, missing episodes, manual search |
+| **Missing** | Missing episodes and gap filling |
+| **Calendar** | Upcoming releases from monitored series |
+| **Explore** | TMDB discovery and release search |
+| **Archive** | Past releases; *Seen from feed* for movies/series |
+| **Comics** | GetComics and weekly packs |
+| **Configuration** | Sources, libtorrent, scoring, renaming, paths, notifications |
+| **Integrations** | Trakt, Simkl, Jellyfin, Plex |
+| **Maintenance** | Backups, duplicates, scoring, legacy import, restart |
+| **Health, Logs, Charts** | Diagnostics and monitoring |
+
+A detailed walkthrough of every screen is in the
+[manual](docs/MANUAL.en.md).
+
+### Data and logs
+
+- Default data directory: `data/` (override with `REXTTO_DATA_DIR`).
+- Logs in `data/rextto.log`, with 5 MB rotation (active file + 3 backups),
+  streamed live in the UI.
+
+### Environment variables
 
 | Variable | Purpose |
 |---|---|
@@ -92,74 +182,26 @@ with environment variables:
 | `REXTTO_API_TOKEN` | Optional bearer token for the API/UI |
 | `RUST_LOG` | Tracing filter (default `rextto=info`) |
 
-Most options are editable from **Configuration** in the web UI (sources,
-indexers, scoring, libtorrent, renaming, notifications, paths, translations).
-
-## Running
-
-Dry-run (writes only to Rextto's own directory):
+## Development
 
 ```bash
-./run-safe.sh
-```
-
-As a service:
-
-```bash
-./start-rextto-service.sh        # install/refresh the systemd unit and restart
-sudo systemctl status rextto.service
-sudo journalctl -u rextto.service -f
-```
-
-Quick checks once it is running:
-
-```bash
-curl --fail http://127.0.0.1:5000/api/status
-curl --fail http://127.0.0.1:5000/api/health
-```
-
-## Web UI and API
-
-The UI is served from `ui/target/site/pkg` on the configured address. Selected
-endpoints:
-
-- `GET /api/status`, `GET /api/health`
-- `GET /api/config`, `POST /api/config/settings`, `POST /api/config/library`
-- `GET /api/series`, `GET /api/movies`, `GET /api/gaps`, `GET /api/calendar`
-- `GET /api/torrents`, `POST /api/send-magnet`, torrent actions under
-  `/api/torrents/{hash}/...`
-- `GET /api/archive`, `POST /api/archive/batch-download`
-- `GET /api/series/seen/grouped`, `GET /api/movies/seen/grouped` (seen from feed)
-- `GET /api/network/interfaces`
-- `POST /api/maintenance/clean-duplicates`, `POST /api/maintenance/restore-source`
-- `GET /api/comics`, `POST /api/comics/explore`
-- `POST /api/search`, `GET /api/sources/health`
-- `GET /api/logs/stream` (SSE), `GET /feed.xml` (magnet RSS)
-
-## Logs
-
-Logs are written to `data/rextto.log` with **size-based rotation at 5 MB**,
-keeping the active file plus three backups (`rextto.log.1` … `rextto.log.3`).
-The log viewer in the UI streams them live.
-
-## Testing
-
-```bash
-cargo test --all-targets
+./scripts/build-fast.sh          # fast daemon build (target/fast/rexttod)
+./scripts/dev-reload.sh --daemon # build + copy + restart the service
+./scripts/dev-reload.sh          # daemon + UI + restart
+cargo check                      # fastest feedback
+cargo test --all-targets         # tests
 ```
 
 ## Migrating from a legacy instance
 
-An optional importer can read a stopped legacy data directory (series, archive,
-comics databases) into Rextto's own `rextto_*.db` files:
+An optional importer reads a stopped legacy data directory (series, archive,
+comics databases) into Rextto's own `rextto_*.db` files. It never writes to the
+source directory.
 
 ```bash
 ./import-legacy.sh /path/to/legacy /home/user/rextto/data
 ```
 
-It never writes to the source directory.
-
 ## License
 
-Licensed under the **European Union Public Licence v. 1.2** — see
-[`LICENSE`](LICENSE).
+Licensed under the **European Union Public Licence v. 1.2** — see [`LICENSE`](LICENSE).
