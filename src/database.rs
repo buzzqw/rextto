@@ -1226,11 +1226,7 @@ impl Database {
                 params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
             )?;
             if let Some(release) = release {
-                let digest = magnet_hash(&release.magnet).unwrap_or_default();
-                self.conn.execute(
-                    "DELETE FROM episodes WHERE (lower(magnet_hash)=lower(?1) OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
-                    params![digest, release.magnet],
-                )?;
+                self.clear_placeholders(&release.magnet)?;
             }
             reconciled += 1;
         }
@@ -1247,11 +1243,7 @@ impl Database {
             params![hash.to_ascii_lowercase(), Utc::now().to_rfc3339()],
         )?;
         if let Some(release) = release {
-            let digest = magnet_hash(&release.magnet).unwrap_or_default();
-            self.conn.execute(
-                "DELETE FROM episodes WHERE (lower(magnet_hash)=lower(?1) OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
-                params![digest, release.magnet],
-            )?;
+            self.clear_placeholders(&release.magnet)?;
         }
         Ok(())
     }
@@ -1431,11 +1423,30 @@ impl Database {
         Ok(())
     }
 
+    /// Elimina i placeholder (non scaricati) di una release. Usato quando un
+    /// download fallisce/scade: senza questa pulizia i suoi placeholder di
+    /// qualità superiore bloccherebbero per sempre il ripiego su una release
+    /// inferiore ma disponibile.
+    fn clear_placeholders(&self, magnet: &str) -> Result<()> {
+        let digest = magnet_hash(magnet).unwrap_or_default();
+        self.conn.execute(
+            "DELETE FROM episodes WHERE (lower(magnet_hash)=lower(?1) OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
+            params![digest, magnet],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_torrent_error(&self, hash: &str, error: &str) -> Result<()> {
+        let release = self.torrent_meta(hash)?.map(|meta| meta.release);
         self.conn.execute(
             "UPDATE torrent_meta SET status='error',error=?,updated_at=? WHERE hash=?",
             params![error, Utc::now().to_rfc3339(), hash.to_ascii_lowercase()],
         )?;
+        // Fallito: i suoi placeholder non scaricati non devono più bloccare un
+        // ripiego su una release inferiore (es. il 1080p dopo un 4K fermo).
+        if let Some(release) = release {
+            self.clear_placeholders(&release.magnet)?;
+        }
         Ok(())
     }
 
@@ -2247,6 +2258,91 @@ mod tests {
             db.torrent_status(&digest).unwrap().as_deref(),
             Some("queued")
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn failed_release_clears_placeholders_to_allow_fallback() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-fallback-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Example')", [])
+            .unwrap();
+        let pack = Release {
+            title: "Example.S01E01-08.2160p".into(),
+            magnet: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            source: "rss".into(),
+            quality: Quality {
+                resolution: "2160p".into(),
+                ..Default::default()
+            },
+            kind: "series".into(),
+            series: Some("Example".into()),
+            season: Some(1),
+            episode: Some(1),
+            is_pack: true,
+            episode_range: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            year: None,
+            discovered_at: Utc::now(),
+        };
+        db.register_torrent(&pack).unwrap();
+        let digest = magnet_hash(&pack.magnet).unwrap();
+        for episode in 1..=8 {
+            // Solo il primo episodio porta l'hash (UNIQUE); gli altri il link.
+            let hash = (episode == 1).then_some(digest.as_str());
+            db.conn
+                .execute(
+                    "INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (1,1,?1,?2,1880,?3,?4)",
+                    params![episode, pack.title, hash, pack.magnet],
+                )
+                .unwrap();
+        }
+
+        // Il 4K è andato in stallo: marcatura errore + pulizia dei placeholder.
+        db.mark_torrent_error(&digest, "stalled download").unwrap();
+        let leftover: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM episodes WHERE series_id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(leftover, 0, "i placeholder non devono bloccare il ripiego");
+
+        // A questo punto una release inferiore ma disponibile (1080p) viene
+        // approvata come ripiego automatico.
+        let fallback = Release {
+            title: "Example.S01.1080p".into(),
+            magnet: "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            source: "rss".into(),
+            quality: Quality {
+                resolution: "1080p".into(),
+                ..Default::default()
+            },
+            kind: "series".into(),
+            series: Some("Example".into()),
+            season: Some(1),
+            episode: Some(0),
+            is_pack: true,
+            episode_range: vec![0],
+            year: None,
+            discovered_at: Utc::now(),
+        };
+        let fallback_hash = magnet_hash(&fallback.magnet).unwrap();
+        let score = fallback.quality.score();
+        let (approved, reason) = db
+            .check_series_pack(&fallback, &fallback_hash, score, 200)
+            .unwrap();
+        assert!(approved, "il 1080p deve essere approvato: {reason}");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
