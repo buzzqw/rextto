@@ -6045,9 +6045,6 @@ async fn mark_torrent_failed(
             .unwrap()
             .mark_torrent_error(&hash, "manual failure");
     let removed = s.torrents.remove(&hash, false).unwrap_or(false);
-    if removed {
-        forget_torrent_resume(&s.cfg.state_dir, &hash);
-    }
     (
         StatusCode::OK,
         Json(serde_json::json!({"ok":true,"removed":removed,"upgrade_restored":restored})),
@@ -7018,14 +7015,6 @@ async fn torrent_peers_legacy(
 ) -> impl IntoResponse {
     torrent_peers(State(s), Path(input.hash)).await
 }
-/// Elimina i file resume (`.fastresume`/`.torrent`) di un torrent rimosso:
-/// altrimenti al riavvio libtorrent lo ripristinerebbe e tornerebbe in Scarico.
-fn forget_torrent_resume(state_dir: &FsPath, hash: &str) {
-    let hash = hash.to_ascii_lowercase();
-    let _ = std::fs::remove_file(state_dir.join(format!("{hash}.fastresume")));
-    let _ = std::fs::remove_file(state_dir.join(format!("{hash}.torrent")));
-}
-
 async fn remove_torrent_legacy(
     State(s): State<AppState>,
     Json(input): Json<RemoveTorrentInput>,
@@ -7035,7 +7024,6 @@ async fn remove_torrent_legacy(
         // Coerenza DB/sessione: il torrent non esiste più, non deve restare
         // "queued" né bloccare un nuovo tentativo, né risorgere al riavvio.
         let _ = s.db.lock().unwrap().mark_torrent_removed(&input.hash);
-        forget_torrent_resume(&s.cfg.state_dir, &input.hash);
     }
     torrent_action(removed)
 }
@@ -7088,7 +7076,10 @@ async fn remove_completed_torrents(
             continue;
         }
         match s.torrents.remove(&torrent.hash, input.delete_files) {
-            Ok(true) => removed.push(torrent.hash),
+            Ok(true) => {
+                let _ = s.db.lock().unwrap().mark_torrent_removed(&torrent.hash);
+                removed.push(torrent.hash)
+            }
             Ok(false) => skipped += 1,
             Err(error) => {
                 tracing::warn!(hash=%torrent.hash, %error, "completed torrent removal failed")
@@ -7913,7 +7904,11 @@ async fn set_torrent_limits_legacy(
     ))
 }
 async fn remove_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
-    torrent_action(s.torrents.remove(&hash, false))
+    let removed = s.torrents.remove(&hash, false);
+    if matches!(removed, Ok(true)) {
+        let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
+    }
+    torrent_action(removed)
 }
 async fn remove_torrent_with_options(
     State(s): State<AppState>,
@@ -7932,7 +7927,11 @@ async fn remove_torrent_with_options(
             let _ = s.db.lock().unwrap().blocklist(&release, "manual");
         }
     }
-    torrent_action(s.torrents.remove(&hash, input.delete_files))
+    let removed = s.torrents.remove(&hash, input.delete_files);
+    if matches!(removed, Ok(true)) {
+        let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
+    }
+    torrent_action(removed)
 }
 async fn set_torrent_no_rename(
     State(s): State<AppState>,

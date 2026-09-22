@@ -1417,11 +1417,16 @@ impl LibtorrentClient {
         if self.session.is_some() {
             self.control(hash, rextto_lt_remove, delete_files as i32)?;
         }
+        let normalized = hash.to_ascii_lowercase();
+        // Il resume va rimosso: altrimenti al riavvio libtorrent ripristina il
+        // torrent e "riappare" in Scarico, annullando la rimozione.
+        let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.fastresume")));
+        let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.torrent")));
         Ok(self
             .torrents
             .write()
             .unwrap()
-            .remove(&hash.to_ascii_lowercase())
+            .remove(&normalized)
             .is_some()
             || self.session.is_some())
     }
