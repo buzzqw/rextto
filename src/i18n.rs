@@ -97,6 +97,17 @@ impl I18nDb {
         tx.commit()?;
         Ok(())
     }
+
+    /// Removes every translation row for a language. Returns how many rows were
+    /// deleted.
+    pub fn delete_lang(&self, lang: &str) -> Result<usize> {
+        let lang = Self::storage_language(lang);
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM translations WHERE lang=?1", params![lang])?)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +140,22 @@ mod tests {
         db.set("en", "dashboard.title", "Dashboard").unwrap();
         assert_eq!(db.language().unwrap(), "en");
         assert_eq!(db.list("en").unwrap()[0].value, "Dashboard");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn deletes_every_translation_for_a_language() {
+        let path =
+            std::env::temp_dir().join(format!("rextto-i18n-del-{}.db", uuid::Uuid::new_v4()));
+        let db = I18nDb::open(&path).unwrap();
+        db.set("it", "hello", "ciao").unwrap();
+        db.set("en", "hello", "hello").unwrap();
+        assert_eq!(db.delete_lang("it").unwrap(), 1);
+        assert!(db.list("it").unwrap().is_empty());
+        assert_eq!(db.list("en").unwrap().len(), 1);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

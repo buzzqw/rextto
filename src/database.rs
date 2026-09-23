@@ -40,6 +40,15 @@ pub struct MaintenanceReport {
     pub stale_torrents_removed: usize,
 }
 
+/// Counts of what a maintenance run *would* remove, so the UI can preview a
+/// destructive prune before committing it. Mirrors `cleanup` exactly.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PrunePreview {
+    pub old_cycles_to_remove: usize,
+    pub stale_torrents_to_remove: usize,
+    pub seen_to_remove: usize,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct StoredTorrent {
     pub hash: String,
@@ -812,6 +821,15 @@ impl Database {
             .optional()?
             .unwrap_or(0)
             != 0)
+    }
+
+    /// Torrents explicitly excluded from renaming (hash, display name).
+    pub fn no_rename_torrents(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT hash, COALESCE(NULLIF(name,''), NULLIF(title,''), '') FROM torrent_meta WHERE COALESCE(no_rename,0)!=0 ORDER BY updated_at DESC",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn is_blocklisted(&self, hash: &str) -> Result<bool> {
@@ -2075,6 +2093,38 @@ impl Database {
     }
 
     /// Elimina le release "viste" più vecchie di `days` giorni (0 = nessuna pulizia).
+    /// Counts what `cleanup` + `prune_seen_older_than` would remove, without
+    /// deleting anything.
+    pub fn prune_preview(&self, retain_cycles: i64, error_age_days: i64, seen_days: i64) -> Result<PrunePreview> {
+        let retain = retain_cycles.clamp(1, 10000);
+        let old_cycles: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cycle_history WHERE id NOT IN (SELECT id FROM cycle_history ORDER BY id DESC LIMIT ?1)",
+            [retain],
+            |row| row.get(0),
+        )?;
+        let stale_torrents: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM torrent_meta WHERE status='error' AND updated_at < datetime('now', ?1)",
+            [format!("-{} days", error_age_days.max(1))],
+            |row| row.get(0),
+        )?;
+        let seen_to_remove = if seen_days <= 0 {
+            0usize
+        } else {
+            let cutoff = (Utc::now() - chrono::Duration::days(seen_days.max(1))).to_rfc3339();
+            let count: i64 = self.conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM movie_feed_seen WHERE found_at < ?1) + (SELECT COUNT(*) FROM series_feed_seen WHERE found_at < ?1)",
+                [&cutoff],
+                |row| row.get(0),
+            )?;
+            count.max(0) as usize
+        };
+        Ok(PrunePreview {
+            old_cycles_to_remove: old_cycles.max(0) as usize,
+            stale_torrents_to_remove: stale_torrents.max(0) as usize,
+            seen_to_remove,
+        })
+    }
+
     pub fn prune_seen_older_than(&self, days: i64) -> Result<usize> {
         if days <= 0 {
             return Ok(0);
@@ -3193,6 +3243,43 @@ mod tests {
         assert_eq!(db.prune_seen_older_than(30).unwrap(), 2);
         assert_eq!(db.seen_counts().unwrap(), (0, 1));
         assert_eq!(db.prune_seen_older_than(0).unwrap(), 0);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn prune_preview_counts_without_deleting() {
+        use crate::models::CycleStats;
+        let path = std::env::temp_dir().join(format!(
+            "rextto-prune-preview-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        for _ in 0..5 {
+            db.save_cycle(&CycleStats::default()).unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO torrent_meta(hash,status,updated_at) VALUES \
+                 ('h1','error', datetime('now','-30 days')),\
+                 ('h2','error', datetime('now','-1 days'))",
+                [],
+            )
+            .unwrap();
+        let preview = db.prune_preview(2, 7, 0).unwrap();
+        assert_eq!(preview.old_cycles_to_remove, 3);
+        assert_eq!(preview.stale_torrents_to_remove, 1);
+        // The preview must not delete anything.
+        let cycles: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM cycle_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cycles, 5);
+        let report = db.cleanup(2, 7).unwrap();
+        assert_eq!(report.old_cycles_removed, 3);
+        assert_eq!(report.stale_torrents_removed, 1);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

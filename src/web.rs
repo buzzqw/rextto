@@ -402,6 +402,9 @@ pub struct PruneInput {
     /// (assente o 0 = conserva tutto).
     #[serde(default)]
     pub seen_retention_days: Option<i64>,
+    /// When true, only report what would be removed (no deletion).
+    #[serde(default)]
+    pub preview: bool,
 }
 #[derive(serde::Deserialize, Default)]
 pub struct DbActionInput {
@@ -456,10 +459,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/i18n/active", get(i18n_active).post(i18n_language))
         .route("/api/i18n/export/{lang}", get(i18n_export))
         .route("/api/i18n/import/{lang}", post(i18n_import))
+        .route("/api/i18n/{lang}", delete(i18n_delete_lang))
         .route("/api/health", get(health_api))
         .route("/api/status", get(status))
         .route("/api/logs", get(logs))
         .route("/api/logs/stream", get(logs_stream))
+        .route("/api/notifications/stream", get(notifications_stream))
         .route("/api/config", get(config_view).post(save_config_root))
         .route("/api/config/migration-status", get(migration_status))
         .route("/api/config/migrate", post(migrate_config))
@@ -583,6 +588,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/db/info", get(db_info))
         .route("/api/db/action", post(db_action))
         .route("/api/db/prune", post(db_prune))
+        .route("/api/db/prune/preview", post(db_prune_preview))
         .route("/api/db/prune-keyword", post(db_prune_keyword))
         .route("/api/trash", get(trash_entries))
         .route("/api/send-magnet", post(send_magnet))
@@ -630,6 +636,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series/seen/grouped", get(series_seen_grouped_view))
         .route("/api/series/seen", get(series_seen_view))
         .route("/api/torrent-events", get(torrent_events))
+        .route("/api/torrent-no-rename", get(torrent_no_rename_list))
         .route("/api/torrents", post(add_torrent))
         .route("/api/blocklist", get(blocklist_entries))
         .route("/api/blocklist/{hash}/remove", post(remove_blocklist_entry))
@@ -901,6 +908,27 @@ async fn i18n_export(State(s): State<AppState>, Path(lang): Path<String>) -> imp
             .into_response(),
     }
 }
+async fn i18n_delete_lang(
+    State(s): State<AppState>,
+    Path(lang): Path<String>,
+) -> impl IntoResponse {
+    if lang.trim().is_empty() || lang.len() > 32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"invalid language code"})),
+        );
+    }
+    match s.i18n.delete_lang(&lang) {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"lang":lang,"removed":removed})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
 async fn i18n_import(
     State(s): State<AppState>,
     Path(lang): Path<String>,
@@ -1072,6 +1100,36 @@ async fn logs_stream(State(s): State<AppState>) -> impl IntoResponse {
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
+
+/// Server-sent stream of torrent lifecycle events (metadata received, finished,
+/// storage moved). New entries appended to the shared buffer are pushed as they
+/// appear, so the Activity view can react in real time instead of polling
+/// `/api/torrent-events`.
+async fn notifications_stream(State(s): State<AppState>) -> impl IntoResponse {
+    let events = s.torrent_events.clone();
+    let stream = async_stream::stream! {
+        let mut cursor = { events.lock().unwrap().len() };
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let batch = {
+                let guard = events.lock().unwrap();
+                // The buffer drops its oldest entries once it exceeds its cap.
+                if guard.len() < cursor {
+                    cursor = 0;
+                }
+                let items = guard[cursor..].to_vec();
+                cursor = guard.len();
+                items
+            };
+            for item in batch {
+                let data = serde_json::to_string(&item).unwrap_or_default();
+                yield Ok::<Event, Infallible>(Event::default().event("torrent").data(data));
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
     Json(serde_json::json!({
@@ -2811,6 +2869,29 @@ fn run_db_action(
     Ok((before_size, before_rows, after_size, after_rows))
 }
 async fn db_prune(State(s): State<AppState>, Json(input): Json<PruneInput>) -> impl IntoResponse {
+    if input.preview {
+        let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
+        let error_age = input.error_age_days.unwrap_or(7).max(1);
+        let seen_days = input.seen_retention_days.unwrap_or(0);
+        return match (|| -> anyhow::Result<crate::database::PrunePreview> {
+            let db = s.db.lock().unwrap();
+            db.prune_preview(retain, error_age, seen_days)
+        })() {
+            Ok(preview) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "preview": true,
+                    "report": preview,
+                    "seen_removed": preview.seen_to_remove,
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+            ),
+        };
+    }
     if s.cfg.dry_run {
         return (
             StatusCode::CONFLICT,
@@ -2830,6 +2911,36 @@ async fn db_prune(State(s): State<AppState>, Json(input): Json<PruneInput>) -> i
         Ok((report, seen_removed)) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok":true,"report":report,"seen_removed":seen_removed})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+/// Read-only preview of the age/error maintenance prune: reports how many
+/// cycle-history rows, stale failed torrents and feed-seen entries would be
+/// removed, without touching the database.
+async fn db_prune_preview(
+    State(s): State<AppState>,
+    Json(input): Json<PruneInput>,
+) -> impl IntoResponse {
+    let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
+    let error_age = input.error_age_days.unwrap_or(7).max(1);
+    let seen_days = input.seen_retention_days.unwrap_or(0);
+    let result = (|| -> anyhow::Result<crate::database::PrunePreview> {
+        let db = s.db.lock().unwrap();
+        db.prune_preview(retain, error_age, seen_days)
+    })();
+    match result {
+        Ok(preview) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "preview": true,
+                "report": preview,
+                "seen_removed": preview.seen_to_remove,
+            })),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6547,6 +6658,26 @@ async fn series_seen_view(
     seen_entries(&s, "series", &query)
 }
 
+/// Lists the torrents explicitly excluded from renaming (the per-torrent
+/// `no_rename` flag), so the UI can show them in one place.
+async fn torrent_no_rename_list(State(s): State<AppState>) -> impl IntoResponse {
+    match s.db.lock().unwrap().no_rename_torrents() {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "torrents": items
+                    .into_iter()
+                    .map(|(hash, name)| serde_json::json!({"hash": hash, "name": name}))
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
 async fn torrent_events(State(s): State<AppState>) -> Json<Vec<crate::models::TorrentEvent>> {
     // Return a snapshot (do not drain): the Activity page polls periodically and
     // a drained buffer left it empty whenever no event happened since the last
