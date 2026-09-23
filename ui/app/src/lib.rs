@@ -5447,6 +5447,11 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                     <div class="grid-2" style="margin-top:18px">
                         <AreaSetting label="Blacklist (parole separate da virgola)" setting_key="blacklist" value=Signal::derive(move || raw(&data.get().config, "blacklist", "[]")) placeholder="cam, ts, screener" rows=2 />
                     </div>
+                    <div class="field span-full" style="margin:18px 0 8px">
+                        <span>{ctx_tr("Filtri per sorgente")}</span>
+                        <small class="hint">{ctx_tr("Blocca per parola chiave solo le release di una sorgente specifica (feed, indexer o motore web), senza disattivarla.")}</small>
+                    </div>
+                    <SourceFilterEditor data />
                 </Panel>
             </Show>
             <Show when=move || tab.get() == "libtorrent">
@@ -6236,6 +6241,51 @@ fn FlareSolverrEditor(data: RwSignal<Data>) -> impl IntoView {
                 });
             }>{move || if busy.get() { "Test…" } else { "Testa FlareSolverr" }}</button>
             <small class="muted">{message}</small>
+        </div>
+    }
+}
+
+#[component]
+fn SourceFilterEditor(data: RwSignal<Data>) -> impl IntoView {
+    let source = RwSignal::new(String::new());
+    let keywords = RwSignal::new(String::new());
+    view! {
+        <div class="stack" style="margin-top:10px">
+            <div class="toolbar">
+                {move || array(&data.get().config, "source_filters").into_iter().map(|item| {
+                    let name = text(&item, "source", "");
+                    let words = item.get("keywords").and_then(Value::as_array)
+                        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default();
+                    let remove_name = name.clone();
+                    let words_title = words.clone();
+                    view! {
+                        <span class="badge" style="margin-right:6px" title=words_title>
+                            {name.clone()} " · " {words}
+                            <button class="btn sm" style="margin-left:6px" on:click=move |_| {
+                                let mut list = array(&data.get().config, "source_filters");
+                                list.retain(|entry| text(entry, "source", "") != remove_name);
+                                run_post(data, "/api/config/source-filters", Some(json!({"filters": list})), "Filtro sorgente rimosso");
+                            }>"×"</button>
+                        </span>
+                    }
+                }).collect_view()}
+            </div>
+            <div class="toolbar">
+                <input prop:value=source on:input=move |event| source.set(event_target_value(&event)) placeholder=ctx_tr("Sorgente (es. ExtTo - MIRCrewRS, jackett, knaben)") />
+                <input prop:value=keywords on:input=move |event| keywords.set(event_target_value(&event)) placeholder=ctx_tr("Parole chiave separate da virgola (es. x265, cam)") />
+                <button class="btn sm" on:click=move |_| {
+                    let source_value = source.get().trim().to_string();
+                    let words = keywords.get().split(',').map(str::trim).filter(|word| !word.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+                    if source_value.is_empty() || words.is_empty() { return; }
+                    let mut list = array(&data.get().config, "source_filters");
+                    list.retain(|entry| text(entry, "source", "") != source_value);
+                    list.push(json!({"source": source_value, "keywords": words, "enabled": true}));
+                    source.set(String::new());
+                    keywords.set(String::new());
+                    run_post(data, "/api/config/source-filters", Some(json!({"filters": list})), "Filtro sorgente aggiunto");
+                }>{ctx_tr("Aggiungi")}</button>
+            </div>
         </div>
     }
 }
@@ -7184,6 +7234,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
     let restore_items = RwSignal::new(Vec::<Value>::new());
     let restore_busy = RwSignal::new(false);
     let restore_message = RwSignal::new(String::new());
+    let rename_status = RwSignal::new(String::new());
     let refresh_trash = move || {
         let trash = trash;
         spawn_local(async move {
@@ -7209,6 +7260,24 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     <button class="btn" on:click=move |_| run_post(data, "/api/maintenance/clean-trash", None, "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
                     <button class="btn" on:click=move |_| run_post(data, "/api/database/rescore", None, "Scoring ricalcolato")>{ctx_tr("Ricalcola scoring")}</button>
                     <button class="btn" on:click=move |_| run_post(data, "/api/scan-all-archives", None, "Archivi scansionati")>{ctx_tr("Scansiona archivi")}</button>
+                    <button class="btn" title=ctx_tr("Rinomina in background tutti i file archiviati, con progresso") on:click=move |_| {
+                        run_post(data, "/api/rename-all", Some(json!({})), "Rinomina avviata…");
+                        spawn_local(async move {
+                            loop {
+                                gloo_timers::future::TimeoutFuture::new(2000).await;
+                                let Ok(value) = get("/api/rename-progress").await else { break; };
+                                let progress = value.get("progress").cloned().unwrap_or_default();
+                                let running = progress.get("running").and_then(Value::as_bool).unwrap_or(false);
+                                let current = progress.get("current").and_then(Value::as_u64).unwrap_or(0);
+                                let total = progress.get("total").and_then(Value::as_u64).unwrap_or(0);
+                                let series = text(&progress, "series", "");
+                                let message = text(&progress, "message", "");
+                                rename_status.set(format!("{current}/{total} {series} {message}"));
+                                if !running { break; }
+                            }
+                        });
+                    }>{ctx_tr("Rinomina tutto")}</button>
+                    <small class="muted">{move || rename_status.get()}</small>
                     <button class="btn" on:click=move |_| run_post(data, "/api/config/migrate", None, "Configurazione importata")>{ctx_tr("Importa config legacy")}</button>
                     <button class="btn" on:click=move |_| run_post(data, "/api/setup/import", None, "Import eseguito")>{ctx_tr("Importa dati esistenti")}</button>
                     <button class="btn" title=ctx_tr("Riavvia il servizio rextto per applicare gli aggiornamenti (richiede l'helper installato una volta da root)") on:click=move |_| {

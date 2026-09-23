@@ -191,6 +191,15 @@ impl Engine {
                 );
                 continue;
             }
+            if let Some(reason) = cfg.source_filter_denied_reason(&release) {
+                tracing::info!(
+                    title = %release.title,
+                    source = %release.source,
+                    reason = %reason,
+                    "🚫 FILTER rejected"
+                );
+                continue;
+            }
             let Some(hash) = magnet_hash(&release.magnet) else {
                 tracing::info!(
                     title = %release.title,

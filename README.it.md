@@ -166,6 +166,18 @@ Rextto lavora a cicli: cerca, valuta, scarica, rinomina e archivia.
 La guida dettagliata di ogni schermata è nel
 [manuale](docs/MANUAL.it.md).
 
+### Terminal UI
+
+Per i server senza browser, Rextto include un client da terminale:
+
+```bash
+./start-tui.sh          # compila al primo avvio, si collega a 127.0.0.1:5000
+```
+
+Mostra **Status, Torrents, Activity, Logs, Health**, avvia un ciclo (`c`) e mette
+in pausa/riprende il torrent selezionato (`p`). Si punta altrove con `REXTTO_URL`
+e `REXTTO_API_TOKEN`.
+
 ### Dati e log
 
 - Data directory di default: `data/` (modificabile con `REXTTO_DATA_DIR`).
@@ -183,6 +195,7 @@ La guida dettagliata di ogni schermata è nel
 | `REXTTO_DRY_RUN` | `1` disabilita i download reali |
 | `REXTTO_API_TOKEN` | Token bearer opzionale per API/UI |
 | `RUST_LOG` | Filtro tracing (default `rextto=info`) |
+| `REXTTO_URL` | Client TUI: URL base del demone (default `http://127.0.0.1:5000`) |
 
 ## Sviluppo
 

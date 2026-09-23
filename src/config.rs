@@ -56,6 +56,24 @@ pub struct IndexerConfig {
     pub enabled: bool,
 }
 
+/// A per-source content filter: when a release's `source` contains `source`
+/// (case-insensitive), any of `keywords` found in the title blocks the release.
+/// Lets the user silence one feed/indexer/engine without disabling it entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SourceFilter {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// Parses the `source_filters` setting (a JSON array); bad input yields none.
+pub fn parse_source_filters(raw: &str) -> Vec<SourceFilter> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibtorrentSettings {
     pub port_min: u16,
@@ -178,6 +196,8 @@ pub struct Config {
     pub blacklist: Vec<String>,
     #[serde(default)]
     pub content_filters: Vec<String>,
+    #[serde(default)]
+    pub source_filters: Vec<SourceFilter>,
     #[serde(default)]
     pub max_release_age_days: i64,
     pub series: Vec<SeriesConfig>,
@@ -588,6 +608,7 @@ impl Default for Config {
             feed_urls: Vec::new(),
             blacklist: default_blacklist(),
             content_filters: Vec::new(),
+            source_filters: Vec::new(),
             max_release_age_days: 0,
             series: Vec::new(),
             movies: Vec::new(),
@@ -1002,6 +1023,40 @@ impl Config {
 
     pub fn release_allowed(&self, release: &crate::models::Release) -> bool {
         self.release_denied_reason(release).is_none()
+            && self.source_filter_denied_reason(release).is_none()
+    }
+
+    /// Reason a release is refused by a per-source filter, if any. Unlike the
+    /// global filters this needs the dynamic source/keyword names, so it returns
+    /// an owned string.
+    pub fn source_filter_denied_reason(
+        &self,
+        release: &crate::models::Release,
+    ) -> Option<String> {
+        if self.source_filters.is_empty() {
+            return None;
+        }
+        let source = release.source.to_ascii_lowercase();
+        let title = release.title.to_ascii_lowercase();
+        for filter in &self.source_filters {
+            if !filter.enabled {
+                continue;
+            }
+            let needle = filter.source.trim().to_ascii_lowercase();
+            if needle.is_empty() || !source.contains(&needle) {
+                continue;
+            }
+            for keyword in &filter.keywords {
+                let keyword = keyword.trim().to_ascii_lowercase();
+                if !keyword.is_empty() && title.contains(&keyword) {
+                    return Some(format!(
+                        "blocked by source filter '{}' (keyword '{keyword}')",
+                        filter.source.trim()
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Human-readable reason a release is refused by the global filters, or
@@ -1055,6 +1110,11 @@ impl Config {
             .get("content_filters")
             .or_else(|| self.settings.get("content_filter"))
             .map(|value| parse_list(value))
+            .unwrap_or_default();
+        self.source_filters = self
+            .settings
+            .get("source_filters")
+            .map(|value| parse_source_filters(value))
             .unwrap_or_default();
         self.max_release_age_days = self
             .settings
@@ -2023,6 +2083,39 @@ mod tests {
         assert!(!cfg.release_allowed(&release("Фильм.1080p.ITA", 1)));
         assert!(cfg.release_allowed(&release("Movie.1080p.ENG", 1)));
         assert!(!cfg.release_allowed(&release("Movie.1080p.ITA", 8)));
+    }
+
+    #[test]
+    fn source_filters_block_only_their_own_source() {
+        let mut cfg = Config::default();
+        cfg.source_filters = vec![SourceFilter {
+            source: "ExtTo - MIRCrewRS".into(),
+            keywords: vec!["x265".into()],
+            enabled: true,
+        }];
+        let release = |title: &str, source: &str| crate::models::Release {
+            title: title.into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: source.into(),
+            quality: Default::default(),
+            kind: "movie".into(),
+            series: None,
+            season: None,
+            episode: None,
+            is_pack: false,
+            episode_range: Vec::new(),
+            year: Some(2026),
+            discovered_at: Utc::now(),
+        };
+        // Blocked: matching source and keyword.
+        assert!(!cfg.release_allowed(&release("Film 1080p x265", "ExtTo - MIRCrewRS")));
+        // Different source: allowed even with the keyword.
+        assert!(cfg.release_allowed(&release("Film 1080p x265", "jackett")));
+        // Same source, no keyword: allowed.
+        assert!(cfg.release_allowed(&release("Film 1080p h264", "ExtTo - MIRCrewRS")));
+        // Disabled filter never blocks.
+        cfg.source_filters[0].enabled = false;
+        assert!(cfg.release_allowed(&release("Film 1080p x265", "ExtTo - MIRCrewRS")));
     }
 
     #[test]

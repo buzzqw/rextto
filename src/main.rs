@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
         last_cycle: Arc::new(Mutex::new(CycleStats::default())),
         cycle_lock: Arc::new(tokio::sync::Mutex::new(())),
         log_reload: Arc::new(Mutex::new(log_reload)),
+        rename_progress: Arc::new(Mutex::new(rextto::web::RenameProgress::default())),
     };
     if cfg.active && !cfg.dry_run {
         tracing::warn!(

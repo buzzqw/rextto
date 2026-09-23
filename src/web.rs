@@ -2,7 +2,7 @@ use crate::{
     archive::Archive,
     backup,
     comics::{self, ComicMonitored, ComicsDb, GetComicsClient},
-    config::{Config, IndexerConfig, MovieConfig, SeriesConfig},
+    config::{Config, IndexerConfig, MovieConfig, SeriesConfig, SourceFilter},
     database::Database,
     engine::Engine,
     health,
@@ -74,6 +74,18 @@ pub struct AppState {
     pub last_cycle: Arc<Mutex<CycleStats>>,
     pub cycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub log_reload: Arc<Mutex<reload::Handle<EnvFilter, tracing_subscriber::Registry>>>,
+    pub rename_progress: Arc<Mutex<RenameProgress>>,
+}
+
+/// Progress of a background rename-all job, polled by `/api/rename-progress`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RenameProgress {
+    pub running: bool,
+    pub current: usize,
+    pub total: usize,
+    pub series: String,
+    pub message: String,
+    pub errors: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -421,6 +433,106 @@ pub struct SettingsPatch {
     #[serde(flatten)]
     pub values: std::collections::BTreeMap<String, serde_json::Value>,
 }
+
+#[derive(serde::Deserialize, Default)]
+pub struct SourceFiltersInput {
+    #[serde(default)]
+    pub filters: Vec<SourceFilter>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct PruneByIdsInput {
+    #[serde(default)]
+    pub movie_seen: Vec<i64>,
+    #[serde(default)]
+    pub series_seen: Vec<i64>,
+}
+
+/// Removes specific "seen in feed" rows by id, e.g. the ones selected in the
+/// feed preview. Ids come from `/api/movies/seen` and `/api/series/seen`.
+async fn db_prune_by_ids(
+    State(s): State<AppState>,
+    Json(input): Json<PruneByIdsInput>,
+) -> impl IntoResponse {
+    if s.cfg.dry_run {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"dry-run does not modify the database"})),
+        );
+    }
+    match s
+        .db
+        .lock()
+        .unwrap()
+        .prune_seen_by_ids(&input.movie_seen, &input.series_seen)
+    {
+        Ok((movies, series)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "movie_seen_removed": movies,
+                "series_seen_removed": series,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+async fn source_filters_view(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"filters":cfg.source_filters})),
+    )
+}
+
+/// Replaces the per-source filters. Stored as a JSON array in the `source_filters`
+/// setting, so no schema change is needed and it is picked up on the next
+/// config reload.
+async fn save_source_filters(
+    State(s): State<AppState>,
+    Json(input): Json<SourceFiltersInput>,
+) -> impl IntoResponse {
+    if input.filters.len() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"too many source filters (max 200)"})),
+        )
+            .into_response();
+    }
+    let payload = match serde_json::to_string(&input.filters) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    if payload.len() > 100_000 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"ok":false,"error":"source filters too large"})),
+        )
+            .into_response();
+    }
+    match Config::save_setting(&s.cfg.data_dir, "source_filters", &payload) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"filters":input.filters})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
 #[derive(serde::Deserialize)]
 pub struct ComicCheckLinksInput {
     pub urls: Vec<String>,
@@ -475,6 +587,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/settings", post(save_setting))
         .route("/api/config/settings/{key}", delete(delete_setting))
         .route(
+            "/api/config/source-filters",
+            get(source_filters_view).post(save_source_filters),
+        )
+        .route(
             "/api/tag-dir-rules",
             get(tag_dir_rules).post(save_tag_dir_rules),
         )
@@ -518,6 +634,8 @@ pub fn router(state: AppState) -> Router {
             "/api/series/{name}/rename-execute",
             post(series_rename_execute),
         )
+        .route("/api/rename-progress", get(rename_progress_view))
+        .route("/api/rename-all", post(rename_all))
         .route("/api/series/{name}", get(series_detail))
         .route("/api/series", get(series_list))
         .route("/api/series/all-missing", get(gaps))
@@ -589,6 +707,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/db/action", post(db_action))
         .route("/api/db/prune", post(db_prune))
         .route("/api/db/prune/preview", post(db_prune_preview))
+        .route("/api/db/prune-by-ids", post(db_prune_by_ids))
         .route("/api/db/prune-keyword", post(db_prune_keyword))
         .route("/api/trash", get(trash_entries))
         .route("/api/send-magnet", post(send_magnet))
@@ -1145,6 +1264,7 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
         "websearch_engines": cfg.websearch_engines,
         "blacklist": cfg.blacklist,
         "content_filters": cfg.content_filters,
+        "source_filters": cfg.source_filters,
         "max_release_age_days": cfg.max_release_age_days,
         "gap_fill_max_per_series": cfg.settings.get("gap_fill_max_per_series").and_then(|value| value.parse::<usize>().ok()).unwrap_or(0),
         "gap_fill_max_per_cycle": cfg.settings.get("gap_fill_max_per_cycle").and_then(|value| value.parse::<usize>().ok()).unwrap_or(30),
@@ -1956,6 +2076,95 @@ async fn series_rename_execute(
     )
     .await
 }
+
+async fn rename_progress_view(State(s): State<AppState>) -> impl IntoResponse {
+    let progress = s.rename_progress.lock().unwrap().clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"progress":progress})),
+    )
+}
+
+/// Starts a rename over every enabled series in the background and returns
+/// immediately; progress is polled via `/api/rename-progress`. Per-series rename
+/// stays synchronous for backward compatibility.
+async fn rename_all(
+    State(s): State<AppState>,
+    input: Option<Json<RenameInput>>,
+) -> impl IntoResponse {
+    let force = input.as_ref().is_some_and(|Json(input)| input.force);
+    let source_only = input
+        .as_ref()
+        .is_some_and(|Json(input)| input.source_only);
+    let cfg = latest_config(&s);
+    if !cfg.rename_episodes {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"rename is disabled"})),
+        );
+    }
+    {
+        let mut progress = s.rename_progress.lock().unwrap();
+        if progress.running {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"a rename is already running"})),
+            );
+        }
+        *progress = RenameProgress {
+            running: true,
+            current: 0,
+            total: 0,
+            series: String::new(),
+            message: "starting".into(),
+            errors: 0,
+        };
+    }
+    let names = cfg
+        .series
+        .iter()
+        .filter(|series| series.enabled)
+        .map(|series| series.name.clone())
+        .collect::<Vec<_>>();
+    let total = names.len();
+    {
+        let mut progress = s.rename_progress.lock().unwrap();
+        progress.total = total;
+        progress.message = "running".into();
+    }
+    let state = s.clone();
+    tokio::spawn(async move {
+        let mut errors = 0usize;
+        for (index, name) in names.iter().enumerate() {
+            {
+                let mut progress = state.rename_progress.lock().unwrap();
+                progress.current = index;
+                progress.series = name.clone();
+            }
+            let (status, _) =
+                series_rename_apply(&state, name, true, force, source_only).await;
+            if status != StatusCode::OK {
+                errors += 1;
+            }
+        }
+        let mut progress = state.rename_progress.lock().unwrap();
+        progress.running = false;
+        progress.current = total;
+        progress.series = String::new();
+        progress.errors = errors;
+        progress.message = if errors == 0 {
+            "completed".into()
+        } else {
+            format!("completed with {errors} error(s)")
+        };
+        tracing::info!(total, errors, "background rename-all finished");
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"ok":true,"total":total})),
+    )
+}
+
 async fn series_rename_apply(
     s: &AppState,
     name: &str,
@@ -10060,6 +10269,7 @@ mod tests {
             last_cycle: Arc::new(Mutex::new(CycleStats::default())),
             cycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             log_reload: Arc::new(Mutex::new(log_reload)),
+            rename_progress: Arc::new(Mutex::new(RenameProgress::default())),
             cfg,
             config_path,
         };

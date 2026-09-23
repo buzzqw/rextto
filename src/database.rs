@@ -2125,6 +2125,24 @@ impl Database {
         })
     }
 
+    /// Deletes specific "seen in feed" rows by id (targeted cleanup after a
+    /// preview). Returns `(movie rows, series rows)` removed.
+    pub fn prune_seen_by_ids(&self, movie_ids: &[i64], series_ids: &[i64]) -> Result<(usize, usize)> {
+        let mut movies = 0usize;
+        for id in movie_ids.iter().take(1000) {
+            movies += self
+                .conn
+                .execute("DELETE FROM movie_feed_seen WHERE id=?1", [id])?;
+        }
+        let mut series = 0usize;
+        for id in series_ids.iter().take(1000) {
+            series += self
+                .conn
+                .execute("DELETE FROM series_feed_seen WHERE id=?1", [id])?;
+        }
+        Ok((movies, series))
+    }
+
     pub fn prune_seen_older_than(&self, days: i64) -> Result<usize> {
         if days <= 0 {
             return Ok(0);
