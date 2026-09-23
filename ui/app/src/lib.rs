@@ -892,14 +892,6 @@ pub fn App() -> impl IntoView {
                                  <option value="it">{ctx_tr("Italiano")}</option>
                                  <option value="en">{ctx_tr("English")}</option>
                              </select>
-                             {move || {
-                                 let dry = data.get().status.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
-                                 if dry {
-                                     view! { <div class="mode-banner">{ctx_tr("DRY-RUN — solo test, nessun download: Rextto analizza i candidati ma non avvia alcun trasferimento. Abilita la modalità reale per scaricare.")}</div> }.into_any()
-                                 } else {
-                                     view! { <div class="mode-banner active">{ctx_tr("ATTIVO — download reali abilitati: Rextto scarica e archivia i contenuti selezionati.")}</div> }.into_any()
-                                 }
-                             }}
                              <button class="btn" title=move || tr(data, "Cambia tra tema chiaro e scuro") on:click=move |_| light.update(|value| *value = !*value)>{move || tr(data, if light.get() { "Tema scuro" } else { "Tema chiaro" })}</button>
                             <button class="btn" title=move || tr(data, "Ricarica i dati mostrati") on:click=move |_| reload()>{move || tr(data, "Aggiorna")}</button>
                             {move || {
