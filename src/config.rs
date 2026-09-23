@@ -35,6 +35,18 @@ pub struct MovieConfig {
     pub id: i64,
     pub name: String,
     pub year: String,
+    /// Identificativi e dati editoriali: non intervengono nei filtri o nello
+    /// stato del download e possono essere aggiornati dalla scelta TMDB/TVDB.
+    #[serde(default)]
+    pub tmdb_id: String,
+    #[serde(default)]
+    pub tvdb_id: String,
+    #[serde(default)]
+    pub original_title: String,
+    #[serde(default)]
+    pub overview: String,
+    #[serde(default)]
+    pub poster_path: String,
     pub quality: String,
     pub language: String,
     pub enabled: bool,
@@ -1144,14 +1156,19 @@ impl Config {
             }
         }
         let movie_query = if conn
+            .prepare("SELECT tmdb_id,tvdb_id,original_title,overview,poster_path FROM movies_config")
+            .is_ok()
+        {
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path FROM movies_config"
+        } else if conn
             .prepare("SELECT language_requirements,subtitle_requirements FROM movies_config")
             .is_ok()
         {
-            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,'','','','','' FROM movies_config"
         } else if conn.prepare("SELECT exclude FROM movies_config").is_ok() {
-            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,'','' FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,'','','','','','','' FROM movies_config"
         } else {
-            "SELECT id,name,year,quality,language,enabled,subtitle,'','','' FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,'','','','','','','','' FROM movies_config"
         };
         if let Ok(mut stmt) = conn.prepare(movie_query) {
             self.movies = stmt
@@ -1171,6 +1188,11 @@ impl Config {
                         subtitle_requirements: sanitize_subtitle_requirements(
                             &row.get::<_, String>(9).unwrap_or_default(),
                         ),
+                        tmdb_id: row.get(10).unwrap_or_default(),
+                        tvdb_id: row.get(11).unwrap_or_default(),
+                        original_title: row.get(12).unwrap_or_default(),
+                        overview: row.get(13).unwrap_or_default(),
+                        poster_path: row.get(14).unwrap_or_default(),
                     })
                 })?
                 .filter_map(Result::ok)
@@ -1675,7 +1697,7 @@ impl Config {
         movies: &[MovieConfig],
     ) -> Result<()> {
         let mut conn = open_config_db(&data_dir.join("rextto_config.db"))?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT '');")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', tvdb_id TEXT DEFAULT '', original_title TEXT DEFAULT '', overview TEXT DEFAULT '', poster_path TEXT DEFAULT '');")?;
         let _ = conn.execute(
             "ALTER TABLE movies_config ADD COLUMN exclude TEXT NOT NULL DEFAULT ''",
             [],
@@ -1688,6 +1710,15 @@ impl Config {
             "ALTER TABLE movies_config ADD COLUMN subtitle_requirements TEXT NOT NULL DEFAULT ''",
             [],
         );
+        for column in [
+            "tmdb_id TEXT NOT NULL DEFAULT ''",
+            "tvdb_id TEXT NOT NULL DEFAULT ''",
+            "original_title TEXT NOT NULL DEFAULT ''",
+            "overview TEXT NOT NULL DEFAULT ''",
+            "poster_path TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE movies_config ADD COLUMN {column}"), []);
+        }
         // Conserva gli id esistenti anche quando il client invia `id: 0`
         // (film aggiunti di recente), abbinando per nome+anno. Evita di
         // riassegnare un id nuovo ad ogni salvataggio e i conseguenti dettagli
@@ -1720,9 +1751,9 @@ impl Config {
                     .unwrap_or(0)
             };
             if id > 0 {
-                tx.execute("INSERT INTO movies_config(id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", rusqlite::params![id, movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements])?;
+                tx.execute("INSERT INTO movies_config(id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", rusqlite::params![id, movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path])?;
             } else {
-                tx.execute("INSERT INTO movies_config(name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", rusqlite::params![movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements])?;
+                tx.execute("INSERT INTO movies_config(name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", rusqlite::params![movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path])?;
             }
         }
         tx.commit()?;
@@ -2141,6 +2172,39 @@ mod tests {
         cfg.load_config_db().unwrap();
         assert_eq!(cfg.series[0].name, "Example");
         assert_eq!(cfg.movies[0].name, "Example Movie");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saves_and_reloads_movie_static_metadata() {
+        let dir = std::env::temp_dir().join(format!("rextto-movie-meta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let movies = vec![MovieConfig {
+            name: "Titolo Italiano".into(),
+            year: "2024".into(),
+            tmdb_id: "12345".into(),
+            original_title: "Original Title".into(),
+            overview: "Trama del film.".into(),
+            poster_path: "/poster.jpg".into(),
+            quality: "1080p".into(),
+            language: "ita".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        Config::save_library(&dir, &[], &movies).unwrap();
+        let mut cfg = Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        };
+        cfg.load_config_db().unwrap();
+        let movie = &cfg.movies[0];
+        assert_eq!(movie.tmdb_id, "12345");
+        assert_eq!(movie.original_title, "Original Title");
+        assert_eq!(movie.overview, "Trama del film.");
+        assert_eq!(movie.poster_path, "/poster.jpg");
+        // I dati di download restano separati e invariati.
+        assert_eq!(movie.quality, "1080p");
+        assert_eq!(movie.language, "ita");
         let _ = std::fs::remove_dir_all(dir);
     }
 

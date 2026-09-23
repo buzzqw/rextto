@@ -37,6 +37,9 @@ dist/
 *.swp
 *~
 
+# Local engineering notes (may contain runtime observations and host details)
+/.rextto-work-notes.md
+
 # Extra safety: never commit key material even if renamed
 *apikey*
 *api_key*

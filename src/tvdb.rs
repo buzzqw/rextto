@@ -117,6 +117,67 @@ impl TvdbClient {
             .collect())
     }
 
+    /// Ricerca film TVDB, normalizzata nello stesso formato compatto usato per
+    /// le serie. È usata soltanto dalla scelta esplicita dei metadati film.
+    pub async fn search_movies(&self, query: &str) -> Result<Vec<Value>> {
+        let token = self.token().await?;
+        let response = self
+            .client
+            .get(format!("{API}/search"))
+            .query(&[("query", query), ("type", "movie")])
+            .header("Accept-Language", &self.language)
+            .bearer_auth(token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("TVDB movie search HTTP {}", response.status());
+        }
+        let value: Value = response.json().await?;
+        Ok(value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.get("tvdb_id").or_else(|| item.get("movie_id")).or_else(|| item.get("objectID")),
+                    "title": item.get("name"),
+                    "original_title": item.get("originalName"),
+                    "release_date": item.get("year"),
+                    "overview": item.get("overview"),
+                    "poster_path": item.get("image_url").or_else(|| item.get("thumbnail")),
+                })
+            })
+            .collect())
+    }
+
+    /// Dati editoriali di un film TVDB selezionato. Il payload resta JSON per
+    /// tollerare i campi opzionali/variabili dell'API v4.
+    pub async fn movie_details(&self, id: &str) -> Result<Value> {
+        let id = id
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("invalid TVDB movie id"))?;
+        let token = self.token().await?;
+        let response = self
+            .client
+            .get(format!("{API}/movies/{id}/extended"))
+            .header("Accept-Language", &self.language)
+            .bearer_auth(token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("TVDB movie details HTTP {}", response.status());
+        }
+        Ok(response
+            .json::<Value>()
+            .await?
+            .get("data")
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Main characters/actors as `{name, tvdb_id}` (TVDB people id).
     pub async fn series_characters(&self, id: i64) -> Result<Vec<Value>> {
         let token = self.token().await?;

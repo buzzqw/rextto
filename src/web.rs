@@ -225,6 +225,7 @@ pub struct SeenQuery {
 pub struct HistoryQuery {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    pub q: Option<String>,
 }
 #[derive(serde::Deserialize)]
 pub struct LogQuery {
@@ -448,6 +449,21 @@ pub struct MovieUpdateInput {
     pub subtitle_requirements: String,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+#[derive(serde::Deserialize)]
+pub struct MovieMetadataSearchInput {
+    pub query: String,
+    #[serde(default = "default_metadata_source")]
+    pub source: String,
+}
+#[derive(serde::Deserialize)]
+pub struct MovieMetadataApplyInput {
+    pub id: String,
+    #[serde(default = "default_metadata_source")]
+    pub source: String,
+}
+fn default_metadata_source() -> String {
+    "tmdb".to_string()
 }
 #[derive(serde::Deserialize, Default)]
 pub struct PruneInput {
@@ -691,6 +707,11 @@ pub fn router(state: AppState) -> Router {
             "/api/movies/{id}",
             get(movie_detail).post(update_movie).delete(delete_movie),
         )
+        .route(
+            "/api/movies/{id}/metadata/search",
+            post(movie_metadata_search),
+        )
+        .route("/api/movies/{id}/metadata", post(apply_movie_metadata))
         .route("/api/movies/{id}/redownload", post(redownload_movie))
         .route("/api/movies/{id}/search", post(movie_search))
         .route(
@@ -1525,16 +1546,38 @@ async fn save_tag_dir_rules(
 }
 async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
-    let summaries = s.db.lock().unwrap().series_summaries().unwrap_or_default();
+    let db = s.db.lock().unwrap();
     let series = cfg
         .series
         .iter()
         .map(|series| {
-            let (total, downloaded, last) = summaries
+            // Usa lo stesso insieme di episodi del dettaglio: include le
+            // puntate TMDB note ma non ancora materializzate nella tabella
+            // downloads. Il vecchio COUNT(episodes) mostrava falsi 140/140
+            // mentre il dettaglio, correttamente, riportava 140/143.
+            let mut ignored_seasons = series.ignored_seasons.clone();
+            for (season, _) in db.series_season_counts(&series.name).unwrap_or_default() {
+                if !Config::season_allowed_for_scan(&series.seasons, season)
+                    && !ignored_seasons.contains(&season)
+                {
+                    ignored_seasons.push(season);
+                }
+            }
+            let episodes = db
+                .episodes_for_series(&series.name, &ignored_seasons)
+                .unwrap_or_default();
+            let total = episodes.len() as i64;
+            let downloaded = episodes
                 .iter()
-                .find(|(name, _, _, _)| name == &series.name)
-                .map(|(_, total, downloaded, last)| (*total, *downloaded, last.clone()))
-                .unwrap_or((0, 0, None));
+                .filter(|episode| {
+                    episode.status == "downloaded"
+                        || episode.archive_path.as_deref().is_some_and(|path| !path.is_empty())
+                })
+                .count() as i64;
+            let last = episodes
+                .iter()
+                .filter_map(|episode| episode.downloaded_at.clone())
+                .max();
             serde_json::json!({
                 "name": series.name,
                 "seasons": series.seasons,
@@ -1659,12 +1702,19 @@ async fn series_detail(State(s): State<AppState>, Path(name): Path<String>) -> i
             Json(serde_json::json!({"ok":false,"error":"series not found"})),
         );
     };
-    let episodes = match s
-        .db
-        .lock()
-        .unwrap()
-        .episodes_for_series(&series.name, &series.ignored_seasons)
-    {
+    let db = s.db.lock().unwrap();
+    // `ignored_seasons` gestisce i toggle espliciti; il campo `seasons`
+    // (es. `8+`, `1-3,5`) è un secondo vincolo e deve dare la stessa vista
+    // nel dettaglio, nei gap e nella ricerca manuale.
+    let mut ignored_seasons = series.ignored_seasons.clone();
+    for (season, _) in db.series_season_counts(&series.name).unwrap_or_default() {
+        if !Config::season_allowed_for_scan(&series.seasons, season)
+            && !ignored_seasons.contains(&season)
+        {
+            ignored_seasons.push(season);
+        }
+    }
+    let episodes = match db.episodes_for_series(&series.name, &ignored_seasons) {
         Ok(items) => items,
         Err(error) => {
             return (
@@ -1674,19 +1724,19 @@ async fn series_detail(State(s): State<AppState>, Path(name): Path<String>) -> i
         }
     };
     let gaps =
-        s.db.lock()
-            .unwrap()
+        db
             .archive_gaps()
             .unwrap_or_default()
             .into_iter()
             .filter(|(series_name, season, _)| {
-                series_name == &series.name && !series.ignored_seasons.contains(season)
+                series_name == &series.name
+                    && !ignored_seasons.contains(season)
+                    && Config::season_allowed_for_scan(&series.seasons, *season)
             })
             .map(|(_, season, episode)| serde_json::json!({"season":season,"episode":episode}))
             .collect::<Vec<_>>();
     let metadata =
-        s.db.lock()
-            .unwrap()
+        db
             .series_season_counts(&series.name)
             .unwrap_or_default()
             .into_iter()
@@ -1788,6 +1838,14 @@ async fn series_search_missing(
         .unarchived_episodes_for_series(&series.name, &series.ignored_seasons)
         .unwrap_or_default()
         .into_iter()
+        // La ricerca manuale deve rispettare anche l'intervallo delle stagioni
+        // monitorate (es. `8+`), oltre alle stagioni esplicitamente ignorate.
+        // Prima questo filtro era applicato dal ciclo automatico ma non dal
+        // pulsante UI "Cerca mancanti".
+        .filter(|(season, _)| {
+            !series.ignored_seasons.contains(season)
+                && Config::season_allowed_for_scan(&series.seasons, *season)
+        })
         // Come il flusso legacy, cerca una porzione significativa della serie
         // senza trasformare una singola azione UI in centinaia di query.
         .take(15)
@@ -1811,7 +1869,7 @@ async fn series_search_missing(
             episode_results
                 .push(serde_json::json!({"release":release,"origin":"Indexer / web"}));
         }
-        for mut result in finalize_episode_search_results(episode_results, &cfg) {
+        for mut result in finalize_episode_search_results(episode_results, &cfg, &series) {
             result["season"] = serde_json::json!(season);
             result["episode"] = serde_json::json!(episode);
             results.push(result);
@@ -1908,7 +1966,29 @@ async fn series_metadata_refresh(
             )
         }
     };
-    let values = counts.into_iter().collect::<Vec<(i64, i64)>>();
+    let mut values = counts.into_iter().collect::<Vec<(i64, i64)>>();
+    values.sort_unstable_by_key(|(season, _)| *season);
+    // Le date sono recuperate solo nel refresh metadati e poi restano nella DB:
+    // l'apertura del dettaglio serie è quindi interamente locale.
+    let mut air_dates = Vec::new();
+    let mut air_date_errors = 0usize;
+    for (season, _) in values.iter().copied().filter(|(season, _)| *season > 0) {
+        match tmdb.season_episodes(&resolved, season).await {
+            Ok(episodes) => air_dates.extend(episodes.into_iter().filter_map(|episode| {
+                let episode_season = episode.season_number.unwrap_or(season);
+                let episode_number = episode.episode_number?;
+                (episode_season == season).then_some((
+                    season,
+                    episode_number,
+                    episode.air_date.unwrap_or_default(),
+                ))
+            })),
+            Err(error) => {
+                air_date_errors += 1;
+                tracing::warn!(series=%series.name, season, %error, "TMDB season air-date refresh failed");
+            }
+        }
+    }
     if let Err(error) =
         s.db.lock()
             .unwrap()
@@ -1931,13 +2011,26 @@ async fn series_metadata_refresh(
             let _ = Config::save_library(&s.cfg.data_dir, &cfg.series, &cfg.movies);
         }
     }
+    if let Err(error) = s
+        .db
+        .lock()
+        .unwrap()
+        .save_episode_air_dates(&series.name, &air_dates)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "series": series.name,
-            "tmdb_id": resolved,
-            "tmdb_id_stored": stored,
+                "tmdb_id": resolved,
+                "tmdb_id_stored": stored,
+                "air_dates_updated": air_dates.len(),
+                "air_date_errors": air_date_errors,
             "seasons": values.iter().map(|(season, count)| serde_json::json!({"season": season, "episodes": count})).collect::<Vec<_>>(),
         })),
     )
@@ -2065,6 +2158,8 @@ async fn series_info(State(s): State<AppState>, Path(name): Path<String>) -> imp
                     "status": value.get("status"),
                     "country": country,
                     "last_air_date": last_air_date,
+                    "last_episode": value.get("last_episode_to_air"),
+                    "next_episode": value.get("next_episode_to_air"),
                     "tmdb_id": value.get("id"),
                     "tvdb_id": series.tvdb_id.clone(),
                     "tvdb_url": tvdb_url,
@@ -2685,30 +2780,256 @@ async fn movie_detail(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
         .take(20)
         .map(|(title, magnet, source)| serde_json::json!({"title":title,"magnet":magnet,"source":source}))
         .collect::<Vec<_>>();
+    // I dati scelti nella modale sono persistenti e non dipendono da una nuova
+    // ricerca ogni volta che si apre il dettaglio. Per le vecchie voci senza
+    // cache manteniamo il fallback TMDB esistente.
+    let stored_metadata = serde_json::json!({
+        "id": movie.tmdb_id.parse::<i64>().ok(),
+        "title": movie.name,
+        "original_title": movie.original_title,
+        "overview": movie.overview,
+        "poster_path": movie.poster_path,
+        "release_date": movie.year,
+        "source": if movie.tvdb_id.is_empty() { "tmdb" } else { "tvdb" },
+    });
+    let has_stored_metadata = !movie.tmdb_id.is_empty()
+        || !movie.tvdb_id.is_empty()
+        || !movie.overview.is_empty()
+        || !movie.poster_path.is_empty();
     let (metadata, cast) = match cfg.tmdb_api_key.clone() {
         Some(key) => {
             let tmdb = TmdbClient::with_language(Some(key), cfg.tmdb_language());
-            let metadata = tmdb
-                .search_movie(&movie.name, movie.year.parse().ok())
-                .await
+            let metadata = if has_stored_metadata {
+                stored_metadata
+            } else {
+                tmdb.search_movie(&movie.name, movie.year.parse().ok())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|item| serde_json::to_value(item).ok())
+                    .unwrap_or_default()
+            };
+            let tmdb_id = movie
+                .tmdb_id
+                .parse::<i64>()
                 .ok()
-                .flatten();
-            let cast = match &metadata {
-                Some(item) => tmdb
-                    .movie_credits(&item.id.to_string())
+                .or_else(|| metadata.get("id").and_then(serde_json::Value::as_i64));
+            let cast = match tmdb_id {
+                Some(tmdb_id) => tmdb
+                    .movie_credits(&tmdb_id.to_string())
                     .await
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
             (metadata, cast)
         }
-        None => (None, Vec::new()),
+        None => (stored_metadata, Vec::new()),
     };
     (
         StatusCode::OK,
         Json(
             serde_json::json!({"ok":true,"movie":movie,"history":history,"metadata":metadata,"cast":cast,"matches":matches}),
         ),
+    )
+}
+
+async fn movie_metadata_search(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<MovieMetadataSearchInput>,
+) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    if !cfg.movies.iter().any(|movie| movie.id == id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"movie not found"})),
+        );
+    }
+    let query = input.query.trim();
+    if query.is_empty() || query.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"query must contain 1-256 characters"})),
+        );
+    }
+    let source = input.source.trim().to_ascii_lowercase();
+    let result = if source == "tvdb" {
+        let tvdb = crate::tvdb::TvdbClient::with_language(cfg.tvdb_api_key(), cfg.tvdb_language());
+        if !tvdb.configured() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"TVDB API key is not configured"})),
+            );
+        }
+        tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, tvdb.search_movies(query)).await
+    } else if source == "tmdb" {
+        let Some(key) = cfg.tmdb_api_key.clone() else {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"TMDB API key is not configured"})),
+            );
+        };
+        let tmdb = TmdbClient::with_language(Some(key), cfg.tmdb_language());
+        tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, tmdb.search_movies(query)).await
+            .map(|result| result.map(|items| items.into_iter().filter_map(|item| serde_json::to_value(item).ok()).collect()))
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"unsupported metadata source"})),
+        );
+    };
+    match result {
+        Ok(Ok(items)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"source":source,"items":items})),
+        ),
+        Ok(Err(error)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({"ok":false,"error":"metadata provider timed out"})),
+        ),
+    }
+}
+
+async fn apply_movie_metadata(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<MovieMetadataApplyInput>,
+) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    let Some(current) = cfg.movies.iter().find(|movie| movie.id == id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"movie not found"})),
+        );
+    };
+    let source = input.source.trim().to_ascii_lowercase();
+    let external_id = input.id.trim();
+    if external_id.is_empty() || external_id.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"invalid metadata id"})),
+        );
+    }
+    let details = if source == "tmdb" {
+        let Some(key) = cfg.tmdb_api_key.clone() else {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"TMDB API key is not configured"})),
+            );
+        };
+        let tmdb = TmdbClient::with_language(Some(key), cfg.tmdb_language());
+        match tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, tmdb.movie_details(external_id)).await {
+            Ok(Ok(item)) => serde_json::json!({
+                "title": item.title,
+                "original_title": item.original_title,
+                "overview": item.overview,
+                "poster_path": item.poster_path,
+                "release_date": item.release_date,
+            }),
+            Ok(Err(error)) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"ok":false,"error":error.to_string()}))),
+            Err(_) => return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"ok":false,"error":"TMDB timed out"}))),
+        }
+    } else if source == "tvdb" {
+        let tvdb = crate::tvdb::TvdbClient::with_language(cfg.tvdb_api_key(), cfg.tvdb_language());
+        if !tvdb.configured() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"TVDB API key is not configured"})),
+            );
+        }
+        match tokio::time::timeout(EXTERNAL_SEARCH_TIMEOUT, tvdb.movie_details(external_id)).await {
+            Ok(Ok(item)) => serde_json::json!({
+                "title": item.get("name"),
+                "original_title": item.get("originalName"),
+                "overview": item.get("overview"),
+                "poster_path": item.get("image").or_else(|| item.get("image_url")),
+                "release_date": item.get("year"),
+            }),
+            Ok(Err(error)) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"ok":false,"error":error.to_string()}))),
+            Err(_) => return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"ok":false,"error":"TVDB timed out"}))),
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"unsupported metadata source"})),
+        );
+    };
+    let title = details
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&current.name)
+        .to_string();
+    let date = details
+        .get("release_date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let metadata_year = date
+        .get(..4)
+        .filter(|value| value.chars().all(|value| value.is_ascii_digit()))
+        .unwrap_or_default();
+    let year = if metadata_year.is_empty() {
+        current.year.clone()
+    } else {
+        metadata_year.to_string()
+    };
+    let mut updated = latest_config(&s);
+    let Some(movie) = updated.movies.iter_mut().find(|movie| movie.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"movie not found"})),
+        );
+    };
+    movie.name = title.clone();
+    movie.year = year.clone();
+    movie.original_title = details
+        .get("original_title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    movie.overview = details
+        .get("overview")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    movie.poster_path = details
+        .get("poster_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if source == "tmdb" {
+        movie.tmdb_id = external_id.to_string();
+        movie.tvdb_id.clear();
+    } else {
+        movie.tvdb_id = external_id.to_string();
+        movie.tmdb_id.clear();
+    }
+    if let Err(error) = Config::save_library(&s.cfg.data_dir, &updated.series, &updated.movies) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        );
+    }
+    if let Err(error) = s.db.lock().unwrap().rename_movie_identity(
+        &current.name,
+        &current.year,
+        &title,
+        &year,
+    ) {
+        tracing::error!(%error, movie_id=id, "movie metadata saved but download identity update failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":"metadata saved, but could not preserve download history"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"movie": updated.movies.into_iter().find(|movie| movie.id == id)})),
     )
 }
 async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
@@ -4820,10 +5141,15 @@ async fn last_cycle(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"ok":true,"cycle":*s.last_cycle.lock().unwrap()}))
 }
 async fn gaps(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.lock().unwrap().archive_gaps() {
+    let db = s.db.lock().unwrap();
+    match db.archive_gaps() {
         Ok(items) => {
             let cfg = latest_config(&s);
-            let items = items.into_iter().filter(|(series, season, _)| cfg.find_series_match(series, Some(*season)).is_some()).map(|(series, season, episode)| serde_json::json!({"series":series,"season":season,"episode":episode})).collect::<Vec<_>>();
+            let air_dates = db.episode_air_dates().unwrap_or_default();
+            let items = items.into_iter().filter(|(series, season, _)| cfg.find_series_match(series, Some(*season)).is_some()).map(|(series, season, episode)| {
+                let air_date = air_dates.get(&(series.clone(), season, episode)).cloned().unwrap_or_default();
+                serde_json::json!({"series":series,"season":season,"episode":episode,"air_date":air_date})
+            }).collect::<Vec<_>>();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok":true,"count":items.len(),"items":items})),
@@ -5118,6 +5444,14 @@ async fn search_episode(
             Json(serde_json::json!({"ok":false,"error":"series not found"})),
         );
     };
+    if series.ignored_seasons.contains(&season)
+        || !Config::season_allowed_for_scan(&series.seasons, season)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"ok":false,"error":"season is not monitored"})),
+        );
+    }
     let query = format!("{} S{season:02}E{episode:02}", series.name);
     let results = search_series_episode_sources(
         &s,
@@ -5163,7 +5497,7 @@ async fn search_series_episode_sources(
             results.push(serde_json::json!({"release":release,"origin":"Indexer / web"}));
         }
     }
-    finalize_episode_search_results(results, cfg)
+    finalize_episode_search_results(results, cfg, series)
 }
 
 fn release_matches_series_episode(
@@ -5233,7 +5567,21 @@ fn stored_series_episode_sources(
 fn finalize_episode_search_results(
     mut results: Vec<serde_json::Value>,
     cfg: &Config,
+    series: &SeriesConfig,
 ) -> Vec<serde_json::Value> {
+    // I risultati manuali devono superare gli stessi filtri applicati al click
+    // su "Accoda". Senza questo passaggio la UI mostrava, come "compatibili",
+    // release con qualità/lingua/esclusioni non ammesse e il click falliva solo
+    // dopo con un messaggio generico.
+    results.retain(|result| {
+        result
+            .get("release")
+            .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
+            .is_some_and(|release| {
+                cfg.release_allowed(&release)
+                    && Config::series_release_allowed(series, &release.quality, &release.title)
+            })
+    });
     let mut seen = HashSet::new();
     results.retain(|result| {
         result
@@ -5290,13 +5638,28 @@ async fn search_missing(
             Json(serde_json::json!({"ok":false,"error":"invalid missing episode"})),
         );
     }
+    let cfg = latest_config(&s);
+    let Some(series) = find_series(&cfg, &input.series).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"series not found"})),
+        );
+    };
+    if series.ignored_seasons.contains(&input.season)
+        || !Config::season_allowed_for_scan(&series.seasons, input.season)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"ok":false,"error":"season is not monitored"})),
+        );
+    }
     let query = format!(
         "{} S{:02}E{:02}",
         input.series.trim(),
         input.season,
         input.episode
     );
-    let mut results = s.engine.search_query_manual(&s.cfg, &query).await;
+    let mut results = s.engine.search_query_manual(&cfg, &query).await;
     for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default() {
         if let Some(release) =
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))
@@ -5306,7 +5669,10 @@ async fn search_missing(
     }
     let mut seen = HashSet::new();
     results.retain(|release| {
-        crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
+        release_matches_series_episode(release, &series, input.season, input.episode)
+            && cfg.release_allowed(release)
+            && Config::series_release_allowed(&series, &release.quality, &release.title)
+            && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
         std::cmp::Reverse(release.quality.score_with_settings(&s.cfg.settings))
@@ -6457,7 +6823,8 @@ async fn torrent_history(
     let limit = query.limit.unwrap_or(10).clamp(1, 200);
     let page = query.page.unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
-    match s.db.lock().unwrap().completed_torrents(offset, limit) {
+    let query = query.q.unwrap_or_default();
+    match s.db.lock().unwrap().completed_torrents(offset, limit, &query) {
         Ok((items, total)) => {
             let pages = ((total as usize + limit - 1) / limit).max(1);
             (
@@ -7348,6 +7715,11 @@ async fn tmdb_add(State(s): State<AppState>, Json(input): Json<TmdbAddInput>) ->
             id: 0,
             name: input.name.trim().into(),
             year: input.year.trim().into(),
+            tmdb_id: input.tmdb_id.trim().into(),
+            tvdb_id: String::new(),
+            original_title: String::new(),
+            overview: String::new(),
+            poster_path: String::new(),
             quality: input.quality.trim().into(),
             language: if input.language.trim().is_empty() {
                 "ita".into()

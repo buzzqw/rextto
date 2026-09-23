@@ -160,6 +160,9 @@ pub struct EpisodeView {
     pub season: i64,
     pub episode: i64,
     pub title: String,
+    /// Data di messa in onda/pianificata, memorizzata dalla sincronizzazione
+    /// TMDB per non interrogare il provider a ogni apertura del dettaglio.
+    pub air_date: String,
     /// Nome del file rinominato in libreria (da `archive_path`), vuoto quando il
     /// file non è ancora archiviato o il percorso è una cartella.
     pub renamed_title: String,
@@ -293,7 +296,7 @@ impl Database {
             }
         }
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, seasons TEXT DEFAULT '1+', quality TEXT DEFAULT '', language TEXT DEFAULT 'ita', enabled INTEGER DEFAULT 1, archive_path TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', aliases TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY, series_id INTEGER NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, title TEXT, quality_score INTEGER NOT NULL DEFAULT 0, is_repack INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, archive_path TEXT, size_bytes INTEGER DEFAULT 0, original_title TEXT, rename_verified INTEGER DEFAULT 0, UNIQUE(series_id, season, episode)); CREATE TABLE IF NOT EXISTS movies (id INTEGER PRIMARY KEY, name TEXT, year INTEGER, title TEXT, quality_score INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, size_bytes INTEGER DEFAULT 0, removed_at TEXT); CREATE TABLE IF NOT EXISTS pending_downloads (id INTEGER PRIMARY KEY, series_id INTEGER, season INTEGER, episode INTEGER, best_magnet TEXT, best_quality_score INTEGER, ready_at TEXT); CREATE TABLE IF NOT EXISTS cycle_history (id INTEGER PRIMARY KEY, at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS torrent_meta (hash TEXT PRIMARY KEY, tag TEXT DEFAULT '', source TEXT DEFAULT '', ui_state TEXT DEFAULT '', progress REAL DEFAULT 0, paused INTEGER DEFAULT 0, total_size INTEGER DEFAULT 0, downloaded INTEGER DEFAULT 0, name TEXT DEFAULT '', kind TEXT DEFAULT '', title TEXT DEFAULT '', series_name TEXT DEFAULT '', season INTEGER, episode INTEGER, year INTEGER, quality_score INTEGER DEFAULT 0, metadata_json TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', completed_at TEXT, processed_path TEXT, error TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_episodes_lookup ON episodes(series_id, season, episode); CREATE INDEX IF NOT EXISTS idx_episodes_magnet ON episodes(magnet_hash); CREATE INDEX IF NOT EXISTS idx_episodes_downloaded ON episodes(downloaded_at); CREATE INDEX IF NOT EXISTS idx_movies_magnet ON movies(magnet_hash); CREATE INDEX IF NOT EXISTS idx_movies_removed ON movies(removed_at); CREATE INDEX IF NOT EXISTS idx_torrent_meta_status ON torrent_meta(status); INSERT INTO schema_meta(key,value,updated_at) VALUES ('schema_version','2',datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at;")?;
-        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS gap_search_log (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, last_searched_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS series_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode_count INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season)); CREATE TABLE IF NOT EXISTS ignored_episodes (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS upgrade_backup (new_hash TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS gap_search_log (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, last_searched_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS series_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode_count INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season)); CREATE TABLE IF NOT EXISTS episode_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, air_date TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS ignored_episodes (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS upgrade_backup (new_hash TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS blocklist (magnet_hash TEXT PRIMARY KEY, title TEXT DEFAULT '', reason TEXT DEFAULT '', created_at TEXT NOT NULL);")?;
         // Identità della release bloccata (come il legacy `download_blocklist`):
         // hash + serie/stagione/episodio o film/anno, per audit e UI.
@@ -1032,6 +1035,27 @@ impl Database {
         Ok(gaps)
     }
 
+    /// Date cache per la vista globale dei mancanti. La chiave include la
+    /// serie perché gli episodi non sono univoci fra titoli diversi.
+    pub fn episode_air_dates(&self) -> Result<std::collections::HashMap<(String, i64, i64), String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT series_name,season,episode,air_date FROM episode_metadata",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ),
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
     /// Episodi attesi di una serie che non hanno ancora un percorso di archivio.
     /// È il criterio del pulsante manuale “Cerca mancanti”: una puntata ancora
     /// nel client può avere alternative nei feed, ma una puntata sul NAS no.
@@ -1113,14 +1137,28 @@ impl Database {
                 ignored_seasons.push(*season);
             }
         }
+        let air_dates = {
+            let mut statement = self.conn.prepare(
+                "SELECT season,episode,air_date FROM episode_metadata WHERE series_name=?1",
+            )?;
+            let rows = statement
+                .query_map([series_name], |row| {
+                    Ok(((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?), row.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+            rows
+        };
         let mut statement = self.conn.prepare("SELECT e.id,s.name,e.season,e.episode,COALESCE(e.title,''),e.quality_score,e.downloaded_at,e.archive_path,COALESCE(e.size_bytes,0),e.magnet_hash,e.magnet_link,CASE WHEN e.downloaded_at IS NOT NULL THEN 'downloaded' ELSE COALESCE(t.status,'missing') END,COALESCE(t.error,''),EXISTS(SELECT 1 FROM ignored_episodes i WHERE i.series_name=s.name AND i.season=e.season AND i.episode=e.episode) FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN torrent_meta t ON lower(t.hash)=lower(e.magnet_hash) WHERE s.name=?1 AND e.episode > 0 ORDER BY e.season,e.episode")?;
         let rows = statement.query_map([series_name], |row| {
+            let season = row.get::<_, i64>(2)?;
+            let episode = row.get::<_, i64>(3)?;
             Ok(EpisodeView {
                 id: row.get(0)?,
                 series_name: row.get(1)?,
-                season: row.get(2)?,
-                episode: row.get(3)?,
+                season,
+                episode,
                 title: row.get(4)?,
+                air_date: air_dates.get(&(season, episode)).cloned().unwrap_or_default(),
                 renamed_title: String::new(),
                 quality_score: row.get(5)?,
                 downloaded_at: row.get(6)?,
@@ -1160,6 +1198,7 @@ impl Database {
                     season,
                     episode,
                     title: String::new(),
+                    air_date: air_dates.get(&(season, episode)).cloned().unwrap_or_default(),
                     renamed_title: String::new(),
                     quality_score: 0,
                     downloaded_at: None,
@@ -1308,6 +1347,29 @@ impl Database {
             .filter(|(season, count)| *season > 0 && *count > 0)
         {
             tx.execute("INSERT INTO series_metadata(series_name,season,episode_count,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(series_name,season) DO UPDATE SET episode_count=excluded.episode_count,updated_at=excluded.updated_at", params![series_name, season, episode_count, Utc::now().to_rfc3339()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Cache persistente delle date TMDB. È distinta dalla tabella degli
+    /// episodi scaricati, perché una puntata futura/mancante deve poter
+    /// mostrare la data anche prima che esista una riga di download.
+    pub fn save_episode_air_dates(
+        &self,
+        series_name: &str,
+        episodes: &[(i64, i64, String)],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        for (season, episode, air_date) in episodes {
+            if *season < 1 || *episode < 1 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO episode_metadata(series_name,season,episode,air_date,updated_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(series_name,season,episode) DO UPDATE SET air_date=excluded.air_date,updated_at=excluded.updated_at",
+                params![series_name, season, episode, air_date, now],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1661,14 +1723,32 @@ impl Database {
         &self,
         offset: usize,
         limit: usize,
+        query: &str,
     ) -> Result<(Vec<StoredTorrent>, i64)> {
-        const WHERE: &str = "FROM torrent_meta
+        let mut where_clause = String::from("FROM torrent_meta
              WHERE removed_at IS NOT NULL
                AND (status IN ('completed','error') OR COALESCE(progress,0) >= 1)
-               AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''";
+                AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''");
+        // Ricerca intelligente: ogni parola deve comparire in almeno uno dei
+        // campi utili dello storico, così `silo nas` trova anche titoli con
+        // parole separate fra nome e cartella, senza scaricare tutte le pagine.
+        let terms = query
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .take(8)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for _ in &terms {
+            where_clause.push_str(" AND lower(COALESCE(name,'') || ' ' || COALESCE(title,'') || ' ' || COALESCE(series_name,'') || ' ' || COALESCE(tag,'') || ' ' || COALESCE(kind,'') || ' ' || COALESCE(status,'') || ' ' || COALESCE(processed_path,'')) LIKE '%' || lower(?) || '%'");
+        }
         let total: i64 = self
             .conn
-            .query_row(&format!("SELECT COUNT(*) {WHERE}"), [], |row| row.get(0))?;
+            .query_row(
+                &format!("SELECT COUNT(*) {where_clause}"),
+                params_from_iter(terms.iter()),
+                |row| row.get(0),
+            )?;
         let mut statement = self.conn.prepare(&format!(
             "SELECT hash,
                     COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,''),hash),
@@ -1676,13 +1756,13 @@ impl Database {
                     COALESCE(total_size,0),COALESCE(downloaded,0),COALESCE(status,'queued'),COALESCE(updated_at,''),
                     COALESCE(kind,''),COALESCE(series_name,''),COALESCE(season,0),COALESCE(episode,0),
                     COALESCE(year,0),COALESCE(quality_score,0),COALESCE(completed_at,''),COALESCE(processed_path,''),COALESCE(error,''),COALESCE(reason,'')
-             {WHERE}
-             ORDER BY COALESCE(NULLIF(removed_at,''), NULLIF(completed_at,''), updated_at) DESC LIMIT ?1 OFFSET ?2"
+              {where_clause}
+              ORDER BY COALESCE(NULLIF(removed_at,''), NULLIF(completed_at,''), updated_at) DESC LIMIT ? OFFSET ?"
         ))?;
-        let rows = statement.query_map(
-            [limit.clamp(1, 2000) as i64, offset as i64],
-            stored_torrent_from_row,
-        )?;
+        let mut values = terms;
+        values.push(limit.clamp(1, 2000).to_string());
+        values.push(offset.to_string());
+        let rows = statement.query_map(params_from_iter(values.iter()), stored_torrent_from_row)?;
         Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
     }
 
@@ -2347,6 +2427,25 @@ impl Database {
             [name],
         )?;
         Ok(reset)
+    }
+
+    /// La configurazione film usa un id stabile, mentre lo storico dei file
+    /// usa ancora nome+anno. Quando l'utente corregge il metadata tramite
+    /// TMDB/TVDB, aggiorna quell'identità senza toccare hash, qualità, date o
+    /// stato di download.
+    pub fn rename_movie_identity(
+        &self,
+        old_name: &str,
+        old_year: &str,
+        new_name: &str,
+        new_year: &str,
+    ) -> Result<usize> {
+        let old_year = old_year.trim().parse::<i64>().ok();
+        let new_year = new_year.trim().parse::<i64>().ok();
+        Ok(self.conn.execute(
+            "UPDATE movies SET name=?1, year=?2 WHERE name=?3 AND year IS ?4",
+            params![new_name, new_year, old_name, old_year],
+        )?)
     }
 
     /// Registra nel "visto nei feed" tutte le release di un ciclo, in un'unica
@@ -3587,6 +3686,151 @@ mod tests {
         assert_eq!(score(1), 1700, "1080p h265 base 1200 + 500");
         assert_eq!(score(2), 1900, "1080p webdl h265 1400 + 500");
         assert_eq!(score(3), 500, "senza qualità non va toccato");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn history_search_filters_across_name_tag_and_path() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-history-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let insert = |hash: &str, name: &str, tag: &str, path: &str| {
+            db.conn
+                .execute(
+                    "INSERT INTO torrent_meta(hash,name,tag,status,removed_at,progress,processed_path,updated_at) VALUES (?1,?2,?3,'completed',datetime('now'),1,?4,datetime('now'))",
+                    params![hash, name, tag, path],
+                )
+                .unwrap();
+        };
+        insert("aaaa", "Silo.S01E01.1080p", "nas", "/media/Silo/S01E01.mkv");
+        insert("bbbb", "Altro.Film.2024", "temp", "/tmp/altro.mkv");
+        insert("cccc", "Silo.S01E02.2160p", "nas", "/media/Silo/S01E02.mkv");
+
+        let search = |query: &str| db.completed_torrents(0, 10, query).unwrap();
+        // Una parola cerca in tutti i campi utili.
+        assert_eq!(search("silo").1, 2);
+        // Più parole devono comparire tutte (ricerca intelligente).
+        assert_eq!(search("silo nas").1, 2);
+        assert_eq!(search("silo temp").1, 0);
+        // Anche tag e percorso sono indicizzati.
+        assert_eq!(search("nas").1, 2);
+        assert_eq!(search("/tmp/altro").1, 1);
+        // La paginazione resta coerente col filtro.
+        let (page, total) = db.completed_torrents(1, 1, "silo").unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn movie_identity_rename_preserves_download_state() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-movie-rename-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO movies(name,year,title,quality_score,magnet_hash,magnet_link,downloaded_at,size_bytes) VALUES ('Titolo Vecchio',2020,'Titolo.Vecchio.2020',1234,'hash1','magnet:?xt=urn:btih:hash1',datetime('now'),999)",
+                [],
+            )
+            .unwrap();
+        let updated = db
+            .rename_movie_identity("Titolo Vecchio", "2020", "Titolo Nuovo", "2021")
+            .unwrap();
+        assert_eq!(updated, 1);
+        let (name, year, score, size, downloaded): (String, i64, i64, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT name,year,quality_score,size_bytes,downloaded_at FROM movies WHERE magnet_hash='hash1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(name, "Titolo Nuovo");
+        assert_eq!(year, 2021);
+        // Lo stato di download resta intatto.
+        assert_eq!(score, 1234);
+        assert_eq!(size, 999);
+        assert!(downloaded.is_some());
+        // Un anno diverso non intacca righe non corrispondenti.
+        assert_eq!(
+            db.rename_movie_identity("Titolo Nuovo", "1900", "X", "1901")
+                .unwrap(),
+            0
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn episode_air_dates_persist_for_unmaterialized_episodes() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-air-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Show')", [])
+            .unwrap();
+        db.save_series_metadata("Show", &[(1, 2)]).unwrap();
+        // Solo l'episodio 1 esiste davvero; il 2 è atteso dai metadati TMDB.
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score) VALUES (1,1,1,'Show.S01E01',900)",
+                [],
+            )
+            .unwrap();
+        db.save_episode_air_dates(
+            "Show",
+            &[
+                (1, 1, "2024-01-01".to_string()),
+                (1, 2, "2024-01-08".to_string()),
+            ],
+        )
+        .unwrap();
+        let items = db.episodes_for_series("Show", &[]).unwrap();
+        assert_eq!(items.len(), 2);
+        let by_episode = |episode: i64| {
+            items
+                .iter()
+                .find(|item| item.episode == episode)
+                .unwrap()
+                .air_date
+                .clone()
+        };
+        assert_eq!(by_episode(1), "2024-01-01");
+        // Anche l'episodio atteso, mai materializzato, mostra la data.
+        assert_eq!(by_episode(2), "2024-01-08");
+        assert_eq!(db.episode_air_dates().unwrap().len(), 2);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

@@ -83,6 +83,7 @@ struct Data {
     history_page: usize,
     history_pages: usize,
     history_total: i64,
+    history_filter: String,
     movie_history: Vec<Value>,
     recent_downloads: Vec<Value>,
     db_info: Value,
@@ -167,6 +168,28 @@ fn array(value: &Value, key: &str) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Filtro locale per le release già trovate: confronta titolo, fonte, origine e
+/// chiave episodio. Le parole sono in AND, così `web ita` restringe davvero la
+/// lista senza ripetere ricerche alle sorgenti remote.
+fn release_matches_result_filter(result: &Value, filter: &str, season: i64, episode: i64) -> bool {
+    let terms = filter
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return true;
+    }
+    let release = result.get("release").unwrap_or(result);
+    let searchable = format!(
+        "{} {} {} S{season:02}E{episode:02}",
+        text(release, "title", ""),
+        text(release, "source", ""),
+        text(result, "origin", ""),
+    )
+    .to_ascii_lowercase();
+    terms.iter().all(|term| searchable.contains(term))
 }
 
 fn size(value: &Value, key: &str) -> String {
@@ -448,8 +471,9 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
         // Storico download paginato: mantiene la pagina corrente anche durante i
         // refresh silenziosi, così la tabella non salta alla prima pagina.
         let history_page_wanted = data.get_untracked().history_page.max(1);
+        let history_filter = data.get_untracked().history_filter;
         let history_response =
-            get(&format!("/api/torrents/history?page={history_page_wanted}&limit=10")).await?;
+            get(&format!("/api/torrents/history?page={history_page_wanted}&limit=10&q={}", urlencoding::encode(&history_filter))).await?;
         let history = array(&history_response, "items");
         let history_page = history_response
             .get("page")
@@ -2122,6 +2146,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
         temp_loaded.set(true);
     });
     let tag_filter = RwSignal::new(String::new());
+    let history_filter = RwSignal::new(data.get_untracked().history_filter.clone());
     let sort_key = RwSignal::new("name".to_string());
     let sort_asc = RwSignal::new(true);
     let selected_torrents = RwSignal::new(Vec::<String>::new());
@@ -2340,7 +2365,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                             <th><button type="button" class="th-sort" on:click=move |_| set_sort("dl")>{ctx_tr("↓")}</button></th>
                             <th><button type="button" class="th-sort" on:click=move |_| set_sort("ul")>{ctx_tr("↑")}</button></th>
                             <th><button type="button" class="th-sort" on:click=move |_| set_sort("eta")>{ctx_tr("ETA")}</button></th>
-                            <th><button type="button" class="th-sort" on:click=move |_| set_sort("peers")>{ctx_tr("Peers")}</button></th>
+                            <th><button type="button" class="th-sort" on:click=move |_| set_sort("peers")>{ctx_tr("Peer / Seed")}</button></th>
                             <th><button type="button" class="th-sort" on:click=move |_| set_sort("ratio")>{ctx_tr("Ratio")}</button></th>
                             <th>{ctx_tr("Azioni")}</th>
                         </tr></thead>
@@ -2359,6 +2384,22 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             </Panel>
             <Panel title="Storico download">
                 <p class="muted">{ctx_tr("Download conclusi. Il badge NAS indica che il file è stato archiviato (percorso in libreria/NAS); il tag è la regola di cartella applicata.")}</p>
+                <div class="search-row" style="margin-top:10px">
+                    <input prop:value=history_filter on:input=move |event| {
+                        let value = event_target_value(&event);
+                        history_filter.set(value.clone());
+                        data.update(|current| {
+                            current.history_filter = value;
+                            current.history_page = 1;
+                        });
+                        history_goto(data, 1);
+                    } placeholder=ctx_tr("Cerca in nome, tipo, tag NAS, stato o cartella…") title=ctx_tr("Cerca nello storico completo, non solo nella pagina visibile") />
+                    <button type="button" class="btn" title=ctx_tr("Azzera il filtro storico") on:click=move |_| {
+                        history_filter.set(String::new());
+                        data.update(|current| { current.history_filter.clear(); current.history_page = 1; });
+                        history_goto(data, 1);
+                    }>{ctx_tr("Pulisci")}</button>
+                </div>
                 <Show when=move || data.get().history.is_empty()><Empty text="Nessun download concluso." /></Show>
                 <div class="table-wrap" style="margin-top:10px">
                     <table class="data-table">
@@ -2608,7 +2649,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
             <td class="numeric">{move || format!("{}/s", size(&item.get(), "download_rate"))}</td>
             <td class="numeric">{move || format!("{}/s", size(&item.get(), "upload_rate"))}</td>
             <td class="numeric" title=ctx_tr("Tempo stimato al completamento")>{move || eta_label(&item.get())}</td>
-            <td class="numeric" title=ctx_tr("Peer connessi / Seed")>{move || format!("{}/{}", number(&item.get(), "num_peers"), number(&item.get(), "num_seeds"))}</td>
+            <td class="numeric" title=ctx_tr("Peer connessi / Seed")>{move || format!("Peer: {} · Seed: {}", number(&item.get(), "num_peers"), number(&item.get(), "num_seeds"))}</td>
             <td class="numeric" title=ctx_tr("Rapporto upload/download")>{move || ratio_label(&item.get())}</td>
             <td>
                 <div class="row-actions">
@@ -3238,6 +3279,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
     let missing_message = RwSignal::new(String::new());
     let missing_results = RwSignal::new(Vec::<Value>::new());
     let missing_searched = RwSignal::new(Vec::<Value>::new());
+    let missing_filter = RwSignal::new(String::new());
     let baseline = RwSignal::new(String::new());
     let signature = move || {
         format!(
@@ -3414,6 +3456,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 busy.set(true);
                                 message.set("Ricerca episodi mancanti in corso…".into());
                                 results.set(Vec::new());
+                                missing_filter.set(String::new());
                                 spawn_local(async move {
                                     match send("POST", &path, None).await {
                                         Ok(value) => {
@@ -3516,6 +3559,12 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                     <Show when=move || !missing_message.get().is_empty()>
                         <div class="notice" style="margin-top:8px">{move || missing_message.get()}</div>
                     </Show>
+                    <Show when=move || !missing_results.get().is_empty()>
+                        <label class="field" style="margin-top:8px" title=ctx_tr("Filtra le release trovate per titolo, fonte o episodio; più parole restringono i risultati")>
+                            <span>{ctx_tr("Filtra risultati")}</span>
+                            <input prop:value=missing_filter on:input=move |event| missing_filter.set(event_target_value(&event)) placeholder=ctx_tr("Titolo, fonte o S09E11…") />
+                        </label>
+                    </Show>
                     <Show when=move || edit_open.get()>
                     <form class="form" on:submit=move |event| {
                         event.prevent_default();
@@ -3534,6 +3583,10 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                  "exclude": exclude.get(),
                                  "enabled": enabled.get(),
                                  "season_subfolders": season_subfolders.get(),
+                                 // Il form salva l'intera libreria: conserva le
+                                 // stagioni disattivate anche se sono state
+                                 // cambiate poco prima con i pulsanti sotto.
+                                 "ignored_seasons": detail.get().get("series").and_then(|series| series.get("ignored_seasons")).cloned().unwrap_or_else(|| json!([])),
                             });
                             save_series_fields(data, original, fields);
                             baseline.set(signature());
@@ -3575,16 +3628,28 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 (1..=max.max(1)).map(|season| {
                                     let is_ignored = ignored.contains(&season);
                                     let class = if is_ignored { "btn sm danger" } else { "btn sm primary" };
-                                    let selected_name = selected.get().unwrap_or_default();
-                                    view! {
-                                        <button class=class on:click=move |_| {
+                                            let selected_name = selected.get().unwrap_or_default();
+                                            let current_detail = detail;
+                                            view! {
+                                                <button class=class on:click=move |_| {
                                             let path = format!("/api/series/{}/toggle-season", urlencoding::encode(&selected_name));
                                             let body = json!({"season": season, "enabled": is_ignored});
                                             let tick = detail_tick;
-                                            spawn_local(async move {
-                                                match send("POST", &path, Some(body)).await {
-                                                    Ok(_) => {
-                                                        tick.update(|value| *value += 1);
+                                                    spawn_local(async move {
+                                                        match send("POST", &path, Some(body)).await {
+                                                            Ok(value) => {
+                                                                // Aggiorna subito il dettaglio locale: un
+                                                                // successivo "Salva serie" non può più
+                                                                // sovrascrivere l'ultimo toggle con una
+                                                                // copia precedente della libreria.
+                                                                if let Some(ignored) = value.get("ignored_seasons").cloned() {
+                                                                    current_detail.update(|detail| {
+                                                                        if let Some(series) = detail.get_mut("series") {
+                                                                            series["ignored_seasons"] = ignored;
+                                                                        }
+                                                                    });
+                                                                }
+                                                                tick.update(|value| *value += 1);
                                                         trigger_refresh();
                                                     }
                                                     Err(error) => data.update(|current| current.error = error),
@@ -3597,7 +3662,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                         </div>
                     </div>
                     </Show>
-                    <EpisodeTable data detail selected missing_results missing_searched />
+                    <EpisodeTable data detail series_info selected missing_results missing_searched missing_filter />
                     <Show when=move || rename_open.get()>
                         <div class="modal-backdrop" on:click=move |_| rename_open.set(false)>
                             <div class="modal" style="width:min(1500px,96vw)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
@@ -3697,9 +3762,11 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
 fn EpisodeTable(
     data: RwSignal<Data>,
     detail: RwSignal<Value>,
+    series_info: RwSignal<Value>,
     selected: RwSignal<Option<String>>,
     missing_results: RwSignal<Vec<Value>>,
     missing_searched: RwSignal<Vec<Value>>,
+    missing_filter: RwSignal<String>,
 ) -> impl IntoView {
     let search_results = RwSignal::new(Vec::<Value>::new());
     let search_label = RwSignal::new(String::new());
@@ -3719,8 +3786,22 @@ fn EpisodeTable(
                         season_list.dedup();
                         let expanded = expanded_seasons.get();
                         let metadata = array(&detail.get(), "metadata");
+                        let info = series_info.get();
+                        let show_status = text(&info, "status", "").to_ascii_lowercase();
+                        let show_ended = matches!(show_status.as_str(), "ended" | "canceled" | "cancelled");
+                        let last_aired_season = info
+                            .get("last_episode")
+                            .and_then(|episode| episode.get("season_number"))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        let next_aired_season = info
+                            .get("next_episode")
+                            .and_then(|episode| episode.get("season_number"))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
                         let missing_items = missing_results.get();
                         let missing_targets = missing_searched.get();
+                        let missing_filter_text = missing_filter.get();
                         let manual_target = search_target.get();
                         let manual_items = search_results.get();
                         let manual_label = search_label.get();
@@ -3733,6 +3814,8 @@ fn EpisodeTable(
                             let metadata_total = metadata.iter().find(|entry| entry.get("season").and_then(Value::as_i64) == Some(season_group)).and_then(|entry| entry.get("count").and_then(Value::as_i64)).unwrap_or(0);
                             let max_episode = season_items.iter().filter_map(|item| item.get("episode").and_then(Value::as_i64)).max().unwrap_or(0);
                             let total = if metadata_total > 0 { metadata_total } else { max_episode };
+                            let season_ended = show_ended || last_aired_season > season_group || next_aired_season > season_group;
+                            let season_complete = total > 0 && owned as i64 >= total;
                             let is_expanded = expanded.contains(&season_group);
                             let toggle_season = season_group;
                             rows.push(view! {
@@ -3743,6 +3826,14 @@ fn EpisodeTable(
                                         })>
                                             {if is_expanded { "▾" } else { "▸" }} {format!("{} {}", tr(data, "Stagione"), season_group)}
                                             <span class="muted">{format!("· {owned}/{total}")}</span>
+                                            {if season_ended {
+                                                let (label, title) = if season_complete {
+                                                    ("🏁 ✓✓", "Stagione terminata e tutti gli episodi sono presenti")
+                                                } else {
+                                                    ("🏁", "Stagione terminata: mancano ancora episodi")
+                                                };
+                                                view! { <span class="badge" class:ok=season_complete title=title>{label}</span> }.into_any()
+                                            } else { view! {}.into_any() }}
                                         </button>
                                     </td>
                                 </tr>
@@ -3765,9 +3856,15 @@ fn EpisodeTable(
                                 .filter(|result| {
                                     result.get("season").and_then(Value::as_i64) == Some(season)
                                         && result.get("episode").and_then(Value::as_i64) == Some(episode)
+                                        && release_matches_result_filter(result, &missing_filter_text, season, episode)
                                 })
                                 .cloned()
                                 .collect::<Vec<_>>();
+                            let missing_empty_label = if missing_filter_text.trim().is_empty() {
+                                "Nessuna release compatibile trovata."
+                            } else {
+                                "Nessun risultato corrisponde al filtro."
+                            };
                             let missing_searched_for_episode = missing_targets.iter().any(|target| {
                                 target.get("season").and_then(Value::as_i64) == Some(season)
                                     && target.get("episode").and_then(Value::as_i64) == Some(episode)
@@ -3789,6 +3886,8 @@ fn EpisodeTable(
                             // Nel dettaglio mostra il nome rinominato in libreria; il
                             // titolo originale del file scaricato resta nel tooltip.
                             let original_title = text(&item, "title", "-");
+                            let air_date = text(&item, "air_date", "");
+                            let air_date_display = air_date.clone();
                             let renamed_title = text(&item, "renamed_title", "");
                             let (title_display, title_tooltip) = if renamed_title.is_empty() {
                                 (original_title.clone(), String::new())
@@ -3798,7 +3897,12 @@ fn EpisodeTable(
                             rows.push(view! {
                                 <tr>
                                     <td class="mono">{format!("S{season:02}E{episode:02}")}</td>
-                                    <td class="truncate" title=title_tooltip>{title_display}</td>
+                                    <td class="truncate" title=title_tooltip>
+                                        <div>{title_display}</div>
+                                        <Show when=move || !air_date.is_empty()>
+                                            <small class="muted">{format!("In onda / prevista: {air_date_display}")}</small>
+                                        </Show>
+                                    </td>
                                     <td>
                                         <span class="badge" class:ok=downloaded_on_nas || status=="downloaded">{status_label.clone()}</span>
                                         <Show when=move || on_nas && status_for_nas != "downloaded">
@@ -3855,7 +3959,7 @@ fn EpisodeTable(
                                         <td colspan="6">
                                             <strong>{format!("Cerca mancanti · S{season:02}E{episode:02}")}</strong>
                                             {if missing_for_episode.is_empty() {
-                                                view! { <p class="muted">"Nessuna release compatibile trovata."</p> }.into_any()
+                                                view! { <p class="muted">{missing_empty_label}</p> }.into_any()
                                             } else {
                                                 view! {
                                                     <div class="episode-search-list">
@@ -3939,6 +4043,13 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
     let lang_b_req = RwSignal::new(true);
     let lang_c_req = RwSignal::new(true);
     let subtitle_reqs = RwSignal::new(String::new());
+    let metadata_open = RwSignal::new(false);
+    let metadata_query = RwSignal::new(String::new());
+    let metadata_source = RwSignal::new("tmdb".to_string());
+    let metadata_results = RwSignal::new(Vec::<Value>::new());
+    let metadata_result_source = RwSignal::new(String::new());
+    let metadata_loading = RwSignal::new(false);
+    let metadata_error = RwSignal::new(String::new());
     Effect::new(move |_| {
         if let Some(id) = selected.get() {
             spawn_local(async move {
@@ -4101,8 +4212,12 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                         </div>
                         <div class="detail-head">
                             {move || match detail.get().get("metadata").and_then(|item| item.get("poster_path")).and_then(Value::as_str) {
-                                Some(path) => view! { <img class="detail-poster" src=format!("https://image.tmdb.org/t/p/w185{path}") alt="Locandina film" loading="lazy" /> }.into_any(),
+                                Some(path) if !path.is_empty() => {
+                                    let poster_url = if path.starts_with("http://") || path.starts_with("https://") { path.to_string() } else { format!("https://image.tmdb.org/t/p/w185{path}") };
+                                    view! { <img class="detail-poster" src=poster_url alt="Locandina film" loading="lazy" /> }.into_any()
+                                }
                                 None => view! { <div class="detail-poster placeholder">{ctx_tr("N/D")}</div> }.into_any(),
+                                _ => view! { <div class="detail-poster placeholder">{ctx_tr("N/D")}</div> }.into_any(),
                             }}
                             <div class="detail-body">
                                 <strong>{move || text(&detail.get().get("metadata").cloned().unwrap_or_default(), "title", "Dettaglio film")}</strong>
@@ -4131,15 +4246,24 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                 }
                             }>
                                 <div class="form-grid">
-                                    <label class="field" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=name on:input=move |event| name.set(event_target_value(&event)) placeholder=ctx_tr("Nome film") /></label>
-                                    <label class="field" title=ctx_tr("Anno")><span>{ctx_tr("Anno")}</span><input prop:value=year on:input=move |event| year.set(event_target_value(&event)) placeholder=ctx_tr("2024") /></label>
-                                    <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                     <label class="field" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=name on:input=move |event| name.set(event_target_value(&event)) placeholder=ctx_tr("Nome film") /></label>
+                                     <label class="field" title=ctx_tr("Anno")><span>{ctx_tr("Anno")}</span><input prop:value=year on:input=move |event| year.set(event_target_value(&event)) placeholder=ctx_tr("2024") /></label>
+                                     <div class="movie-metadata-action">
+                                         <button type="button" class="btn" title=ctx_tr("Cerca e scegli i metadati del film: non modifica scaricamenti, qualità o lingue") on:click=move |_| {
+                                             let query = if year.get().trim().is_empty() { name.get() } else { format!("{} {}", name.get(), year.get()) };
+                                             metadata_query.set(query);
+                                             metadata_results.set(Vec::new());
+                                             metadata_error.set(String::new());
+                                             metadata_open.set(true);
+                                         }>{ctx_tr("Aggiorna da TMDB/TVDB")}</button>
+                                     </div>
+                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field span-full" title=ctx_tr("Parole che non devono comparire nel titolo della release (separate da virgola)")><span>{ctx_tr("Parole vietate (exclude)")}</span><input prop:value=exclude on:input=move |event| exclude.set(event_target_value(&event)) placeholder=ctx_tr("cam, ts, screener") /></label>
                                     <label class="field" title=ctx_tr("Sottotitoli")><span>{ctx_tr("Sottotitoli")}</span><input prop:value=subtitle on:input=move |event| subtitle.set(event_target_value(&event)) placeholder=ctx_tr("es. ita, eng") /></label>
                                     <div class="field span-full" title=ctx_tr("Lingue che devono essere presenti nella release; con 'obbligatoria' la release senza quella lingua viene scartata")>
                                         <span>{ctx_tr("Lingue richieste (fino a 3)")}</span>
-                                        <div class="stack">
+                                        <div class="language-rows-compact">
                                             {language_row(lang_a, lang_a_req)}
                                             {language_row(lang_b, lang_b_req)}
                                             {language_row(lang_c, lang_c_req)}
@@ -4177,6 +4301,75 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                     }>{ctx_tr("Cerca subito")}</button>
                                 </div>
                             </form>
+                            <Show when=move || metadata_open.get()>
+                                <div class="modal-backdrop" on:click=move |_| metadata_open.set(false)>
+                                    <div class="modal" style="width:min(820px,96vw)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
+                                        <div class="modal-head">
+                                            <strong>{ctx_tr("Aggiorna metadati film")}</strong>
+                                            <button type="button" class="btn sm" on:click=move |_| metadata_open.set(false)>{ctx_tr("Chiudi")}</button>
+                                        </div>
+                                        <div class="modal-body">
+                                            <p class="muted">{ctx_tr("Scegli il film corretto. Verranno aggiornati solo titolo, anno, trama, locandina e ID del provider; scaricamenti e impostazioni restano invariati.")}</p>
+                                            <form class="search-row" on:submit=move |event| {
+                                                event.prevent_default();
+                                                let Some(id) = selected.get() else { return; };
+                                                let query = metadata_query.get();
+                                                let source = metadata_source.get();
+                                                if query.trim().is_empty() { return; }
+                                                let loading = metadata_loading;
+                                                let error = metadata_error;
+                                                let results = metadata_results;
+                                                let result_source = metadata_result_source;
+                                                loading.set(true);
+                                                error.set(String::new());
+                                                spawn_local(async move {
+                                                    let path = format!("/api/movies/{id}/metadata/search");
+                                                    match send("POST", &path, Some(json!({"query":query,"source":source}))).await {
+                                                        Ok(value) => {
+                                                            result_source.set(text(&value, "source", "tmdb"));
+                                                            results.set(array(&value, "items"));
+                                                        }
+                                                        Err(message) => error.set(message),
+                                                    }
+                                                    loading.set(false);
+                                                });
+                                            }>
+                                                <select prop:value=metadata_source on:change=move |event| metadata_source.set(event_target_value(&event)) title=ctx_tr("Provider di metadati")>
+                                                    <option value="tmdb">"TMDB"</option>
+                                                    <option value="tvdb">"TVDB"</option>
+                                                </select>
+                                                <input prop:value=metadata_query on:input=move |event| metadata_query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca titolo film…") />
+                                                <button type="submit" class="btn primary" disabled=move || metadata_loading.get()>{move || if metadata_loading.get() { "Ricerca…" } else { "Cerca" }}</button>
+                                            </form>
+                                            <Show when=move || !metadata_error.get().is_empty()>
+                                                <div class="notice err" style="margin-top:10px">{move || metadata_error.get()}</div>
+                                            </Show>
+                                            <div class="list" style="margin-top:12px">
+                                                {move || {
+                                                    let source = metadata_result_source.get();
+                                                    metadata_results.get().into_iter().map(|item| {
+                                                        let candidate_id = item.get("id").and_then(Value::as_i64).map(|value| value.to_string()).unwrap_or_else(|| text(&item, "id", ""));
+                                                        let fallback_title = text(&item, "name", "Film");
+                                                        let title = text(&item, "title", &fallback_title);
+                                                        let fallback_date = text(&item, "first_air_date", "");
+                                                        let date = text(&item, "release_date", &fallback_date);
+                                                        let overview = text(&item, "overview", "");
+                                                        let movie_id = selected.get().unwrap_or_default();
+                                                        let candidate_for_disabled = candidate_id.clone();
+                                                        let source_for_choice = source.clone();
+                                                        view! {
+                                                            <div class="list-item">
+                                                                <div><strong>{title}</strong><small>{date}</small><small class="truncate">{overview}</small></div>
+                                                                <button type="button" class="btn sm primary" disabled=move || candidate_for_disabled.is_empty() on:click=move |_| apply_movie_metadata_choice(movie_id, candidate_id.clone(), source_for_choice.clone(), name, year, detail, metadata_open, metadata_loading, metadata_error)>{ctx_tr("Usa questi dati")}</button>
+                                                            </div>
+                                                        }
+                                                    }).collect_view()
+                                                }}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Show>
                             <Show when=move || !best_matches.get().is_empty()>
                                 <div class="table-wrap" style="margin-top:12px">
                                     <h4 style="margin:0 0 8px">{ctx_tr("Migliori trovati")}</h4>
@@ -4839,8 +5032,9 @@ fn archive_page(data: RwSignal<Data>, query: String, page: usize) {
 /// Cambia pagina nello Storico download (10 elementi per pagina).
 fn history_goto(data: RwSignal<Data>, page: usize) {
     let page = page.max(1);
+    let query = data.get_untracked().history_filter;
     spawn_local(async move {
-        match get(&format!("/api/torrents/history?page={page}&limit=10")).await {
+        match get(&format!("/api/torrents/history?page={page}&limit=10&q={}", urlencoding::encode(&query))).await {
             Ok(value) => data.update(|current| {
                 current.history = array(&value, "items");
                 current.history_page = value.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -4849,6 +5043,41 @@ fn history_goto(data: RwSignal<Data>, page: usize) {
             }),
             Err(error) => data.update(|current| current.error = error),
         }
+    });
+}
+
+/// Applica una scelta della modale metadata senza passare dal form dei filtri:
+/// il backend aggiorna esclusivamente i campi editoriali e conserva download,
+/// qualità, lingue e stato del film.
+fn apply_movie_metadata_choice(
+    movie_id: i64,
+    external_id: String,
+    source: String,
+    name: RwSignal<String>,
+    year: RwSignal<String>,
+    detail: RwSignal<Value>,
+    metadata_open: RwSignal<bool>,
+    metadata_loading: RwSignal<bool>,
+    metadata_error: RwSignal<String>,
+) {
+    metadata_loading.set(true);
+    metadata_error.set(String::new());
+    spawn_local(async move {
+        let path = format!("/api/movies/{movie_id}/metadata");
+        match send("POST", &path, Some(json!({"id":external_id,"source":source}))).await {
+            Ok(value) => {
+                let movie = value.get("movie").cloned().unwrap_or_default();
+                name.set(text(&movie, "name", ""));
+                year.set(text(&movie, "year", ""));
+                metadata_open.set(false);
+                trigger_refresh();
+                if let Ok(value) = get(&format!("/api/movies/{movie_id}")).await {
+                    detail.set(value);
+                }
+            }
+            Err(message) => metadata_error.set(message),
+        }
+        metadata_loading.set(false);
     });
 }
 
@@ -8000,11 +8229,29 @@ fn MissingView(data: RwSignal<Data>) -> impl IntoView {
     view! {
         <div class="view">
             <Panel title="Episodi mancanti">
-                <div class="table-wrap">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Serie")}</th><th>{ctx_tr("Episodio")}</th><th>{ctx_tr("Data")}</th><th></th></tr></thead>
-                        <tbody>
-                            {move || data.get().gaps.iter().cloned().map(|item| {
+                <div class="stack">
+                    {move || {
+                        let mut grouped = std::collections::BTreeMap::<String, Vec<Value>>::new();
+                        for item in data.get().gaps {
+                            grouped.entry(text(&item, "series", "Serie")).or_default().push(item);
+                        }
+                        grouped.into_iter().map(|(series_name, mut episodes)| {
+                            episodes.sort_by_key(|item| (
+                                item.get("season").and_then(Value::as_i64).unwrap_or(0),
+                                item.get("episode").and_then(Value::as_i64).unwrap_or(0),
+                            ));
+                            let count = episodes.len();
+                            view! {
+                                <details class="panel" style="padding:0">
+                                    <summary class="list-item" style="cursor:pointer">
+                                        <strong>{series_name.clone()}</strong>
+                                        <span class="badge warn">{format!("{count} episodi mancanti")}</span>
+                                    </summary>
+                                    <div class="table-wrap" style="padding:0 12px 12px">
+                                        <table class="data-table">
+                                            <thead><tr><th>{ctx_tr("Episodio")}</th><th>{ctx_tr("Data")}</th><th></th></tr></thead>
+                                            <tbody>
+                                            {episodes.into_iter().map(|item| {
                                 let series = text(&item, "series", "");
                                 let season = item.get("season").and_then(Value::as_i64).unwrap_or(0);
                                 let episode = item.get("episode").and_then(Value::as_i64).unwrap_or(0);
@@ -8012,7 +8259,6 @@ fn MissingView(data: RwSignal<Data>) -> impl IntoView {
                                 let ignore_series = series.clone();
                                 view! {
                                     <tr>
-                                        <td>{series.clone()}</td>
                                         <td class="mono">{format!("S{season:02}E{episode:02}")}</td>
                                         <td class="muted">{text(&item, "air_date", "-")}</td>
                                         <td>
@@ -8034,9 +8280,14 @@ fn MissingView(data: RwSignal<Data>) -> impl IntoView {
                                         </td>
                                     </tr>
                                 }
-                            }).collect_view()}
-                        </tbody>
-                    </table>
+                                            }).collect_view()}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </details>
+                            }
+                        }).collect_view()
+                    }}
                 </div>
             </Panel>
             <Show when=move || !results.get().is_empty()>

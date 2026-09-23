@@ -263,6 +263,8 @@ label { color: var(--muted); font-size: 0.875rem; }
 .field textarea { min-height: 96px; resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.7812rem; }
 .form-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .form-actions .muted { font-size: 0.75rem; }
+.movie-metadata-action { align-self: end; display: flex; justify-content: flex-end; }
+.movie-metadata-action .btn { white-space: nowrap; }
 .add-torrent-grid { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 14px 16px; align-items: start; }
 .add-torrent-action { align-self: start; padding-top: 24px; }
 .add-torrent-action .btn { white-space: nowrap; }
@@ -551,6 +553,11 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 .tmdb-body p { margin: 0; font-size: 0.75rem; line-height: 1.45; }
 .lang-row { display: flex; gap: 10px; align-items: center; }
 .lang-row select { flex: 1; min-width: 0; }
+.language-rows-compact { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.language-rows-compact .lang-row { gap: 5px; min-width: 0; }
+.language-rows-compact .lang-row select { min-width: 70px; }
+.language-rows-compact .check { white-space: nowrap; font-size: 12px; }
+@media (max-width: 760px) { .language-rows-compact { grid-template-columns: 1fr; } }
 .language-select-row { display: flex; gap: 8px; align-items: center; }
 .language-select-row select, .language-select-row input { flex: 1; min-width: 0; }
 .detail-head { display: flex; gap: 16px; margin-bottom: 16px; }

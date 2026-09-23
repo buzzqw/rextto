@@ -29,6 +29,18 @@ pub struct TmdbItem {
     pub release_date: Option<String>,
     pub vote_average: Option<f64>,
 }
+/// Dati editoriali persistibili di un film. Sono separati dalle impostazioni
+/// di download: una scelta esplicita nella UI non deve alterare qualità,
+/// lingue, code o storico.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TmdbMovieDetails {
+    pub id: i64,
+    pub title: Option<String>,
+    pub original_title: Option<String>,
+    pub overview: Option<String>,
+    pub poster_path: Option<String>,
+    pub release_date: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 struct EpisodeResult {
     name: Option<String>,
@@ -53,6 +65,11 @@ struct SeriesDetails {
 struct SeasonSummary {
     season_number: Option<i64>,
     episode_count: Option<i64>,
+}
+#[derive(Debug, Deserialize)]
+struct SeasonDetails {
+    #[serde(default)]
+    episodes: Vec<TmdbEpisode>,
 }
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct TmdbEpisode {
@@ -197,6 +214,19 @@ impl TmdbClient {
             .results
             .into_iter()
             .next())
+    }
+
+    /// Dettaglio di un film scelto esplicitamente dall'utente nella modale.
+    pub async fn movie_details(&self, tmdb_id: &str) -> Result<TmdbMovieDetails> {
+        let id = tmdb_id
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("invalid TMDB movie id"))?;
+        self.get_json(
+            &format!("https://api.themoviedb.org/3/movie/{id}"),
+            &[("language", self.language.as_str())],
+        )
+        .await
     }
 
     /// Cast principale di un film (massimo 12 membri, ordinati per rilevanza).
@@ -369,6 +399,24 @@ impl TmdbClient {
             .into_iter()
             .filter_map(|season| Some((season.season_number?, season.episode_count?)))
             .collect())
+    }
+
+    /// Episodi e date di una stagione. Viene chiamato solo durante il refresh
+    /// esplicito dei metadati; il chiamante li persiste nel database.
+    pub async fn season_episodes(&self, tmdb_id: &str, season: i64) -> Result<Vec<TmdbEpisode>> {
+        if self.key.is_none() || season < 1 {
+            return Ok(Vec::new());
+        }
+        let Some(id) = tmdb_id.trim().parse::<i64>().ok() else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .get_json::<SeasonDetails>(
+                &format!("https://api.themoviedb.org/3/tv/{id}/season/{season}"),
+                &[("language", self.language.as_str())],
+            )
+            .await?
+            .episodes)
     }
 
     pub async fn next_episode(&self, tmdb_id: &str) -> Result<Option<TmdbEpisode>> {
