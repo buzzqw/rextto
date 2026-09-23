@@ -221,7 +221,9 @@ impl Engine {
                 if compatible > 0 {
                     targets_with_hits += 1;
                     step2_usable += compatible;
-                    tracing::info!("🔎 {}: {} release compatibili", query, compatible);
+                    // Per-target detail: utile solo in diagnosi. Il ciclo riporta
+                    // già il totale in "Step 2/2 completato".
+                    tracing::debug!(query = %query, compatible, "🔎 release compatibili");
                 } else {
                     tracing::debug!(query = %query, found = items.len(), "🔎 search: nessuna release compatibile");
                 }
