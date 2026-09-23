@@ -182,7 +182,9 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | Keys | Action |
 |---|---|
 | `1-4` / `Tab` | switch tab |
+| `?` | show keyboard help |
 | `↑↓` | select a torrent in the Torrents tab |
+| `PgUp/PgDn`, `Home/End` | page through torrents and logs |
 | `Enter` | open the selected torrent details (`Enter`/`Esc` to go back) |
 | `r` | refresh · `c` run a cycle · `q` quit |
 | `a` | **add a magnet link** |
@@ -192,6 +194,7 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | `k` / `R` | recheck / reannounce |
 | `n` | toggle "do not rename" for it |
 | `x` | on the Health tab, clean the trash (asks for confirmation) |
+| `/` / `f` | on the Logs tab, filter / toggle follow mode |
 
 ### Data and logs
 

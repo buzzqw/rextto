@@ -794,6 +794,33 @@ pub fn App() -> impl IntoView {
         let remaining = parsed + refresh as f64 * 1000.0 - now_ms.get();
         format_remaining_seconds((remaining / 1000.0) as i64)
     });
+    // Live torrent figures, always visible in the top bar.
+    let live_dl = Signal::derive(move || {
+        size_str(
+            data.get()
+                .torrents
+                .iter()
+                .map(|item| value_f64(item, "download_rate"))
+                .sum(),
+        )
+    });
+    let live_ul = Signal::derive(move || {
+        size_str(
+            data.get()
+                .torrents
+                .iter()
+                .map(|item| value_f64(item, "upload_rate"))
+                .sum(),
+        )
+    });
+    let live_count = Signal::derive(move || data.get().torrents.len());
+    let live_peers = Signal::derive(move || {
+        data.get()
+            .torrents
+            .iter()
+            .map(|item| value_f64(item, "num_peers"))
+            .sum::<f64>() as i64
+    });
 
     view! {
         <Title text="Rextto" />
@@ -843,6 +870,12 @@ pub fn App() -> impl IntoView {
                         </div>
                         <div class="top-actions">
                             <Show when=move || busy.get()><span class="loading">{ctx_tr("Aggiornamento…")}</span></Show>
+                            <span class="live-stats" title=ctx_tr("Sessione torrent in tempo reale")>
+                                <span title=ctx_tr("Velocità di download")>"↓ " {move || format!("{}/s", live_dl.get())}</span>
+                                <span title=ctx_tr("Velocità di upload")>"↑ " {move || format!("{}/s", live_ul.get())}</span>
+                                <span title=ctx_tr("Torrent nella sessione")>{move || format!("{} torrent", live_count.get())}</span>
+                                <span title=ctx_tr("Peer connessi")>{move || format!("{} peer", live_peers.get())}</span>
+                            </span>
                             <span class="muted" title=move || tr(data, "Tempo stimato al prossimo ciclo automatico")>{move || tr(data, "Prossimo ciclo: ")}{move || next_cycle.get()}</span>
                             <button class="btn" title=ctx_tr("Testo più piccolo") on:click=move |_| font_scale.update(|value| *value = (*value - 5).max(85))>{ctx_tr("A−")}</button>
                             <button class="btn" title=ctx_tr("Dimensione testo predefinita (100%)") on:click=move |_| font_scale.set(100)>{move || format!("Testo {}%", font_scale.get())}</button>
@@ -2148,10 +2181,6 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             sort_asc.set(true);
         }
     };
-    let stat_dl = Signal::derive(move || size_str(data.get().torrents.iter().map(|item| value_f64(item, "download_rate")).sum()));
-    let stat_ul = Signal::derive(move || size_str(data.get().torrents.iter().map(|item| value_f64(item, "upload_rate")).sum()));
-    let stat_count = Signal::derive(move || data.get().torrents.len());
-    let stat_peers = Signal::derive(move || data.get().torrents.iter().map(|item| value_f64(item, "num_peers")).sum::<f64>() as i64);
     let all_selected = Signal::derive(move || {
         let items = filtered.get();
         !items.is_empty() && items.iter().all(|item| selected_torrents.get().contains(&text(item, "hash", "")))
@@ -2229,12 +2258,6 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             </Panel>
             <Panel title="Sessione torrent">
                 <p class="muted">{ctx_tr("Torrent ancora nel client (scarico e seed). Il badge NAS indica che i file sono già archiviati: il torrent esce da qui quando lo rimuovi (Pulisci completati o rimozione) e passa allo Storico download.")}</p>
-                <div class="torrent-stats" style="margin-bottom:10px">
-                    <div class="metric"><small>{ctx_tr("Download")}</small><strong>{move || format!("{}/s", stat_dl.get())}</strong></div>
-                    <div class="metric"><small>{ctx_tr("Upload")}</small><strong>{move || format!("{}/s", stat_ul.get())}</strong></div>
-                    <div class="metric"><small>{ctx_tr("Torrent")}</small><strong>{move || stat_count.get()}</strong></div>
-                    <div class="metric"><small>{ctx_tr("Peer")}</small><strong>{move || stat_peers.get()}</strong></div>
-                </div>
                 <div class="toolbar" style="margin-bottom:10px">
                     <button class="btn sm" title=ctx_tr("Rimuove i torrent completati secondo i limiti di seed (ratio/tempo)") on:click=move |_| { run_post(data, "/api/torrents/remove_completed", Some(json!({"delete_files": false})), "Pulizia completati richiesta"); }>{ctx_tr("Pulisci completati")}</button>
                     <select style="width:auto" title=ctx_tr("Filtra i torrent per tag") prop:value=tag_filter on:change=move |event| tag_filter.set(event_target_value(&event))>

@@ -163,7 +163,9 @@ a { color: var(--accent-2); }
 .top-actions > * { flex: none; white-space: nowrap; }
 .top-actions .btn { padding: 6px 10px; }
 .top-actions .lang-select, .top-actions .mode-badge, .top-actions .system-pill { padding: 6px 10px; }
-.lang-select { padding: 7px 10px; border-radius: 8px; background: var(--btn); color: var(--btn-text); border: 1px solid var(--btn-line); font-weight: 600; }
+.lang-select { padding: 6px 8px; max-width: 110px; border-radius: 8px; background: var(--btn); color: var(--btn-text); border: 1px solid var(--btn-line); font-weight: 600; }
+.live-stats { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
+.live-stats > span { white-space: nowrap; }
 /* Testata dettaglio serie: poster + titolo + badge + trama. */
 .series-hero { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 16px; align-items: start; }
 .series-poster img { width: 150px; border-radius: 8px; display: block; }

@@ -182,7 +182,9 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | Tasti | Azione |
 |---|---|
 | `1-4` / `Tab` | cambia scheda |
+| `?` | mostra l’aiuto dei tasti |
 | `↑↓` | seleziona un torrent nella scheda Torrents |
+| `PgUp/PgDn`, `Home/End` | naviga a pagine nei torrent e nei log |
 | `Invio` | apre i dettagli del torrent selezionato (`Invio`/`Esc` per tornare) |
 | `r` | aggiorna · `c` avvia un ciclo · `q` esci |
 | `a` | **aggiungi un magnet** |
@@ -192,6 +194,7 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | `k` / `R` | recheck / reannounce |
 | `n` | attiva/disattiva "non rinominare" |
 | `x` | nella scheda Health, pulisce il trash (chiede conferma) |
+| `/` / `f` | nella scheda Logs, filtra / attiva-disattiva il follow |
 
 ### Dati e log
 

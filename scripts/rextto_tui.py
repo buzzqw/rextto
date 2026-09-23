@@ -8,9 +8,11 @@ install:
     REXTTO_URL=http://127.0.0.1:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 
 Tabs: Status · Torrents · Logs · Health.
-Keys: 1-4/Tab switch · ↑↓ select · Enter details · r refresh · q quit.
+Keys: 1-4/Tab switch · ↑↓ select · Enter details · ? help · r refresh · q quit.
 Global: a add magnet · t add .torrent file · c run cycle.
 Torrents tab: p pause/resume · d remove · k recheck · R reannounce · n no-rename.
+Logs tab: / filter · f follow · ↑↓/PgUp/PgDn scroll · Home/End.
+Health tab: x empty trash.
 
 It only talks to the daemon's HTTP API and never touches the databases.
 """
@@ -98,6 +100,10 @@ class App:
         self.health = {}
         self.detail = None
         self.service_uptime = None
+        self.help_visible = False
+        self.log_filter = ""
+        self.log_scroll = 0
+        self.log_follow = True
 
     def refresh(self) -> None:
         selected_hash = self.selected_hash()
@@ -134,6 +140,12 @@ class App:
         if not self.torrents:
             return None
         return text(self.torrents[self.selected], "hash") or None
+
+    def filtered_logs(self):
+        if not self.log_filter:
+            return self.logs
+        needle = self.log_filter.casefold()
+        return [line for line in self.logs if needle in line.casefold()]
 
     def open_selected_details(self) -> None:
         hash_value = self.selected_hash()
@@ -342,20 +354,24 @@ def draw(app: "App", win, colors: dict) -> None:
     elif app.tab == 1:
         draw_torrents(app, win, top, bottom, width, colors)
     elif app.tab == 2:
-        draw_lines(app.logs[-(bottom - top):], win, top, bottom, colors)
+        draw_logs(app, win, top, bottom, width, colors)
     else:
         draw_health(app, win, top, bottom, width, colors)
 
-    hints = " q quit · r refresh · a magnet · t file · c cycle"
+    hints = " q quit · ? help · r refresh · a magnet · t file · c cycle"
     if app.detail is not None:
         hints += " · Enter/Esc back"
     elif app.tab == 1:
-        hints += " · ↑↓ select · Enter details · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+        hints += " · ↑↓/PgUp/PgDn select · Enter details · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+    elif app.tab == 2:
+        hints += " · ↑↓/PgUp/PgDn scroll · / filter · f follow · Home/End"
     elif app.tab == 3:
         hints += " · x empty trash"
     add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
         add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
+    if app.help_visible:
+        draw_help(win, colors)
     win.refresh()
 
 
@@ -364,9 +380,54 @@ def draw_lines(lines, win, top, bottom, colors) -> None:
         y = top + offset
         if y >= bottom:
             break
-        attr = colors["err"] if " ERROR " in line else (
-            colors["warn"] if " WARN " in line else colors["normal"])
+        attr = colors["err"] if "ERROR" in line else (
+            colors["warn"] if "WARN" in line else colors["normal"])
         add(win, y, 2, line, attr)
+
+
+def draw_logs(app: App, win, top, bottom, width, colors) -> None:
+    lines = app.filtered_logs()
+    visible = max(1, bottom - top - 1)
+    max_scroll = max(0, len(lines) - visible)
+    app.log_scroll = min(max(app.log_scroll, 0), max_scroll)
+    end = len(lines) - app.log_scroll
+    start = max(0, end - visible)
+    label = f"Logs: {len(lines)} lines"
+    if app.log_filter:
+        label += f" · filter '{app.log_filter}'"
+    if app.log_follow:
+        label += " · FOLLOW"
+    add(win, top, 2, shorten(label, max(1, width - 4)), colors["header"] | curses.A_BOLD)
+    draw_lines(lines[start:end], win, top + 1, bottom, colors)
+
+
+def draw_help(win, colors) -> None:
+    height, width = win.getmaxyx()
+    lines = [
+        "Rextto TUI - keyboard help",
+        "",
+        "Global:  1-4/Tab tabs · r refresh · ? close help · q quit",
+        "         a add magnet · t add .torrent · c run cycle",
+        "Torrents: ↑↓ or PgUp/PgDn select · Home/End · Enter details",
+        "          p pause/resume · d remove · k recheck · R reannounce",
+        "          n no-rename",
+        "Logs:     ↑↓ or PgUp/PgDn scroll · Home/End · / filter · f follow",
+        "Health:   x empty trash (confirmation required)",
+        "",
+        "Press Esc, Enter or ? to close",
+    ]
+    box_width = min(width - 4, max(44, max(len(line) for line in lines) + 4))
+    box_height = min(height - 2, len(lines) + 2)
+    left = max(1, (width - box_width) // 2)
+    top = max(0, (height - box_height) // 2)
+    attr = curses.A_REVERSE
+    for row in range(box_height):
+        add(win, top + row, left, " " * box_width, attr)
+    add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + box_height - 1, left,
+        "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    for offset, line in enumerate(lines[: max(0, box_height - 2)], 1):
+        add(win, top + offset, left + 2, shorten(line, max(1, box_width - 4)), attr)
 
 
 def draw_status(app, win, top, colors) -> None:
@@ -593,6 +654,13 @@ def main(stdscr) -> None:
     while True:
         draw(app, stdscr, colors)
         key = stdscr.getch()
+        if app.help_visible:
+            if key in (27, 10, 13, curses.KEY_ENTER, ord("?"), ord("q")):
+                app.help_visible = False
+            continue
+        if key == ord("?"):
+            app.help_visible = True
+            continue
         if key == ord("q"):
             break
         if app.detail is not None:
@@ -638,11 +706,49 @@ def main(stdscr) -> None:
             app.toggle_no_rename()
         elif app.tab == 1 and key in (10, 13, curses.KEY_ENTER):
             app.open_selected_details()
-        elif app.tab == 1 and key == curses.KEY_DOWN:
-            if app.torrents:
-                app.selected = min(app.selected + 1, len(app.torrents) - 1)
-        elif app.tab == 1 and key == curses.KEY_UP:
-            app.selected = max(0, app.selected - 1)
+        elif app.tab == 1:
+            page = max(1, stdscr.getmaxyx()[0] - 7)
+            if key == curses.KEY_DOWN:
+                app.selected = min(app.selected + 1, max(0, len(app.torrents) - 1))
+            elif key == curses.KEY_UP:
+                app.selected = max(0, app.selected - 1)
+            elif key == curses.KEY_NPAGE:
+                app.selected = min(app.selected + page, max(0, len(app.torrents) - 1))
+            elif key == curses.KEY_PPAGE:
+                app.selected = max(0, app.selected - page)
+            elif key == curses.KEY_HOME:
+                app.selected = 0
+            elif key == curses.KEY_END:
+                app.selected = max(0, len(app.torrents) - 1)
+        elif app.tab == 2:
+            page = max(1, stdscr.getmaxyx()[0] - 5)
+            max_scroll = max(0, len(app.filtered_logs()) - page)
+            if key == curses.KEY_UP:
+                app.log_scroll = min(app.log_scroll + 1, max_scroll)
+                app.log_follow = False
+            elif key == curses.KEY_DOWN:
+                app.log_scroll = max(0, app.log_scroll - 1)
+                app.log_follow = app.log_scroll == 0
+            elif key == curses.KEY_NPAGE:
+                app.log_scroll = min(app.log_scroll + page, max_scroll)
+                app.log_follow = False
+            elif key == curses.KEY_PPAGE:
+                app.log_scroll = max(0, app.log_scroll - page)
+                app.log_follow = app.log_scroll == 0
+            elif key == curses.KEY_HOME:
+                app.log_scroll = max_scroll
+                app.log_follow = False
+            elif key == curses.KEY_END:
+                app.log_scroll = 0
+                app.log_follow = True
+            elif key == ord("/"):
+                app.log_filter = prompt_input(stdscr, "Log filter (empty=all): ")
+                app.log_scroll = 0
+                app.log_follow = True
+            elif key == ord("f"):
+                app.log_follow = not app.log_follow
+                if app.log_follow:
+                    app.log_scroll = 0
 
         if time.time() - app.last_refresh >= REFRESH_SECS:
             app.refresh()
