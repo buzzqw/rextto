@@ -235,7 +235,8 @@ impl GetComicsClient {
             if let Ok(response) = self.client.get(&url).send().await {
                 if let Ok(response) = response.error_for_status() {
                     let html = response.text().await?;
-                    let links = parse_links(&html, &url)?;
+                    // Tollera errori di parsing: prosegue con le altre strategie.
+                    let links = parse_links(&html, &url).unwrap_or_default();
                     if !links.magnets.is_empty()
                         || !links.torrents.is_empty()
                         || !links.mega.is_empty()
@@ -692,7 +693,12 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
         let Some(raw) = anchor.value().attr("href") else {
             continue;
         };
-        let href = url::Url::parse(page_url)?.join(raw)?.to_string();
+        // Un singolo href non valido (es. magnet con caratteri strani) non deve
+        // far fallire l'intero parsing della pagina: si salta solo quell'anchor.
+        let Ok(joined) = url::Url::parse(page_url).and_then(|base| base.join(raw)) else {
+            continue;
+        };
+        let href = joined.to_string();
         let text = anchor.text().collect::<String>().to_ascii_lowercase();
         if href.starts_with("magnet:") {
             if !links.magnets.contains(&href) {
@@ -1307,6 +1313,15 @@ mod tests {
             "The Amazing Spider Man"
         );
         assert_eq!(clean_search_title(""), "");
+    }
+
+    #[test]
+    fn parse_links_ignores_invalid_hrefs() {
+        // Un href non valido non deve far fallire il parsing degli altri link.
+        let html = r#"<a href="magnet:?xt=urn:btih:0123456789012345678901234567890123456789">ok</a><a href="http://[bad">x</a><a href="/file.torrent">t</a>"#;
+        let links = parse_links(html, "https://getcomics.org/post/").expect("parse");
+        assert_eq!(links.magnets.len(), 1);
+        assert_eq!(links.torrents.len(), 1);
     }
 
     #[test]
