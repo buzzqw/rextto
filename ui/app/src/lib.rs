@@ -3240,6 +3240,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                     let total = item.get("episodes_total").and_then(Value::as_i64).unwrap_or(0);
                                     let downloaded = item.get("episodes_downloaded").and_then(Value::as_i64).unwrap_or(0);
                                     let completeness = if total > 0 { format!("{:.0}%", downloaded as f64 / total as f64 * 100.0) } else { "—".into() };
+                                    let complete = total > 0 && downloaded >= total;
                                     view! {
                                         <tr>
                                             <td><input type="checkbox" title=ctx_tr("Seleziona la serie per le azioni bulk") prop:checked=move || selected_series.get().contains(&selected_name) on:change=move |_| selected_series.update(|items| { if items.contains(&selected_name_toggle) { items.retain(|name| name != &selected_name_toggle); } else { items.push(selected_name_toggle.clone()); } }) /></td>
@@ -3250,7 +3251,16 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                             <td class="numeric" title=ctx_tr("Episodi scaricati / totali")>{format!("{}/{}", number(&item, "episodes_downloaded"), number(&item, "episodes_total"))}</td>
                                             <td class="numeric" title=ctx_tr("Percentuale di episodi scaricati")>{completeness}</td>
                                             <td class="muted" title=ctx_tr("Ultimo download")>{short_date(&text(&item, "last_downloaded_at", ""))}</td>
-                                            <td><span class="badge" class:ok=enabled>{if enabled { "attiva" } else { "in pausa" }}</span></td>
+                                            <td>
+                                                {if complete {
+                                                    view! { <span class="badge ok" title=ctx_tr("Serie completa: tutti gli episodi disponibili sono archiviati sul NAS")>{ctx_tr("✓✓ completa")}</span> }.into_any()
+                                                } else {
+                                                    view! { <span class="badge" class:ok=enabled>{if enabled { "attiva" } else { "in pausa" }}</span> }.into_any()
+                                                }}
+                                                <Show when=move || complete && !enabled>
+                                                    <span class="badge" title=ctx_tr("Serie in pausa")>{ctx_tr("in pausa")}</span>
+                                                </Show>
+                                            </td>
                                             <td>
                                                 <div class="row-actions">
                                                     <button class="btn sm primary" on:click=move |_| selected.set(Some(detail_name.clone()))>{ctx_tr("Dettagli")}</button>

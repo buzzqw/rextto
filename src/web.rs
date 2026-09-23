@@ -11180,6 +11180,83 @@ async fn optimize_worker(state: AppState) {
     }
 }
 
+/// True se la cartella contiene almeno un file (anche in sottocartelle).
+fn dir_has_files(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_files(&path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rimuove le cartelle **vuote** rimaste in `libtorrent_temp_dir` (residui di
+/// download completati o rimossi). Salta le cartelle dei torrent attivi e quelle
+/// troppo recenti, per non disturbare un download appena avviato.
+fn cleanup_empty_temp_dirs(cfg: &Config, torrents: &LibtorrentClient) {
+    let Some(temp) = cfg.libtorrent_temp_dir.as_deref() else {
+        return;
+    };
+    let active = torrents
+        .list()
+        .into_iter()
+        .map(|torrent| torrent.name)
+        .collect::<std::collections::HashSet<_>>();
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if active.contains(&name) {
+            continue;
+        }
+        if dir_has_files(&path) {
+            continue;
+        }
+        // Solo se è lì da almeno un'ora: evita di rimuovere la cartella di un
+        // download appena creato e non ancora popolato.
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            if modified
+                .elapsed()
+                .map(|elapsed| elapsed.as_secs() < 3600)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(dir = %path.display(), "removed empty temp folder")
+            }
+            Err(error) => {
+                tracing::debug!(dir = %path.display(), %error, "could not remove empty temp folder")
+            }
+        }
+    }
+}
+
+/// Pulizia periodica delle cartelle vuote nella temp libtorrent.
+async fn temp_cleanup_worker(state: AppState) {
+    const CLEANUP_PERIOD: Duration = Duration::from_secs(30 * 60);
+    loop {
+        tokio::time::sleep(CLEANUP_PERIOD).await;
+        let cfg = latest_config(&state);
+        cleanup_empty_temp_dirs(&cfg, &state.torrents);
+    }
+}
+
 pub async fn serve(
     state: AppState,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -11207,6 +11284,7 @@ pub async fn serve(
     let cycle = tokio::spawn(cycle_worker(state.clone()));
     let backups = tokio::spawn(backup_worker(state.clone()));
     let optimize = tokio::spawn(optimize_worker(state.clone()));
+    let temp_cleanup = tokio::spawn(temp_cleanup_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -11217,6 +11295,7 @@ pub async fn serve(
         registry.push(cycle);
         registry.push(backups);
         registry.push(optimize);
+        registry.push(temp_cleanup);
     }
     let app = router(state);
     let result = tokio::try_join!(

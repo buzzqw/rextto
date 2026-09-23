@@ -501,6 +501,8 @@ pub async fn run_cycle_domain(
         }
         live
     };
+    let mut upgrades = 0usize;
+    let mut new_items = 0usize;
     for mut release in best {
         // I feed RSS che espongono solo il link `.torrent` (es. TorrentLeech)
         // non hanno un magnet: scarica il file, ricava l'infohash e conserva il
@@ -630,6 +632,11 @@ pub async fn run_cycle_domain(
                         }
                     }
                     stats.downloads_started += 1;
+                    if approval_reason == "upgrade" {
+                        upgrades += 1;
+                    } else {
+                        new_items += 1;
+                    }
                     if from_archive || !gap_episodes.is_empty() {
                         stats.gaps_filled += 1;
                     }
@@ -699,11 +706,13 @@ pub async fn run_cycle_domain(
     let started = stats.last_started_at.unwrap_or_else(Utc::now);
     let elapsed = (Utc::now() - started).num_seconds().max(0);
     tracing::info!(
-        "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} | gaps filled: {} | errors: {}",
+        "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} (upgrade: {} · nuovi: {}) | gaps filled: {} | errors: {}",
         human_duration(elapsed),
         stats.scraped,
         stats.candidates,
         stats.downloads_started,
+        upgrades,
+        new_items,
         stats.gaps_filled,
         stats.errors
     );

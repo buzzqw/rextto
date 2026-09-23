@@ -159,30 +159,41 @@ impl Engine {
             targets_total
         );
         let cfg = Arc::new(cfg.clone());
-        let mut set = tokio::task::JoinSet::new();
+        let mut set = tokio::task::JoinSet::<(String, Vec<Release>)>::new();
         let mut iter = targets.into_iter();
-        let schedule =
-            |set: &mut tokio::task::JoinSet<Vec<Release>>,
-             iter: &mut std::vec::IntoIter<(String, Vec<(String, String)>)>| {
-                if let Some((query, ids)) = iter.next() {
-                    let client = self.client.clone();
-                    let cfg = cfg.clone();
-                    set.spawn(async move { search_one(&client, &cfg, &query, &ids, None).await });
-                }
-            };
+        let schedule = |set: &mut tokio::task::JoinSet<(String, Vec<Release>)>,
+                        iter: &mut std::vec::IntoIter<(String, Vec<(String, String)>)>| {
+            if let Some((query, ids)) = iter.next() {
+                let client = self.client.clone();
+                let cfg = cfg.clone();
+                set.spawn(async move {
+                    let items = search_one(&client, &cfg, &query, &ids, None).await;
+                    (query, items)
+                });
+            }
+        };
         for _ in 0..QUERY_CONCURRENCY {
             schedule(&mut set, &mut iter);
         }
+        let mut targets_done = 0usize;
+        let mut targets_with_hits = 0usize;
+        let mut step2_releases = 0usize;
         while let Some(joined) = set.join_next().await {
-            if let Ok(items) = joined {
+            if let Ok((query, items)) = joined {
+                targets_done += 1;
+                if items.is_empty() {
+                    tracing::debug!(query = %query, "🔎 search: nessun risultato");
+                } else {
+                    targets_with_hits += 1;
+                    step2_releases += items.len();
+                    tracing::info!(query = %query, releases = items.len(), "🔎 trovato");
+                }
                 all.extend(items);
             }
             schedule(&mut set, &mut iter);
         }
         tracing::info!(
-            "🔎 Indexer/web search: {} releases from {} queries (series+movies)",
-            all.len().saturating_sub(feeds_releases),
-            targets_total
+            "🔎 Step 2/2 completato: {targets_done} target analizzati · {targets_with_hits} con risultati · {step2_releases} release trovate"
         );
         let engine_failures = websearch::take_engine_failures();
         if !engine_failures.is_empty() {
