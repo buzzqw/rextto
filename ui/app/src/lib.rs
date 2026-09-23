@@ -447,6 +447,38 @@ fn run_delete(data: RwSignal<Data>, path: &str, success: &'static str) {
     });
 }
 
+/// Pulisce i torrent completati e riporta l'esito reale (rimossi/saltati) invece
+/// di un messaggio generico: rende chiaro che vengono tolti solo quelli che
+/// hanno già raggiunto i limiti di seed e che ora sono nello Storico.
+fn run_cleanup_completed(data: RwSignal<Data>) {
+    spawn_local(async move {
+        match send(
+            "POST",
+            "/api/torrents/remove_completed",
+            Some(json!({"delete_files": false})),
+        )
+        .await
+        {
+            Ok(value) => {
+                let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
+                let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+                let message = if removed == 0 {
+                    format!(
+                        "Nessun torrent rimosso: {skipped} non hanno ancora raggiunto i limiti di seed (ratio/tempo) o sono in seed infinito."
+                    )
+                } else {
+                    format!(
+                        "Rimossi {removed} completati · saltati {skipped} (limiti di seed non raggiunti o seed infinito). Sono ora nello Storico download."
+                    )
+                };
+                flash_text(data, "ok", message);
+            }
+            Err(error) => flash_text(data, "err", error),
+        }
+        trigger_refresh();
+    });
+}
+
 fn remove_monitored_comic(data: RwSignal<Data>, id: i64) {
     spawn_local(async move {
         let result = send("DELETE", &format!("/api/comics/{id}"), None).await;
@@ -1758,6 +1790,7 @@ fn setting_tooltip(key: &str) -> &'static str {
         "libtorrent_seed_ratio" => "Rapporto upload/download dopo cui fermare il seeding (0 = infinito).",
         "libtorrent_seed_time" => "Limite di seeding in minuti, usato solo se Seed massimo (giorni) è 0; utile per limiti inferiori a 24 ore.",
         "libtorrent_seed_time_days" => "Limite principale di seeding in giorni; se maggiore di 0 prevale sul limite in minuti.",
+        "auto_remove_completed" => "Rimuove dalla sessione i torrent completati appena raggiungono i limiti di seed (o appena archiviati), senza dover premere Pulisci completati. Non cancella l'archivio NAS.",
         "libtorrent_connections_limit" => "Numero massimo di connessioni peer simultanee a livello di sessione.",
         "libtorrent_upload_slots_limit" => "Numero di peer non bloccati in upload (-1 = automatico).",
         "libtorrent_half_open_limit" => "Numero massimo di connessioni in fase di apertura (-1 = automatico).",
@@ -2392,9 +2425,9 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 </form>
             </Panel>
             <Panel title="Sessione torrent">
-                <p class="muted">{ctx_tr("Torrent ancora nel client (scarico e seed). Il badge NAS indica che i file sono già archiviati: il torrent esce da qui quando lo rimuovi (Pulisci completati o rimozione) e passa allo Storico download.")}</p>
+                <p class="muted">{ctx_tr("Torrent ancora nel client (download e seed). Il badge NAS indica che i file sono già archiviati: restano qui a seedare e passano allo Storico download solo quando escono dalla sessione (Pulisci completati, rimozione manuale, o automaticamente al limite di seed).")}</p>
                 <div class="toolbar" style="margin-bottom:10px">
-                    <button class="btn sm" title=ctx_tr("Rimuove i torrent completati secondo i limiti di seed (ratio/tempo)") on:click=move |_| { run_post(data, "/api/torrents/remove_completed", Some(json!({"delete_files": false})), "Pulizia completati richiesta"); }>{ctx_tr("Pulisci completati")}</button>
+                    <button class="btn sm" title=ctx_tr("Toglie dalla coda libtorrent i torrent completati che hanno già raggiunto i limiti di seed (ratio/tempo). Esclude il seed infinito e non cancella l'archivio NAS: i torrent escono dalla Sessione e passano allo Storico download.") on:click=move |_| run_cleanup_completed(data)>{ctx_tr("Pulisci completati")}</button>
                     <select style="width:auto" title=ctx_tr("Filtra i torrent per tag") prop:value=tag_filter on:change=move |event| tag_filter.set(event_target_value(&event))>
                         <option value="">{ctx_tr("Tutti i tag")}</option>
                         <option value="__none__">{ctx_tr("Senza tag")}</option>
@@ -5870,6 +5903,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                             <TextSetting label="Seed ratio globale (0 = infinito)" setting_key="libtorrent_seed_ratio" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_ratio", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (minuti, fallback)" setting_key="libtorrent_seed_time" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_minutes", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (giorni)" setting_key="libtorrent_seed_time_days" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_days", "0")) placeholder="0" />
+                              <BooleanSetting label="Rimozione automatica dei completati" setting_key="auto_remove_completed" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_remove_completed", "false")) />
                         </SettingGroup>
                         <SettingGroup title="Connessioni e prestazioni">
                             <TextSetting label="Limite connessioni totali" setting_key="libtorrent_connections_limit" value=Signal::derive(move || number(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "connections_limit")) placeholder="200" />
