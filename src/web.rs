@@ -876,7 +876,9 @@ pub fn router(state: AppState) -> Router {
             post(libtorrent_check_update),
         )
         .route("/api/jellyfin/refresh", post(jellyfin_refresh))
+        .route("/api/jellyfin/test", post(jellyfin_test))
         .route("/api/plex/refresh", post(plex_refresh))
+        .route("/api/plex/test", post(plex_test))
         .route("/api/feed/status", get(feed_status))
         .route("/feed.xml", get(magnet_feed))
         .route("/api/feed.xml", get(magnet_feed))
@@ -1448,7 +1450,8 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
             "ramdisk_enabled": cfg.ramdisk_enabled(),
             "ramdisk_threshold_gb": cfg.settings.get("libtorrent_ramdisk_threshold_gb").cloned().unwrap_or_else(|| "3.5".into()),
             "ramdisk_margin_gb": cfg.settings.get("libtorrent_ramdisk_margin_gb").cloned().unwrap_or_else(|| "0.5".into()),
-            "ramdisk_min_free_bytes": cfg.settings.get("libtorrent_ramdisk_min_free_bytes").cloned().unwrap_or_default()
+            "ramdisk_min_free_bytes": cfg.settings.get("libtorrent_ramdisk_min_free_bytes").cloned().unwrap_or_default(),
+            "auto_optimize": cfg.settings.get("libtorrent_auto_optimize").cloned().unwrap_or_else(|| "false".into())
         },
          "paths": {"data_dir":cfg.data_dir,"libtorrent_dir":cfg.libtorrent_dir,"libtorrent_temp_dir":cfg.libtorrent_temp_dir,"libtorrent_ramdisk_dir":cfg.settings.get("libtorrent_ramdisk_dir"),"state_dir":cfg.state_dir,"archive_root":cfg.archive_root,"trash_path":cfg.trash_path}
     }))
@@ -2409,7 +2412,7 @@ async fn series_rename_apply(
                     .unwrap_or_default(),
             ),
         );
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: episode.title.clone(),
             magnet: String::new(),
             source: "archive".into(),
@@ -2580,7 +2583,7 @@ async fn series_rename_apply(
             let known = episodes
                 .iter()
                 .find(|episode| episode.season == season && episode.episode == episode_number);
-            let release = Release {
+            let release = Release { torrent_url: None,
                 title: known
                     .map(|episode| episode.title.clone())
                     .unwrap_or_else(|| format!("Episodio {episode_number}")),
@@ -2710,18 +2713,35 @@ async fn series_rename_apply(
         _ => "",
     };
     if execute {
-        tracing::info!(
-            "🗂 rename '{}': {} renamed, {} already correct, {} discarded, {} duplicates removed, {} errors — {}/{} files present{}",
-            series.name,
-            renamed_count,
-            already_ok_count,
-            discarded_count,
-            duplicates_removed,
-            error_count,
-            with_path,
-            considered,
-            note
-        );
+        // Un'esecuzione che non cambia nulla (tutto già corretto) non merita una
+        // riga INFO ad ogni ciclo: la si tiene solo a livello debug.
+        let changed = renamed_count > 0
+            || discarded_count > 0
+            || duplicates_removed > 0
+            || error_count > 0;
+        if changed {
+            tracing::info!(
+                "🗂 rename '{}': {} renamed, {} already correct, {} discarded, {} duplicates removed, {} errors — {}/{} files present{}",
+                series.name,
+                renamed_count,
+                already_ok_count,
+                discarded_count,
+                duplicates_removed,
+                error_count,
+                with_path,
+                considered,
+                note
+            );
+        } else {
+            tracing::debug!(
+                "🗂 rename '{}': nothing to change ({} already correct, {}/{} files present){}",
+                series.name,
+                already_ok_count,
+                with_path,
+                considered,
+                note
+            );
+        }
     } else if items.is_empty() {
         tracing::info!(
             "🗂 rename preview '{}': nothing to rename ({} already correct, {}/{} files present){}",
@@ -6661,14 +6681,61 @@ async fn create_backup(State(s): State<AppState>) -> impl IntoResponse {
         ),
     }
 }
+/// Data locale leggibile di un backup. Per i vecchi nomi `snapshot-<epoch>.zip`
+/// usa l'istante nel nome (più affidabile se il file è stato copiato), altrimenti
+/// ricade sulla data di modifica del file.
+fn backup_label(name: &str, modified: Option<u64>) -> String {
+    use chrono::TimeZone;
+    let from_name = name
+        .strip_prefix("snapshot-")
+        .and_then(|rest| rest.strip_suffix(".zip"))
+        .and_then(|value| value.parse::<i64>().ok());
+    let seconds = from_name.or_else(|| modified.map(|value| value as i64));
+    seconds
+        .and_then(|value| chrono::Local.timestamp_opt(value, 0).single())
+        .map(|value| value.format("%d/%m/%Y %H:%M").to_string())
+        .unwrap_or_else(|| "data sconosciuta".to_string())
+}
 async fn list_backups(State(s): State<AppState>) -> Json<serde_json::Value> {
     let root = s.cfg.data_dir.join("backups");
-    let mut items = std::fs::read_dir(&root).ok().into_iter().flatten().filter_map(|entry| entry.ok()).filter(|entry| entry.path().extension().is_some_and(|extension| extension == "zip")).filter_map(|entry| { let metadata = entry.metadata().ok()?; Some(serde_json::json!({"name":entry.file_name().to_string_lossy().into_owned(),"path":entry.path(),"size_bytes":metadata.len(),"modified":metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok()).map(|value| value.as_secs())})) }).collect::<Vec<_>>();
+    let mut items = std::fs::read_dir(&root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "zip")
+        })
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs());
+            Some(serde_json::json!({
+                "name": name,
+                "path": entry.path(),
+                "size_bytes": metadata.len(),
+                "modified": modified,
+                "label": backup_label(&name, modified),
+            }))
+        })
+        .collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        right
-            .get("name")
-            .and_then(|value| value.as_str())
-            .cmp(&left.get("name").and_then(|value| value.as_str()))
+        let modified = |item: &serde_json::Value| {
+            item.get("modified").and_then(serde_json::Value::as_u64)
+        };
+        modified(right).cmp(&modified(left)).then_with(|| {
+            right
+                .get("name")
+                .and_then(|value| value.as_str())
+                .cmp(&left.get("name").and_then(|value| value.as_str()))
+        })
     });
     Json(serde_json::json!({"items":items}))
 }
@@ -8354,6 +8421,132 @@ async fn plex_refresh(State(s): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Estrae un attributo XML semplice (`nome="valore"`) senza un parser completo:
+/// serve solo a mostrare un'informazione amichevole nei test di integrazione.
+fn xml_attribute(body: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Messaggio d'errore leggibile per un test di integrazione andato male.
+fn media_test_error(provider: &str, status: u16) -> String {
+    match status {
+        401 | 403 => format!("{provider}: credenziali non valide"),
+        404 => format!("{provider}: endpoint non trovato, controlla l'URL"),
+        _ => format!("{provider}: HTTP {status}"),
+    }
+}
+
+/// Verifica URL e API key di Jellyfin con `/System/Info` e riporta nome/versione
+/// del server. Non modifica nulla.
+async fn jellyfin_test(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    let url = cfg.settings.get("jellyfin_url").cloned().unwrap_or_default();
+    let key = cfg.settings.get("jellyfin_api_key").cloned().unwrap_or_default();
+    if url.trim().is_empty() || key.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"Jellyfin non configurato"})),
+        );
+    }
+    let endpoint = format!("{}/System/Info", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    match client
+        .get(&endpoint)
+        .header("X-Emby-Token", key)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let info: serde_json::Value = response.json().await.unwrap_or_default();
+            let server = info
+                .get("ServerName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let version = info
+                .get("Version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"server":server,"version":version})),
+            )
+        }
+        Ok(response) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok":false,"error":media_test_error("Jellyfin", response.status().as_u16())})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+/// Verifica URL e token di Plex con `/identity` e prova a leggere il nome del
+/// server. Non avvia refresh di libreria.
+async fn plex_test(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    let url = cfg.settings.get("plex_url").cloned().unwrap_or_default();
+    let token = cfg.settings.get("plex_token").cloned().unwrap_or_default();
+    if url.trim().is_empty() || token.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"Plex non configurato"})),
+        );
+    }
+    let base = url.trim_end_matches('/').to_string();
+    let token = token.trim().to_string();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    match client
+        .get(format!("{base}/identity"))
+        .header("X-Plex-Token", token.clone())
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let identity = response.text().await.unwrap_or_default();
+            let machine = xml_attribute(&identity, "machineIdentifier").unwrap_or_default();
+            let server = match client
+                .get(format!("{base}/"))
+                .header("X-Plex-Token", token)
+                .send()
+                .await
+            {
+                Ok(root) if root.status().is_success() => root
+                    .text()
+                    .await
+                    .map(|body| xml_attribute(&body, "friendlyName").unwrap_or_default())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"server":server,"version":"","machine":machine})),
+            )
+        }
+        Ok(response) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok":false,"error":media_test_error("Plex", response.status().as_u16())})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
 /// Refresh configured media servers after an actual torrent import. legacy
 /// does this automatically after move/rename; keeping it here also covers
 /// season packs and completion recovered after a restart.
@@ -8428,15 +8621,12 @@ static FEED_STATUS_CACHE: Mutex<Option<(Instant, serde_json::Value)>> = Mutex::n
 /// Quante voci recenti dell'archivio considerare per il feed status.
 const FEED_STATUS_WINDOW: usize = 40_000;
 
-async fn feed_status(State(s): State<AppState>) -> Json<serde_json::Value> {
-    // Risposta cache per un minuto: la dashboard e i tab "dal feed" la
-    // richiedono ripetutamente e il calcolo tocca l'intero archivio.
-    if let Some((computed_at, value)) = FEED_STATUS_CACHE.lock().unwrap().as_ref() {
-        if computed_at.elapsed() < Duration::from_secs(60) {
-            return Json(value.clone());
-        }
-    }
-    let cfg = latest_config(&s);
+/// Calcola il matching fra titoli monitorati e release recenti dei feed e
+/// aggiorna la cache condivisa. Separato così sia l'endpoint sia il worker
+/// periodico usano la stessa logica e "Dal feed" resta fresco anche fra un
+/// ciclo e l'altro.
+fn compute_feed_status(s: &AppState) -> serde_json::Value {
+    let cfg = latest_config(s);
     // Carica solo le voci recenti dell'archivio e fai il matching in memoria:
     // evita sia centinaia di scansioni complete sia di tenere in RAM l'intero
     // archivio (che può superare le centinaia di migliaia di righe).
@@ -8484,7 +8674,18 @@ async fn feed_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     }
     let value = serde_json::json!({"ok": true, "items": items});
     *FEED_STATUS_CACHE.lock().unwrap() = Some((Instant::now(), value.clone()));
-    Json(value)
+    value
+}
+
+async fn feed_status(State(s): State<AppState>) -> Json<serde_json::Value> {
+    // Risposta cache per un minuto: la dashboard e i tab "dal feed" la
+    // richiedono ripetutamente e il calcolo tocca l'intero archivio.
+    if let Some((computed_at, value)) = FEED_STATUS_CACHE.lock().unwrap().as_ref() {
+        if computed_at.elapsed() < Duration::from_secs(60) {
+            return Json(value.clone());
+        }
+    }
+    Json(compute_feed_status(&s))
 }
 
 fn xml_escape(value: &str) -> String {
@@ -8547,8 +8748,19 @@ async fn apply_libtorrent_settings(State(s): State<AppState>) -> impl IntoRespon
     torrent_action(s.torrents.apply_settings(&cfg))
 }
 
-async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoResponse {
-    let cfg = latest_config(&s);
+/// Valori libtorrent consigliati in base a RAM/risorse. Separati dal comando,
+/// così il pulsante e l'ottimizzazione continua condividono la stessa logica.
+struct LibtorrentOptimization {
+    changes: Vec<(&'static str, String)>,
+    memory_mb: u64,
+    cache_size: i64,
+    cache_mb: i64,
+    queue_mb: i64,
+    send_buffer_kb: i64,
+    peer_list: i64,
+}
+
+fn libtorrent_optimization(cfg: &Config) -> LibtorrentOptimization {
     let trash = cfg
         .trash_path
         .clone()
@@ -8566,20 +8778,21 @@ async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoRes
         ramdisk_path: ramdisk.as_deref(),
     });
     let memory_mb = health.memory_total_bytes / (1024 * 1024);
-    // legacy does not derive the queue size from the bandwidth cap.  It keeps a
-    // stable baseline and lets the dynamic queue adapt at runtime.  Memory
-    // suggestions are deliberately separate and target NFS/NAS write bursts.
-    let (cache_size, queue_mb, send_buffer_kb, peer_list) = if memory_mb > 0 && memory_mb < 2048 {
-        (0, 8, 256, 100)
-    } else if memory_mb < 4096 {
-        (1024, 32, 512, 200)
-    } else if memory_mb < 8192 {
-        (8192, 64, 1024, 300)
-    } else if memory_mb < 16384 {
-        (16384, 64, 1024, 500)
-    } else {
-        (32768, 128, 2048, 500)
-    };
+    // legacy non deriva la coda dal tetto di banda: mantiene una base stabile e
+    // lascia che la coda dinamica si adatti a runtime. I suggerimenti di memoria
+    // sono separati e mirano ai burst di scrittura su NFS/NAS.
+    let (cache_size, queue_mb, send_buffer_kb, peer_list): (i64, i64, i64, i64) =
+        if memory_mb > 0 && memory_mb < 2048 {
+            (0, 8, 256, 100)
+        } else if memory_mb < 4096 {
+            (1024, 32, 512, 200)
+        } else if memory_mb < 8192 {
+            (8192, 64, 1024, 300)
+        } else if memory_mb < 16384 {
+            (16384, 64, 1024, 500)
+        } else {
+            (32768, 128, 2048, 500)
+        };
     let cache_mb = cache_size * 16 / 1024;
     let active_downloads = 3;
     let active_seeds = 3;
@@ -8604,19 +8817,56 @@ async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoRes
         format!("send_buffer_watermark={}", send_buffer_kb * 1024),
         format!("max_peerlist_size={peer_list}"),
     ]);
-    let changes = [
+    let changes = vec![
         ("libtorrent_active_downloads", active_downloads.to_string()),
         ("libtorrent_active_seeds", active_seeds.to_string()),
         ("libtorrent_active_limit", active_limit.to_string()),
-        ("libtorrent_dynamic_queue", "yes".into()),
-        ("libtorrent_dynamic_queue_min", "1".into()),
-        ("libtorrent_dynamic_queue_max", "10".into()),
+        ("libtorrent_dynamic_queue", "yes".to_string()),
+        ("libtorrent_dynamic_queue_min", "1".to_string()),
+        ("libtorrent_dynamic_queue_max", "10".to_string()),
         ("libtorrent_cache_size", cache_size.to_string()),
-        ("libtorrent_cache_expiry", "300".into()),
+        ("libtorrent_cache_expiry", "300".to_string()),
         ("libtorrent_extra_settings", extra_settings.join("\n")),
     ];
-    for (key, value) in changes {
-        if let Err(error) = Config::save_setting(&s.cfg.data_dir, key, &value) {
+    LibtorrentOptimization {
+        changes,
+        memory_mb,
+        cache_size,
+        cache_mb,
+        queue_mb,
+        send_buffer_kb,
+        peer_list,
+    }
+}
+
+/// Applica l'ottimizzazione **solo se qualche valore è cambiato**, così il
+/// worker continuo non riscrive la configurazione ad ogni giro. Ritorna
+/// `(modificato, memoria_rilevata_mb)`.
+async fn apply_libtorrent_optimization(s: &AppState) -> Result<(bool, u64), String> {
+    let cfg = latest_config(s);
+    let optimization = libtorrent_optimization(&cfg);
+    let changed = optimization
+        .changes
+        .iter()
+        .any(|(key, value)| cfg.settings.get(*key).map(String::as_str) != Some(value.as_str()));
+    if !changed {
+        return Ok((false, optimization.memory_mb));
+    }
+    for (key, value) in &optimization.changes {
+        Config::save_setting(&s.cfg.data_dir, key, value).map_err(|error| format!("{key}: {error}"))?;
+    }
+    let optimized = latest_config(s);
+    s.torrents
+        .apply_settings(&optimized)
+        .map_err(|error| error.to_string())?;
+    Ok((true, optimization.memory_mb))
+}
+
+async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    let optimization = libtorrent_optimization(&cfg);
+    for (key, value) in &optimization.changes {
+        if let Err(error) = Config::save_setting(&s.cfg.data_dir, key, value) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"ok":false,"error":format!("{key}: {error}")})),
@@ -8635,9 +8885,9 @@ async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoRes
         Json(serde_json::json!({
             "ok": true,
             "applied": true,
-            "hardware": {"memory_mb": memory_mb, "cpu_percent": health.cpu_percent},
-            "settings": {"active_downloads": active_downloads, "active_seeds": active_seeds, "active_limit": active_limit, "dynamic_queue": true, "dynamic_queue_min": 1, "dynamic_queue_max": 10, "cache_blocks": cache_size, "cache_mb": cache_size * 16 / 1024, "queue_mb": queue_mb, "send_buffer_kb": send_buffer_kb, "peer_list": peer_list},
-            "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. RAM rilevata: {memory_mb} MB; cache: {cache_size} blocchi ({cache_mb} MB), coda disco: {queue_mb} MB, send-buffer: {send_buffer_kb} KiB, peer-list: {peer_list}. Connessioni e limiti globali di banda lasciati invariati."),
+            "hardware": {"memory_mb": optimization.memory_mb},
+            "settings": {"active_downloads": 3, "active_seeds": 3, "active_limit": 5, "dynamic_queue": true, "dynamic_queue_min": 1, "dynamic_queue_max": 10, "cache_blocks": optimization.cache_size, "cache_mb": optimization.cache_mb, "queue_mb": optimization.queue_mb, "send_buffer_kb": optimization.send_buffer_kb, "peer_list": optimization.peer_list},
+            "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. RAM rilevata: {} MB; cache: {} blocchi ({} MB), coda disco: {} MB, send-buffer: {} KiB, peer-list: {}. Connessioni e limiti globali di banda lasciati invariati.", optimization.memory_mb, optimization.cache_size, optimization.cache_mb, optimization.queue_mb, optimization.send_buffer_kb, optimization.peer_list),
             "bandwidth_limits_preserved": true,
             "connections_limit_preserved": true
         })),
@@ -10783,6 +11033,37 @@ async fn cycle_worker(state: AppState) {
     }
 }
 
+/// Ottimizzazione continua libtorrent: quando `libtorrent_auto_optimize` è
+/// attivo rivaluta periodicamente cache, buffer e coda in base alle risorse e
+/// applica solo i valori cambiati (nessuna riscrittura inutile).
+async fn optimize_worker(state: AppState) {
+    const OPTIMIZE_PERIOD: Duration = Duration::from_secs(15 * 60);
+    loop {
+        tokio::time::sleep(OPTIMIZE_PERIOD).await;
+        let enabled = Config::load(&state.config_path)
+            .ok()
+            .and_then(|cfg| cfg.settings.get("libtorrent_auto_optimize").cloned())
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        if !enabled {
+            continue;
+        }
+        match apply_libtorrent_optimization(&state).await {
+            Ok((true, memory_mb)) => {
+                tracing::info!(memory_mb, "libtorrent continuous optimization applied")
+            }
+            Ok((false, _)) => {
+                tracing::debug!("libtorrent continuous optimization: values already optimal")
+            }
+            Err(error) => tracing::warn!(%error, "libtorrent continuous optimization failed"),
+        }
+    }
+}
+
 pub async fn serve(
     state: AppState,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -10809,6 +11090,7 @@ pub async fn serve(
     ));
     let cycle = tokio::spawn(cycle_worker(state.clone()));
     let backups = tokio::spawn(backup_worker(state.clone()));
+    let optimize = tokio::spawn(optimize_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -10818,6 +11100,7 @@ pub async fn serve(
         registry.push(worker);
         registry.push(cycle);
         registry.push(backups);
+        registry.push(optimize);
     }
     let app = router(state);
     let result = tokio::try_join!(
@@ -11099,6 +11382,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["items"][0]["name"], "snapshot-1.zip");
+        // L'etichetta leggibile è presente (data locale del backup).
+        assert!(value["items"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains('/')));
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }

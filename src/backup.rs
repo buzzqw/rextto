@@ -3,14 +3,15 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 pub fn create_snapshot(data_dir: &Path, backup_root: &Path, retain: usize) -> Result<PathBuf> {
     fs::create_dir_all(backup_root)?;
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let destination = backup_root.join(format!("snapshot-{timestamp}.zip"));
+    // Nome leggibile e ordinabile cronologicamente (locale del server).
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let destination = backup_root.join(format!("rextto-backup-{stamp}.zip"));
     for name in [
         "rextto_series.db",
         "rextto_archive.db",
@@ -36,7 +37,14 @@ pub fn create_snapshot(data_dir: &Path, backup_root: &Path, retain: usize) -> Re
                     .is_some_and(|extension| extension == "zip")
         })
         .collect::<Vec<_>>();
-    snapshots.sort_by_key(|entry| entry.file_name());
+    // Ordina per data di modifica: con nomi legacy e nuovi mescolati il solo
+    // nome non riflette l'ordine cronologico reale.
+    snapshots.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
     let keep_from = snapshots.len().saturating_sub(retain.max(1));
     for entry in snapshots.into_iter().take(keep_from) {
         fs::remove_file(entry.path())?;

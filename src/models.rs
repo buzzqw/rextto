@@ -100,6 +100,12 @@ impl Quality {
         self.is_dv || !self.hdr.is_empty()
     }
 
+    /// Un REMUX conserva la qualità piena della sorgente: usato come criterio di
+    /// preferenza a parità di punteggio.
+    pub fn is_remux(&self) -> bool {
+        self.source == "remux"
+    }
+
     pub fn resolution_rank(&self) -> i32 {
         match self.resolution.as_str() {
             "2160p" => 6,
@@ -114,7 +120,9 @@ impl Quality {
 
     pub fn source_rank(&self) -> i32 {
         match self.source.as_str() {
-            "bluray" => 5,
+            // Il REMUX è la copia a risoluzione piena di un BluRay: stesso rango
+            // del BluRay, così le regole di upgrade lo trattano correttamente.
+            "bluray" | "remux" => 5,
             "webdl" => 4,
             "webrip" => 3,
             "dvdrip" => 2,
@@ -142,6 +150,12 @@ impl Quality {
         }
         if old.source == "hdtv" && self.source == "webdl" && new_res >= old_res {
             return Some("source");
+        }
+        // A parità di punteggio un REMUX vince sulla copia esistente, in
+        // particolare quando è il remux dell'episodio già scaricato: è la
+        // versione a risoluzione piena, senza ricodifica.
+        if self.is_remux() && !old.is_remux() && new_res >= old_res && new_score >= old_score {
+            return Some("remux");
         }
         if self.has_hdr() && !old.has_hdr() && new_res >= old_res {
             return Some("hdr");
@@ -301,6 +315,10 @@ pub struct ApprovalContext {
 pub struct Release {
     pub title: String,
     pub magnet: String,
+    /// Link `.torrent` diretto di un feed RSS (es. TorrentLeech) quando la
+    /// release non espone un magnet: viene risolto in infohash prima dell'uso.
+    #[serde(default)]
+    pub torrent_url: Option<String>,
     pub source: String,
     pub quality: Quality,
     pub kind: String,
@@ -455,6 +473,49 @@ mod tests {
         assert_eq!(
             base.upgrade_reason(&base, base.score() + 500, base.score(), 200),
             Some("score")
+        );
+    }
+
+    #[test]
+    fn remux_wins_at_equal_or_better_score() {
+        let webdl = Quality {
+            resolution: "1080p".into(),
+            source: "webdl".into(),
+            codec: "h264".into(),
+            audio: "aac".into(),
+            ..Default::default()
+        };
+        let remux = Quality {
+            resolution: "1080p".into(),
+            source: "remux".into(),
+            codec: "h264".into(),
+            audio: "aac".into(),
+            ..Default::default()
+        };
+        // Il REMUX ha uno score maggiore (280 vs 200) ma sotto la soglia minima:
+        // vince comunque grazie alla regola dedicata.
+        assert!(remux.score() > webdl.score());
+        assert_eq!(
+            remux.upgrade_reason(&webdl, remux.score(), webdl.score(), 200),
+            Some("remux")
+        );
+        // Un REMUX non sostituisce un altro REMUX a parità di punteggio.
+        assert_eq!(
+            remux.upgrade_reason(&remux, remux.score(), remux.score(), 200),
+            None
+        );
+        // Un REMUX con punteggio inferiore a un BluRay non vince.
+        let bluray = Quality {
+            resolution: "1080p".into(),
+            source: "bluray".into(),
+            codec: "h264".into(),
+            audio: "aac".into(),
+            ..Default::default()
+        };
+        assert!(bluray.score() > remux.score());
+        assert_eq!(
+            remux.upgrade_reason(&bluray, remux.score(), bluray.score(), 200),
+            None
         );
     }
 

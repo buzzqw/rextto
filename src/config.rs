@@ -2095,7 +2095,7 @@ mod tests {
         cfg.blacklist = vec!["cam".into()];
         cfg.content_filters = vec!["[non-latino]".into()];
         cfg.max_release_age_days = 7;
-        let release = |title: &str, age_days: i64| crate::models::Release {
+        let release = |title: &str, age_days: i64| crate::models::Release { torrent_url: None,
             title: title.into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "test".into(),
@@ -2124,7 +2124,7 @@ mod tests {
             keywords: vec!["x265".into()],
             enabled: true,
         }];
-        let release = |title: &str, source: &str| crate::models::Release {
+        let release = |title: &str, source: &str| crate::models::Release { torrent_url: None,
             title: title.into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: source.into(),

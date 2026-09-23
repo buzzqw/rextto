@@ -1569,7 +1569,7 @@ impl Database {
             [&normalized],
             |row| Ok((row.get::<_, Option<String>>(0)?.unwrap_or_default(), row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?.unwrap_or_default())),
         ).optional()? {
-            return Ok(Some(TorrentMeta { release: Release { title, magnet, source: "restored-db".into(), quality: Default::default(), kind: "series".into(), series: Some(series), season: Some(season), episode: Some(episode), is_pack: false, episode_range: vec![episode], year: None, discovered_at: Utc::now() } }));
+            return Ok(Some(TorrentMeta { release: Release { torrent_url: None, title, magnet, source: "restored-db".into(), quality: Default::default(), kind: "series".into(), series: Some(series), season: Some(season), episode: Some(episode), is_pack: false, episode_range: vec![episode], year: None, discovered_at: Utc::now() } }));
         }
         if let Some((title, year, magnet)) = self
             .conn
@@ -1587,7 +1587,7 @@ impl Database {
             .optional()?
         {
             return Ok(Some(TorrentMeta {
-                release: Release {
+                release: Release { torrent_url: None,
                     title,
                     magnet,
                     source: "restored-db".into(),
@@ -2745,7 +2745,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn release() -> Release {
-        Release {
+        Release { torrent_url: None,
             title: "Example.S01E01.1080p".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -2835,7 +2835,7 @@ mod tests {
         db.conn
             .execute("INSERT INTO series(id,name) VALUES (1,'Example')", [])
             .unwrap();
-        let pack = Release {
+        let pack = Release { torrent_url: None,
             title: "Example.S01E01-08.2160p".into(),
             magnet: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             source: "rss".into(),
@@ -2877,7 +2877,7 @@ mod tests {
 
         // A questo punto una release inferiore ma disponibile (1080p) viene
         // approvata come ripiego automatico.
-        let fallback = Release {
+        let fallback = Release { torrent_url: None,
             title: "Example.S01.1080p".into(),
             magnet: "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             source: "rss".into(),
@@ -3268,7 +3268,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Database::open(&path).unwrap();
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example Movie".into(),
             magnet: "magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
             source: "rss".into(),
@@ -3323,7 +3323,7 @@ mod tests {
         db.register_torrent(&release).unwrap();
         db.mark_torrent_completed(&hash, "/nas/example", 42)
             .unwrap();
-        let movie = Release {
+        let movie = Release { torrent_url: None,
             title: "Example Movie".into(),
             magnet: "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678".into(),
             source: "rss".into(),
@@ -3371,7 +3371,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Database::open(&path).unwrap();
-        let movie = |title: &str, resolution: &str| Release {
+        let movie = |title: &str, resolution: &str| Release { torrent_url: None,
             title: title.into(),
             magnet: format!(
                 "magnet:?xt=urn:btih:{}",
@@ -3507,7 +3507,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let pack = Release {
+        let pack = Release { torrent_url: None,
             title: "Reacher - Season 04 (2026) [1080p H265 ITA ENG EAC3 SUB ITA ENG WEB-DL]".into(),
             magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".into(),
             source: "ExtTo".into(),
@@ -3554,7 +3554,7 @@ mod tests {
                 params![episode, format!("Neagley.S01E0{episode}.2160p.DV.HDR.H.265")],
             ).unwrap();
         }
-        let pack = Release {
+        let pack = Release { torrent_url: None,
             title: "Neagley.S01E01-02.1080p.AMZN.WEB-DL.ITA.ENG.DDP5.1.H.264-G66".into(),
             magnet: "magnet:?xt=urn:btih:abababababababababababababababababababab".into(),
             source: "ExtTo".into(),
@@ -3603,7 +3603,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let pack = Release {
+        let pack = Release { torrent_url: None,
             title: "Neagley.S01E01-02.2160p.AMZN.WEB-DL.ITA.ENG.DDP5.1.DV.HDR.H.265-G66".into(),
             magnet: magnet.clone(),
             source: "ExtTo".into(),

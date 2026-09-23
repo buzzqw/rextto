@@ -277,6 +277,70 @@ pub fn stable_id(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Ritorna l'infohash v1 (esadecimale) di un file `.torrent` bencodato,
+/// calcolando lo SHA-1 del dizionario `info`. Serve ai feed RSS che espongono
+/// solo il download `.torrent` senza magnet (es. TorrentLeech).
+pub fn torrent_info_hash(bytes: &[u8]) -> Option<String> {
+    let (start, end) = bencode_info_span(bytes)?;
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes[start..end]);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Indice subito dopo il valore bencodato che inizia in `start`.
+fn bencode_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'i' => {
+            let position = bytes[start + 1..].iter().position(|byte| *byte == b'e')?;
+            Some(start + 1 + position + 1)
+        }
+        b'l' => {
+            let mut index = start + 1;
+            while *bytes.get(index)? != b'e' {
+                index = bencode_value_end(bytes, index)?;
+            }
+            Some(index + 1)
+        }
+        b'd' => {
+            let mut index = start + 1;
+            while *bytes.get(index)? != b'e' {
+                index = bencode_value_end(bytes, index)?;
+                index = bencode_value_end(bytes, index)?;
+            }
+            Some(index + 1)
+        }
+        b'0'..=b'9' => {
+            let colon = bytes[start..].iter().position(|byte| *byte == b':')? + start;
+            let length = std::str::from_utf8(&bytes[start..colon])
+                .ok()?
+                .parse::<usize>()
+                .ok()?;
+            Some(colon + 1 + length)
+        }
+        _ => None,
+    }
+}
+
+/// Individua l'intervallo del valore associato alla chiave `info` nel
+/// dizionario principale del torrent.
+fn bencode_info_span(bytes: &[u8]) -> Option<(usize, usize)> {
+    if *bytes.first()? != b'd' {
+        return None;
+    }
+    let mut index = 1;
+    while *bytes.get(index)? != b'e' {
+        let key_start = index;
+        let key_end = bencode_value_end(bytes, key_start)?;
+        let value_start = key_end;
+        let value_end = bencode_value_end(bytes, value_start)?;
+        if &bytes[key_start..key_end] == b"4:info" {
+            return Some((value_start, value_end));
+        }
+        index = value_end;
+    }
+    None
+}
+
 /// Chiave di raggruppamento "condensed" come il legacy `mfs_key`: minuscolo e
 /// solo caratteri alfanumerici. Usata per unire le release della stessa serie o
 /// dello stesso film quando non esiste un id TMDB.
@@ -552,6 +616,20 @@ mod tests {
     fn condensed_key_keeps_only_alphanumerics() {
         assert_eq!(condensed_key("The Veil (2024)"), "theveil2024");
         assert_eq!(condensed_key("F.B.I."), "fbi");
+    }
+
+    #[test]
+    fn extracts_torrent_info_hash() {
+        use sha1::{Digest, Sha1};
+        // Torrent minimale: il valore hashare è solo il dizionario `info`.
+        let body = b"d8:announce12:http://t/ann4:infod6:lengthi100e4:name3:abcee";
+        let hash = torrent_info_hash(body).expect("infohash");
+        let mut expected = Sha1::new();
+        expected.update(b"d6:lengthi100e4:name3:abce");
+        assert_eq!(hash, format!("{:x}", expected.finalize()));
+        assert_eq!(hash.len(), 40);
+        // Payload non valido.
+        assert!(torrent_info_hash(b"not a torrent").is_none());
     }
 
     #[test]

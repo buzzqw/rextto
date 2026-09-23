@@ -1553,7 +1553,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Only Murders in the Building S01E01".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -1602,7 +1602,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Star Trek Strange New Worlds S03E10".into(),
             magnet: String::new(),
             source: "archive".into(),
@@ -1658,7 +1658,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example S01E01".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -1688,7 +1688,7 @@ mod tests {
             season_subfolders: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example S02E03".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -1715,7 +1715,7 @@ mod tests {
             "tag_dir_rules".into(),
             r#"[{"tag":"Film","temp_dir":"","final_dir":"/home/user/film"},{"tag":"Serie TV","temp_dir":"","final_dir":"/home/user/serie"}]"#.into(),
         );
-        let movie = Release {
+        let movie = Release { torrent_url: None,
             title: "Example Movie".into(),
             magnet: "magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
             source: "archive".into(),
@@ -1733,7 +1733,7 @@ mod tests {
             destination_for(&movie, &cfg),
             Some(PathBuf::from("/home/user/film"))
         );
-        let series = Release {
+        let series = Release { torrent_url: None,
             kind: "series".into(),
             series: Some("Example".into()),
             season: Some(1),
@@ -1767,7 +1767,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("01.mkv"), b"one").unwrap();
         fs::write(root.join("Episode 02.mkv"), b"two").unwrap();
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example.S03E01-02.1080p.WEB-DL".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "test".into(), quality: Default::default(), kind: "series".into(),
@@ -1786,7 +1786,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rextto-opaque-pack-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("01.mkv"), b"one").unwrap();
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example.S03.COMPLETE.1080p.WEB-DL".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "test".into(), quality: Default::default(), kind: "series".into(),
@@ -1802,7 +1802,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rextto-incomplete-pack-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("Example.S03E01.mkv"), b"one").unwrap();
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example.S03E01-02.1080p.WEB-DL".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "test".into(), quality: Default::default(), kind: "series".into(),
@@ -1846,7 +1846,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example S01E01".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -1888,7 +1888,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example S01E02".into(),
             magnet: String::new(),
             source: "archive".into(),
@@ -1928,7 +1928,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example.Movie.2024.1080p".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -1980,7 +1980,7 @@ mod tests {
             ])
             .to_string(),
         );
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example S01E01".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),
@@ -2015,7 +2015,7 @@ mod tests {
             ])
             .to_string(),
         );
-        let release = Release {
+        let release = Release { torrent_url: None,
             title: "Example Movie 2024".into(),
             magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
             source: "rss".into(),

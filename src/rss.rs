@@ -1,4 +1,8 @@
-use crate::{config::IndexerConfig, models::Release, parser::parse_release_at};
+use crate::{
+    config::IndexerConfig,
+    models::Release,
+    parser::{parse_release_at, parse_release_source},
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use quick_xml::{
@@ -45,6 +49,7 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
     let mut in_item = false;
     let mut title = String::new();
     let mut magnet = String::new();
+    let mut torrent_url = String::new();
     let mut description = String::new();
     let mut size_bytes: Option<f64> = None;
     let mut discovered_at = Utc::now();
@@ -57,6 +62,7 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                     in_item = true;
                     title.clear();
                     magnet.clear();
+                    torrent_url.clear();
                     description.clear();
                     size_bytes = None;
                     discovered_at = Utc::now();
@@ -72,6 +78,8 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                     {
                         if let Some(found) = magnet_in(&value) {
                             magnet = found;
+                        } else if crate::parser::is_torrent_url(&value) {
+                            torrent_url = value;
                         }
                     }
                 }
@@ -84,13 +92,14 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                         size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                     }
                 }
-                if (name == "link" || name == "enclosure" || name == "content") && magnet.is_empty()
-                {
+                if name == "link" || name == "enclosure" || name == "content" {
                     if let Some(value) =
                         attribute(&start, "href").or_else(|| attribute(&start, "url"))
                     {
                         if let Some(found) = magnet_in(&value) {
                             magnet = found;
+                        } else if crate::parser::is_torrent_url(&value) {
+                            torrent_url = value;
                         }
                     }
                 }
@@ -122,6 +131,9 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                 if let Some(found) = magnet_in(&value) {
                     magnet = found;
                 }
+                if current == "link" && crate::parser::is_torrent_url(&value) {
+                    torrent_url = value;
+                }
             }
             Event::CData(text) if in_item => {
                 let value = String::from_utf8_lossy(&text).into_owned();
@@ -131,6 +143,9 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                 }
                 if let Some(found) = magnet_in(&value) {
                     magnet = found;
+                }
+                if current == "link" && crate::parser::is_torrent_url(&value) {
+                    torrent_url = value;
                 }
             }
             Event::End(end) => {
@@ -144,9 +159,13 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                             (mb > 0.0).then_some(mb)
                         });
                     if !size_mb.is_some_and(|mb| mb < 50.0) {
-                        if let Some(release) =
-                            parse_release_at(&title, &magnet, source, discovered_at)
-                        {
+                        if let Some(release) = parse_release_source(
+                            &title,
+                            &magnet,
+                            (!torrent_url.is_empty()).then_some(torrent_url.as_str()),
+                            source,
+                            discovered_at,
+                        ) {
                             out.push(release);
                         }
                     }

@@ -194,7 +194,7 @@ mod tests {
     fn recent_entries_respect_the_limit() {
         let path = std::env::temp_dir().join(format!("rextto-archive-{}", uuid::Uuid::new_v4()));
         let archive = Archive::open(&path).unwrap();
-        let release = |index: usize| Release {
+        let release = |index: usize| Release { torrent_url: None,
             title: format!("Release {index}"),
             magnet: format!("magnet:?xt=urn:btih:{:040x}", index),
             source: format!("source-{index}"),
@@ -223,7 +223,7 @@ mod tests {
     fn retains_distinct_hashes_and_deduplicates_the_same_magnet() {
         let path = std::env::temp_dir().join(format!("rextto-archive-{}", uuid::Uuid::new_v4()));
         let archive = Archive::open(&path).unwrap();
-        let release = |magnet: &str, title: &str| Release {
+        let release = |magnet: &str, title: &str| Release { torrent_url: None,
             title: title.into(),
             magnet: magnet.into(),
             source: "test".into(),

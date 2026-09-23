@@ -59,9 +59,15 @@ pub async fn run_cycle_domain(
         .parse::<i64>()
         .unwrap_or(0);
     let now = Utc::now().timestamp();
+    // Un ciclo richiesto esplicitamente per i fumetti deve partire subito,
+    // senza attendere la scadenza dell'intervallo automatico: altrimenti il
+    // pulsante "Fumetti" non fa nulla quando il controllo non è ancora dovuto.
+    let comics_requested = domain == Some("comics");
     if domain != Some("series")
         && domain != Some("movies")
-        && (comics_interval == 0 || now.saturating_sub(last_comics_check) >= comics_interval)
+        && (comics_requested
+            || comics_interval == 0
+            || now.saturating_sub(last_comics_check) >= comics_interval)
     {
         match crate::comics::run_cycle(
             comics,
@@ -393,16 +399,18 @@ pub async fn run_cycle_domain(
                         ((complete && old_complete)
                             || (!complete
                                 && old_complete
-                                && old.quality.score_with_settings(&cfg.settings) >= score)
+                                && incumbent_wins(&release, score, old, &cfg.settings))
                             || (!complete && !old_complete && old_range.is_superset(&range)))
-                            && old.quality.score_with_settings(&cfg.settings) >= score
+                            && incumbent_wins(&release, score, old, &cfg.settings)
                     }
             }) {
-                tracing::info!(
+                // Scartato perché nella selezione c'è già una release uguale o
+                // migliore: è una deduplica routine, non un evento da INFO.
+                tracing::debug!(
                     target = %release_target(&release),
                     score,
                     reason = "superseded by an equal or better release already selected",
-                    "🚫 release rejected"
+                    "🚫 release rejected (superseded)"
                 );
                 continue;
             }
@@ -421,7 +429,7 @@ pub async fn run_cycle_domain(
                     .collect::<std::collections::HashSet<_>>();
                 let old_complete = old.episode_range.iter().any(|episode| *episode == 0);
                 !((complete || (range.len() > 1 && range.is_superset(&old_range)))
-                    && score >= old.quality.score_with_settings(&cfg.settings)
+                    && !incumbent_wins(&release, score, old, &cfg.settings)
                     && (!old_complete || complete))
             });
             if let Some(index) = best.iter().position(|old| {
@@ -430,7 +438,7 @@ pub async fn run_cycle_domain(
                     && old.season == Some(season)
                     && old.episode_range == release.episode_range
             }) {
-                if best[index].quality.score_with_settings(&cfg.settings) < score {
+                if !incumbent_wins(&release, score, &best[index], &cfg.settings) {
                     best[index] = release;
                 }
             } else {
@@ -439,7 +447,7 @@ pub async fn run_cycle_domain(
         } else if let Some(index) = best.iter().position(|old| {
             old.kind == "movie" && old.title == release.title && old.year == release.year
         }) {
-            if best[index].quality.score_with_settings(&cfg.settings) < score {
+            if !incumbent_wins(&release, score, &best[index], &cfg.settings) {
                 best[index] = release;
             }
         } else {
@@ -493,7 +501,30 @@ pub async fn run_cycle_domain(
         }
         live
     };
-    for release in best {
+    for mut release in best {
+        // I feed RSS che espongono solo il link `.torrent` (es. TorrentLeech)
+        // non hanno un magnet: scarica il file, ricava l'infohash e conserva il
+        // file per l'aggiunta (ai tracker privati serve per l'announce).
+        let mut torrent_file: Option<std::path::PathBuf> = None;
+        if release.magnet.trim().is_empty() {
+            if let Some(url) = release.torrent_url.clone() {
+                match resolve_torrent_url(engine, cfg, &url).await {
+                    Ok((magnet, path)) => {
+                        release.magnet = magnet;
+                        torrent_file = Some(path);
+                    }
+                    Err(error) => {
+                        stats.error("torrent_link");
+                        tracing::warn!(
+                            target = %release_target(&release),
+                            %error,
+                            "torrent link resolution failed"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
         let is_ready_pending =
             magnet_hash(&release.magnet).is_some_and(|hash| ready_pending.contains(&hash));
         if release.kind == "series" {
@@ -567,7 +598,11 @@ pub async fn run_cycle_domain(
         };
         if approved {
             let download_dir = crate::postprocess::download_dir_for(&release, cfg);
-            match torrents.add_with_path(&release.magnet, cfg, download_dir.as_deref()) {
+            let added = match &torrent_file {
+                Some(path) => torrents.add_file_with_path(path, cfg, download_dir.as_deref()),
+                None => torrents.add_with_path(&release.magnet, cfg, download_dir.as_deref()),
+            };
+            match added {
                 Ok(true) => {
                     tracing::info!(
                         target = %release_target(&release),
@@ -635,15 +670,16 @@ pub async fn run_cycle_domain(
                 }
             }
         } else {
-            // A duplicate (equal or better already present) is routine noise:
-            // keep it at debug so the cycle log stays readable.
-            if approval_reason == "duplicate" {
+            // Gli scarti "già presente / già in corso" (duplicato o episodio
+            // attivo nella sessione) sono routine: restano a debug per tenere
+            // leggibile il log del ciclo.
+            if matches!(approval_reason.as_str(), "duplicate" | "active_episode") {
                 tracing::debug!(
                     target = %release_target(&release),
                     score,
                     reason = %decision_reason,
                     approval_reason = %approval_reason,
-                    "download skipped (duplicate)"
+                    "download skipped (already present or active)"
                 );
             } else {
                 tracing::info!(
@@ -745,6 +781,38 @@ fn human_duration(seconds: i64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// Scarica un `.torrent`, ne ricava l'infohash v1 e lo salva nella state dir.
+/// Ritorna il magnet equivalente e il percorso del file (per l'aggiunta).
+async fn resolve_torrent_url(
+    engine: &Engine,
+    cfg: &Config,
+    url: &str,
+) -> Result<(String, std::path::PathBuf)> {
+    let bytes = engine.fetch_torrent(url).await?;
+    let hash = crate::utils::torrent_info_hash(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("invalid torrent payload"))?;
+    let dir = cfg.state_dir.join("feed_torrents");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{hash}.torrent"));
+    std::fs::write(&path, &bytes)?;
+    Ok((format!("magnet:?xt=urn:btih:{hash}"), path))
+}
+
+/// True quando `incumbent` non deve essere sostituito da `candidate`: a parità
+/// di punteggio vince il REMUX (versione a risoluzione piena), in particolare
+/// quando è il remux dell'episodio già selezionato/scaricato.
+fn incumbent_wins(
+    candidate: &Release,
+    candidate_score: i64,
+    incumbent: &Release,
+    settings: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let incumbent_score = incumbent.quality.score_with_settings(settings);
+    incumbent_score > candidate_score
+        || (incumbent_score == candidate_score
+            && !(candidate.quality.is_remux() && !incumbent.quality.is_remux()))
 }
 
 fn gap_episodes_for_release(

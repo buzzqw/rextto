@@ -471,12 +471,45 @@ pub fn parse_release_at(
     source: &str,
     discovered_at: chrono::DateTime<Utc>,
 ) -> Option<Release> {
+    parse_release_source(title, magnet, None, source, discovered_at)
+}
+
+/// True per un link HTTP(S) che punta a un file `.torrent`.
+pub fn is_torrent_url(value: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("http://") || value.starts_with("https://"))
+        && value
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase()
+            .ends_with(".torrent")
+}
+
+/// Come [`parse_release_at`], ma accetta anche un link `.torrent` diretto: molti
+/// feed RSS (es. TorrentLeech) non espongono un magnet, solo il download del
+/// `.torrent`. Una release è valida se ha almeno un magnet **o** un link.
+pub fn parse_release_source(
+    title: &str,
+    magnet: &str,
+    torrent_url: Option<&str>,
+    source: &str,
+    discovered_at: chrono::DateTime<Utc>,
+) -> Option<Release> {
     // Alcune fonti (es. BTDigg) usano un magnet troncato come testo del link:
     // non è un titolo valido, scartalo prima di creare una release.
     if title.trim().to_ascii_lowercase().starts_with("magnet:") {
         return None;
     }
-    let magnet = sanitize_magnet(magnet, Some(title))?;
+    let torrent_url = torrent_url
+        .map(str::trim)
+        .filter(|value| is_torrent_url(value))
+        .map(str::to_owned);
+    let magnet = match sanitize_magnet(magnet, Some(title)) {
+        Some(value) => value,
+        None if torrent_url.is_none() => return None,
+        None => String::new(),
+    };
     // Ordine di riconoscimento come legacy: range, multi-episodio concatenato,
     // SxxExx singolo, NxNN, data (YYYY-MM-DD), stagione completa.
     let range_re =
@@ -566,6 +599,7 @@ pub fn parse_release_at(
     Some(Release {
         title: title.into(),
         magnet,
+        torrent_url,
         source: source.into(),
         quality: parse_quality(title),
         kind: kind.into(),

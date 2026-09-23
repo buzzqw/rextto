@@ -882,6 +882,30 @@ impl LibtorrentClient {
         Ok(Some(native_string(&hash)))
     }
 
+    /// Aggiunge un `.torrent` da file scegliendo la cartella come
+    /// [`Self::add_with_path`]. Usato dai feed RSS che espongono solo il
+    /// download `.torrent`: i tracker privati richiedono il file per l'announce.
+    pub fn add_file_with_path(
+        &self,
+        torrent_path: &std::path::Path,
+        cfg: &Config,
+        preferred_path: Option<&std::path::Path>,
+    ) -> Result<bool> {
+        let save_path = preferred_path
+            .filter(|path| path.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| Self::preferred_download_path(cfg));
+        fs::create_dir_all(&save_path)?;
+        match self.add_torrent_file(torrent_path, &save_path)? {
+            Some(_) => Ok(true),
+            None if self.dry_run => {
+                tracing::info!("dry-run: torrent file accepted, not started");
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn list(&self) -> Vec<TorrentView> {
         let Some(session) = &self.session else {
             return self.torrents.read().unwrap().values().cloned().collect();

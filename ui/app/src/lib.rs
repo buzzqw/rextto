@@ -16,7 +16,6 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("series", "Serie TV"),
             ("movies", "Film"),
             ("gaps", "Mancanti"),
-            ("calendar", "Calendario"),
         ],
     ),
     (
@@ -944,7 +943,6 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "health"><HealthView data /></Show>
                         <Show when=move || page.get() == "charts"><ChartsView data /></Show>
                         <Show when=move || page.get() == "gaps"><MissingView data /></Show>
-                        <Show when=move || page.get() == "calendar"><CalendarView data /></Show>
                         <Show when=move || page.get() == "blocklist"><BlocklistView data /></Show>
                         <Show when=move || page.get() == "license"><LicenseView /></Show>
                     </div>
@@ -1650,6 +1648,7 @@ fn setting_tooltip(key: &str) -> &'static str {
         "libtorrent_dynamic_queue" => "Regola automaticamente quanti torrent sono attivi in base al carico.",
         "libtorrent_dynamic_queue_min" => "Numero minimo di download dinamici. La coda cambia al massimo di uno per volta.",
         "libtorrent_dynamic_queue_max" => "Numero massimo di download dinamici. Servono campioni consecutivi coerenti prima di aumentare la coda.",
+        "libtorrent_auto_optimize" => "Applica periodicamente l'ottimizzazione di cache, buffer e coda in base alle risorse, senza dover premere Ottimizza.",
         "libtorrent_sequential" => "Scarica i file in ordine sequenziale invece che a pezzi sparsi.",
         "libtorrent_extra_settings" => "Impostazioni libtorrent avanzate, una per riga nel formato chiave=valore (es. max_peerlist_size=4000). Solo le chiavi riconosciute vengono applicate.",
         "libtorrent_active_downloads" => "Numero massimo di download attivi contemporaneamente.",
@@ -4507,6 +4506,8 @@ fn load_discover(
 fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
     let tmdb_query = RwSignal::new(String::new());
     let tmdb_kind = RwSignal::new("series".to_string());
+    // Tab di pagina di Esplora: Calendario (default, primo) | Serie TV | Film.
+    let explore_tab = RwSignal::new("calendar".to_string());
     let tmdb_results = RwSignal::new(Vec::<Value>::new());
     let trending = RwSignal::new(Vec::<Value>::new());
     let trend_kind = RwSignal::new("series".to_string());
@@ -4522,14 +4523,17 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
     load_discover(data, trending, trend_kind, trend_window, "trending");
     view! {
         <div class="view">
+            <div class="tabs" style="margin-bottom:10px">
+                <button class="tab" class:active=move || explore_tab.get() == "calendar" on:click=move |_| explore_tab.set("calendar".into())>{ctx_tr("Calendario")}</button>
+                <button class="tab" class:active=move || explore_tab.get() == "series" on:click=move |_| { explore_tab.set("series".into()); tmdb_kind.set("series".into()); trend_kind.set("series".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Serie TV")}</button>
+                <button class="tab" class:active=move || explore_tab.get() == "movie" on:click=move |_| { explore_tab.set("movie".into()); tmdb_kind.set("movie".into()); trend_kind.set("movie".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Film")}</button>
+            </div>
+            <Show when=move || explore_tab.get() == "calendar"><CalendarView data /></Show>
+            <Show when=move || explore_tab.get() != "calendar">
             <Show when=move || !add_message.get().is_empty()>
                 <div class="notice">{move || add_message.get()}</div>
             </Show>
             <Panel title="Di tendenza su TMDB">
-                <div class="tabs" style="margin-bottom:10px">
-                    <button class="tab" class:active=move || trend_kind.get() == "series" on:click=move |_| { trend_kind.set("series".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Serie TV")}</button>
-                    <button class="tab" class:active=move || trend_kind.get() == "movie" on:click=move |_| { trend_kind.set("movie".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Film")}</button>
-                </div>
                 <div class="toolbar">
                     <button class="btn" title=ctx_tr("Le uscite più popolari della settimana") on:click=move |_| { trend_window.set("week".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Tendenza settimana")}</button>
                     <button class="btn" title=ctx_tr("Le uscite più popolari di oggi") on:click=move |_| { trend_window.set("day".into()); load_discover(data, trending, trend_kind, trend_window, "trending"); }>{ctx_tr("Tendenza oggi")}</button>
@@ -4682,6 +4686,7 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                     </div>
                 </div>
             </Show>
+            </Show>
         </div>
     }
 }
@@ -4698,8 +4703,6 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
     let query = RwSignal::new(String::new());
     let selected = RwSignal::new(Vec::<i64>::new());
     let manual_magnet = RwSignal::new(String::new());
-    let feed_items = RwSignal::new(Vec::<Value>::new());
-    let feed_tab = RwSignal::new("series".to_string());
     view! {
         <div class="view">
             <div class="tabs">
@@ -4804,45 +4807,6 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                     </table>
                 </div>
             </Panel>
-            <Panel title="Dal feed">
-                <div class="toolbar">
-                    <button class="btn" class:primary=move || feed_tab.get()=="series" on:click=move |_| feed_tab.set("series".into())>{ctx_tr("Serie TV dal Feed")}</button>
-                    <button class="btn" class:primary=move || feed_tab.get()=="movie" on:click=move |_| feed_tab.set("movie".into())>{ctx_tr("Film dal Feed")}</button>
-                    <button class="btn sm" on:click=move |_| {
-                        spawn_local(async move {
-                            match get("/api/feed/status").await {
-                                Ok(value) => feed_items.set(array(&value, "items")),
-                                Err(error) => data.update(|current| current.error = error),
-                            }
-                        });
-                    } >{ctx_tr("Aggiorna")}</button>
-                </div>
-                <Show when=move || feed_items.get().is_empty()>
-                    <Empty text="Premi Aggiorna per mostrare le release già raccolte dai feed." />
-                </Show>
-                <div class="table-wrap" style="margin-top:10px">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Monitorato")}</th><th>{ctx_tr("Release")}</th><th>{ctx_tr("Fonte")}</th><th></th></tr></thead>
-                        <tbody>{move || {
-                            let kind = feed_tab.get();
-                            feed_items.get().into_iter().filter(|item| text(item, "kind", "") == kind).flat_map(|item| {
-                                let name = text(&item, "name", "-");
-                                array(&item, "matches").into_iter().map(move |release| (name.clone(), release))
-                            }).map(|(name, item)| {
-                                let title = text(&item, "title", "Release");
-                                let magnet = text(&item, "magnet", "");
-                                let source = text(&item, "source", "feed");
-                                view! {
-                                    <tr>
-                                        <td>{name}</td><td class="truncate">{title.clone()}</td><td class="muted">{source.clone()}</td>
-                                        <td><button class="btn sm primary" on:click=move |_| run_post(data, "/api/archive/add", Some(json!({"title": title.clone(), "magnet": magnet.clone(), "source": source.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button></td>
-                                    </tr>
-                                }
-                            }).collect_view()
-                        }}</tbody>
-                    </table>
-                </div>
-            </Panel>
             </Show>
             <Show when=move || tab.get() == "seen">
                 <FeedSeenPanel data />
@@ -4864,6 +4828,9 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
     let entries = RwSignal::new(Vec::<Value>::new());
     let entries_loading = RwSignal::new(false);
     let query = RwSignal::new(String::new());
+    // Filtro unificato: mostra solo i gruppi che corrispondono a un titolo
+    // monitorato (eredita la funzione del vecchio pannello "Dal feed").
+    let monitored_only = RwSignal::new(false);
     view! {
         <Panel title="Visti dal feed">
             <div class="toolbar">
@@ -4891,6 +4858,7 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                     <input prop:value=query on:input=move |event| query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca per titolo… (* e ? come wildcard)") title=ctx_tr("Filtra i gruppi visti per parole nel titolo") />
                 </form>
                     <button class="btn sm" on:click=move |_| load_seen_groups(kind.get(), query.get(), groups, total, data)>{ctx_tr("Aggiorna")}</button>
+                    <label class="check" title=ctx_tr("Mostra solo i titoli che stai monitorando (serie/film in libreria)")><input type="checkbox" prop:checked=move || monitored_only.get() on:change=move |event| monitored_only.set(event_target_checked(&event)) /> <span>{ctx_tr("Solo monitorati")}</span></label>
                     <span class="muted">{move || format!("{} gruppi", total.get())}</span>
                 </Show>
             </div>
@@ -4904,7 +4872,24 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
             <div class="table-wrap" style="margin-top:10px">
                 <table class="data-table">
                     <thead><tr><th>{ctx_tr("Titolo")}</th><th>{ctx_tr("Anno/Stagione")}</th><th>{ctx_tr("N.")}</th><th>{ctx_tr("Migliore")}</th><th>{ctx_tr("Score")}</th><th>{ctx_tr("Ultimo")}</th><th></th></tr></thead>
-                    <tbody>{move || groups.get().into_iter().map(|group| {
+                    <tbody>{move || {
+                        let monitored: Vec<String> = array(&data.get().library, "series")
+                            .into_iter()
+                            .chain(array(&data.get().library, "movies"))
+                            .map(|item| text(&item, "name", "").to_lowercase())
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        let only = monitored_only.get();
+                        groups.get().into_iter().filter(|group| {
+                            if !only { return true; }
+                            let group_name = text(group, "group_name", "").to_lowercase();
+                            !group_name.is_empty()
+                                && monitored.iter().any(|name| {
+                                    name == &group_name
+                                        || group_name.contains(name.as_str())
+                                        || name.contains(&group_name)
+                                })
+                        }).map(|group| {
                         let key = text(&group, "group_key", "");
                         let name = text(&group, "group_name", "N/D");
                         let year = number(&group, "year");
@@ -4932,7 +4917,7 @@ fn FeedSeenPanel(data: RwSignal<Data>) -> impl IntoView {
                                 }>{ctx_tr("Mostra")}</button></td>
                             </tr>
                         }
-                    }).collect_view()}</tbody>
+                    }).collect_view()}}</tbody>
                 </table>
             </div>
             <Show when=move || !expanded.get().is_empty()>
@@ -5733,29 +5718,13 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                                  }
                              });
                          }>{ctx_tr("Ottimizza")}</button>
-                         <button class="btn sm" title=ctx_tr("Controlla su GitHub se esiste una versione di libtorrent più recente di quella installata") on:click=move |_| {
-                            spawn_local(async move {
-                                match send("POST", "/api/libtorrent/check-update", None).await {
-                                    Ok(value) => {
-                                        let installed = text(&value, "installed", "?");
-                                        let latest = text(&value, "latest", "?");
-                                        if value.get("update_available").and_then(Value::as_bool).unwrap_or(false) {
-                                            let apt = text(&value, "apt_candidate", "-");
-                                            push_toast(data, "info", format!("libtorrent {installed} → nuova versione {latest} (repo: {apt})"));
-                                        } else {
-                                            push_toast(data, "ok", format!("libtorrent {installed}: già aggiornato (ultima {latest})"));
-                                        }
-                                    }
-                                    Err(error) => push_toast(data, "err", error),
-                                }
-                            });
-                        }>{ctx_tr("Verifica aggiornamenti")}</button>
                         <span class="muted">{ctx_tr("Alcune modifiche si applicano al riavvio del servizio.")}</span>
                     </div>
                     <div class="grid-2">
                         <SettingGroup title="Generale">
                             <BooleanSetting label="Client abilitato" setting_key="libtorrent_enabled" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "enabled", "false")) />
                              <BooleanSetting label="Auto-gestione dinamica coda e risorse" setting_key="libtorrent_dynamic_queue" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dynamic_queue", "false")) />
+                             <BooleanSetting label="Ottimizzazione continua (periodica)" setting_key="libtorrent_auto_optimize" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", "false")) />
                              <TextSetting label="Slot download dinamici minimi" setting_key="libtorrent_dynamic_queue_min" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dynamic_queue_min", "1")) placeholder="1" />
                              <TextSetting label="Slot download dinamici massimi" setting_key="libtorrent_dynamic_queue_max" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dynamic_queue_max", "10")) placeholder="10" />
                             <BooleanSetting label="Download sequenziale" setting_key="libtorrent_sequential" value=Signal::derive(move || raw(&data.get().config, "libtorrent_sequential", "false")) />
@@ -7518,10 +7487,10 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
         <div class="view">
             <Panel title="Azioni">
                 <div class="toolbar">
-                    <button class="btn primary" on:click=move |_| run_post(data, "/api/backup", None, "Backup creato")>{ctx_tr("Backup")}</button>
-                    <button class="btn" on:click=move |_| run_post(data, "/api/maintenance/clean-trash", None, "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
-                    <button class="btn" on:click=move |_| run_post(data, "/api/database/rescore", None, "Scoring ricalcolato")>{ctx_tr("Ricalcola scoring")}</button>
-                    <button class="btn" on:click=move |_| run_post(data, "/api/scan-all-archives", None, "Archivi scansionati")>{ctx_tr("Scansiona archivi")}</button>
+                    <button class="btn primary" title=ctx_tr("Crea subito un backup compresso di database e configurazione") on:click=move |_| run_post(data, "/api/backup", None, "Backup creato")>{ctx_tr("Backup")}</button>
+                    <button class="btn" title=ctx_tr("Svuota subito il cestino ignorando la conservazione configurata") on:click=move |_| run_post(data, "/api/maintenance/clean-trash", None, "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
+                    <button class="btn" title=ctx_tr("Ricalcola il punteggio di qualità degli episodi indicizzati con le regole scoring attuali") on:click=move |_| run_post(data, "/api/database/rescore", None, "Scoring ricalcolato")>{ctx_tr("Ricalcola scoring")}</button>
+                    <button class="btn" title=ctx_tr("Rileggi le cartelle archivio e registra nel database i file video già presenti") on:click=move |_| run_post(data, "/api/scan-all-archives", None, "Archivi scansionati")>{ctx_tr("Scansiona archivi")}</button>
                     <button class="btn" title=ctx_tr("Rinomina in background tutti i file archiviati, con progresso") on:click=move |_| {
                         run_post(data, "/api/rename-all", Some(json!({})), "Rinomina avviata…");
                         spawn_local(async move {
@@ -7540,8 +7509,8 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                         });
                     }>{ctx_tr("Rinomina tutto")}</button>
                     <small class="muted">{move || rename_status.get()}</small>
-                    <button class="btn" on:click=move |_| run_post(data, "/api/config/migrate", None, "Configurazione importata")>{ctx_tr("Importa config legacy")}</button>
-                    <button class="btn" on:click=move |_| run_post(data, "/api/setup/import", None, "Import eseguito")>{ctx_tr("Importa dati esistenti")}</button>
+                    <button class="btn" title=ctx_tr("Importa impostazioni e libreria da una configurazione legacy (Extto/rextto)") on:click=move |_| run_post(data, "/api/config/migrate", None, "Configurazione importata")>{ctx_tr("Importa config legacy")}</button>
+                    <button class="btn" title=ctx_tr("Importa serie, film e storico dai database già presenti nella cartella dati") on:click=move |_| run_post(data, "/api/setup/import", None, "Import eseguito")>{ctx_tr("Importa dati esistenti")}</button>
                     <button class="btn" title=ctx_tr("Riavvia il servizio rextto per applicare gli aggiornamenti (richiede l'helper installato una volta da root)") on:click=move |_| {
                         spawn_local(async move {
                             match send("POST", "/api/service/restart", None).await {
@@ -7552,14 +7521,15 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     }>{ctx_tr("Riavvia servizio")}</button>
                 </div>
                 <div class="toolbar" style="margin-top:10px">
-                    <label>{ctx_tr("Retain cicli")}</label><input prop:value=retain on:input=move |event| retain.set(event_target_value(&event)) />
-                    <label>{ctx_tr("Giorni errori")}</label><input prop:value=age on:input=move |event| age.set(event_target_value(&event)) />
-                    <button class="btn danger" on:click=move |_| {
+                    <label title=ctx_tr("Numero di cicli recenti da conservare")>{ctx_tr("Retain cicli")}</label><input prop:value=retain on:input=move |event| retain.set(event_target_value(&event)) title=ctx_tr("Quanti cicli di ricerca recenti tenere nello storico") />
+                    <label title=ctx_tr("Età in giorni oltre la quale eliminare gli errori")>{ctx_tr("Giorni errori")}</label><input prop:value=age on:input=move |event| age.set(event_target_value(&event)) title=ctx_tr("Elimina gli errori più vecchi di questi giorni") />
+                    <button class="btn danger" title=ctx_tr("Elimina dallo storico cicli e errori oltre i limiti indicati") on:click=move |_| {
                         let body = json!({"retain_cycles": retain.get().parse::<i64>().ok(), "error_age_days": age.get().parse::<i64>().ok()});
                         run_post(data, "/api/db/prune", Some(body), "Database pulito");
                     }>{ctx_tr("Pulisci database")}</button>
                 </div>
             </Panel>
+            <div class="grid-2">
             <Panel title="Duplicati video in libreria">
                 <p class="muted">{ctx_tr("Individua i file video chiaramente inferiori (risoluzione più bassa) rimasti accanto alla versione migliore. Conservativo: tocca solo le risoluzioni riconosciute e lascia intatte le versioni con la stessa risoluzione. La pulizia sposta i file nel trash.")}</p>
                 <div class="toolbar" style="margin-top:8px">
@@ -7688,6 +7658,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </Show>
             </Panel>
+            </div>
             <DbOptimizeTool data />
             <Panel title="Stato sorgenti">
                 <div class="toolbar">
@@ -7728,14 +7699,20 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                 </Show>
             </Panel>
             <Panel title="Backup disponibili">
-                <div class="table-wrap">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("Dimensione")}</th></tr></thead>
-                        <tbody>
-                            {move || data.get().backups.iter().cloned().map(|item| view! { <tr><td class="mono truncate">{text(&item, "name", "-")}</td><td class="numeric">{size(&item, "size_bytes")}</td></tr> }).collect_view()}
-                        </tbody>
-                    </table>
+                <div class="grid-2">
+                    {move || data.get().backups.iter().cloned().map(|item| {
+                        let name = text(&item, "name", "-");
+                        let label = text(&item, "label", &name);
+                        let name_title = name.clone();
+                        view! {
+                            <div class="list-item">
+                                <div class="truncate" title=name_title>{format!("Backup {label}")}</div>
+                                <span class="badge">{size(&item, "size_bytes")}</span>
+                            </div>
+                        }
+                    }).collect_view()}
                 </div>
+                <Show when=move || data.get().backups.is_empty()><Empty text="Nessun backup disponibile." /></Show>
             </Panel>
             <BackupSettings data />
             <DbPruneTool data />

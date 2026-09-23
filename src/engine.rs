@@ -35,6 +35,20 @@ impl Engine {
         }
     }
 
+    /// Scarica un file `.torrent` da un feed RSS che non espone un magnet. Non
+    /// logga l'URL completo: può contenere una passkey.
+    pub async fn fetch_torrent(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            let host = url::Url::parse(url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "feed".to_string());
+            anyhow::bail!("HTTP {} fetching torrent from {host}", response.status());
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
+
     pub async fn scrape_all(&self, cfg: &Config) -> Result<Vec<Release>> {
         let mut all = Vec::new();
         let flaresolverr = cfg.flaresolverr_url.clone();
