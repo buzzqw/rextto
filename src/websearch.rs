@@ -27,6 +27,40 @@ pub fn take_engine_failures() -> Vec<(String, usize)> {
     items
 }
 
+/// Raffreddamento per motore: dopo un errore (es. `429 Too Many Requests`) il
+/// motore viene saltato per un po', così non lo si martella ad ogni query.
+static ENGINE_COOLDOWN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn engine_in_cooldown(engine: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = ENGINE_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match map.get(engine) {
+        Some(until) if *until > now => true,
+        Some(_) => {
+            map.remove(engine);
+            false
+        }
+        None => false,
+    }
+}
+
+fn set_engine_cooldown(engine: &str, error: &str) {
+    // Rate-limit: pausa più lunga. Altri errori (parsing/timeout): pausa breve.
+    let duration = if error.contains("429") {
+        Duration::from_secs(30 * 60)
+    } else {
+        Duration::from_secs(15 * 60)
+    };
+    ENGINE_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(engine.to_string(), std::time::Instant::now() + duration);
+}
+
 pub async fn search(
     client: &Client,
     engines: &[String],
@@ -70,6 +104,11 @@ pub async fn search_with_timeout(
         ) {
             continue;
         }
+        // Motore in raffreddamento dopo errori recenti: salta per non ripetere
+        // la stessa richiesta a vuoto ad ogni query.
+        if engine_in_cooldown(&engine) {
+            continue;
+        }
         set.spawn(async move {
             let _permit = limiter.acquire_owned().await.ok();
             let flaresolverr = flaresolverr.as_deref();
@@ -96,6 +135,7 @@ pub async fn search_with_timeout(
                 Err(error) => {
                     let error = crate::utils::redact_url_secrets(&error.to_string());
                     crate::logging::source_fail("web", &engine, &error);
+                    set_engine_cooldown(&engine, &error);
                     tracing::debug!(engine = %engine, query = %query, error = %error, "web engine search failed");
                     (Vec::new(), Some(engine))
                 }
@@ -619,6 +659,15 @@ fn build_magnet(hash: &str, title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_cooldown_blocks_after_a_failure() {
+        assert!(!engine_in_cooldown("test-cooldown-engine"));
+        set_engine_cooldown("test-cooldown-engine", "HTTP 429 Too Many Requests");
+        assert!(engine_in_cooldown("test-cooldown-engine"));
+        // Un motore diverso non è toccato.
+        assert!(!engine_in_cooldown("test-cooldown-other"));
+    }
 
     #[test]
     fn builds_sanitized_magnet_with_trackers() {
