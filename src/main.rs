@@ -177,8 +177,22 @@ async fn main() -> Result<()> {
         for handle in &handles {
             handle.abort();
         }
-        for handle in handles {
-            let _ = handle.await;
+        // Wait briefly so `torrents.shutdown` is not racing a native call, but
+        // never block shutdown forever: a worker stuck in a blocking syscall
+        // (e.g. a hung NFS mount) cannot be aborted, and an unbounded await here
+        // would freeze the process so it never saves resume data nor exits.
+        let stop = async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), stop)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "background workers did not stop within 5s (blocked I/O?); continuing shutdown"
+            );
         }
     }
     tracing::info!("background workers stopped, saving libtorrent session");
