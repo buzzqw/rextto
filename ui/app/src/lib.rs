@@ -4150,6 +4150,9 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
     let lang_b_req = RwSignal::new(true);
     let lang_c_req = RwSignal::new(true);
     let subtitle_reqs = RwSignal::new(String::new());
+    // ID esterni inseriti a mano: se popolati vengono usati per i metadati.
+    let movie_tmdb_id = RwSignal::new(String::new());
+    let movie_tvdb_id = RwSignal::new(String::new());
     let metadata_open = RwSignal::new(false);
     let metadata_query = RwSignal::new(String::new());
     let metadata_source = RwSignal::new("tmdb".to_string());
@@ -4168,6 +4171,8 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                     language.set(text(&movie, "language", ""));
                     subtitle.set(text(&movie, "subtitle", ""));
                     exclude.set(text(&movie, "exclude", ""));
+                    movie_tmdb_id.set(text(&movie, "tmdb_id", ""));
+                    movie_tvdb_id.set(text(&movie, "tvdb_id", ""));
                     let entries = parse_language_entries(&text(&movie, "language_requirements", ""));
                     let pick = |index: usize| {
                         entries
@@ -4347,7 +4352,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                         (lang_b.get(), lang_b_req.get()),
                                         (lang_c.get(), lang_c_req.get()),
                                     ]);
-                                    let body = json!({"name": name.get(), "year": year.get(), "quality": quality.get(), "language": language.get(), "subtitle": subtitle.get(), "exclude": exclude.get(), "language_requirements": requirements, "subtitle_requirements": subtitle_reqs.get()});
+                                    let body = json!({"name": name.get(), "year": year.get(), "quality": quality.get(), "language": language.get(), "subtitle": subtitle.get(), "exclude": exclude.get(), "language_requirements": requirements, "subtitle_requirements": subtitle_reqs.get(), "tmdb_id": movie_tmdb_id.get(), "tvdb_id": movie_tvdb_id.get()});
                                     let path = format!("/api/movies/{id}");
                                     run_post(data, &path, Some(body), "Film aggiornato");
                                 }
@@ -4366,6 +4371,10 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                      </div>
                                      <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                <div class="grid-2" style="grid-column: 1 / -1">
+                                    <label class="field" title=ctx_tr("ID numerico TMDB del film. Se impostato viene usato per i metadati (titolo, trama, locandina, cast) al posto della ricerca per nome.")><span>{ctx_tr("TMDB ID")}</span><input prop:value=movie_tmdb_id on:input=move |event| movie_tmdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 27205") /></label>
+                                    <label class="field" title=ctx_tr("ID TheTVDB del film (usato dalla ricerca metadati TVDB). Per il dettaglio film i metadati vengono da TMDB.")><span>{ctx_tr("TVDB ID")}</span><input prop:value=movie_tvdb_id on:input=move |event| movie_tvdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 1234") /></label>
+                                </div>
                                 <label class="field span-full" title=ctx_tr("Parole che non devono comparire nel titolo della release (separate da virgola)")><span>{ctx_tr("Parole vietate (exclude)")}</span><input prop:value=exclude on:input=move |event| exclude.set(event_target_value(&event)) placeholder=ctx_tr("cam, ts, screener") /></label>
                                     <div class="grid-2" style="grid-column: 1 / -1">
                                         <label class="field" title=ctx_tr("Lingue dei sottotitoli desiderate (es. ita, eng). Una release senza questi sottotitoli viene scartata; se compili 'Requisiti sottotitoli', questo campo viene ignorato.")><span>{ctx_tr("Sottotitoli")}</span><input prop:value=subtitle on:input=move |event| subtitle.set(event_target_value(&event)) placeholder=ctx_tr("es. ita, eng") /></label>
@@ -4469,7 +4478,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                                         view! {
                                                             <div class="list-item">
                                                                 <div><strong>{title}</strong><small>{date}</small><small class="truncate">{overview}</small></div>
-                                                                <button type="button" class="btn sm primary" disabled=move || candidate_for_disabled.is_empty() on:click=move |_| apply_movie_metadata_choice(movie_id, candidate_id.clone(), source_for_choice.clone(), name, year, detail, metadata_open, metadata_loading, metadata_error)>{ctx_tr("Usa questi dati")}</button>
+                                                                <button type="button" class="btn sm primary" disabled=move || candidate_for_disabled.is_empty() on:click=move |_| apply_movie_metadata_choice(movie_id, candidate_id.clone(), source_for_choice.clone(), name, year, detail, movie_tmdb_id, movie_tvdb_id, metadata_open, metadata_loading, metadata_error)>{ctx_tr("Usa questi dati")}</button>
                                                             </div>
                                                         }
                                                     }).collect_view()
@@ -5151,6 +5160,8 @@ fn apply_movie_metadata_choice(
     name: RwSignal<String>,
     year: RwSignal<String>,
     detail: RwSignal<Value>,
+    tmdb_id: RwSignal<String>,
+    tvdb_id: RwSignal<String>,
     metadata_open: RwSignal<bool>,
     metadata_loading: RwSignal<bool>,
     metadata_error: RwSignal<String>,
@@ -5164,6 +5175,8 @@ fn apply_movie_metadata_choice(
                 let movie = value.get("movie").cloned().unwrap_or_default();
                 name.set(text(&movie, "name", ""));
                 year.set(text(&movie, "year", ""));
+                tmdb_id.set(text(&movie, "tmdb_id", ""));
+                tvdb_id.set(text(&movie, "tvdb_id", ""));
                 metadata_open.set(false);
                 trigger_refresh();
                 if let Ok(value) = get(&format!("/api/movies/{movie_id}")).await {

@@ -449,6 +449,10 @@ pub struct MovieUpdateInput {
     pub subtitle_requirements: String,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tmdb_id: String,
+    #[serde(default)]
+    pub tvdb_id: String,
 }
 #[derive(serde::Deserialize)]
 pub struct MovieMetadataSearchInput {
@@ -2841,7 +2845,22 @@ async fn movie_detail(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
     let (metadata, cast) = match cfg.tmdb_api_key.clone() {
         Some(key) => {
             let tmdb = TmdbClient::with_language(Some(key), cfg.tmdb_language());
-            let metadata = if has_stored_metadata {
+            // Un ID TMDB inserito a mano ha priorità: recupera i dettagli
+            // aggiornati da TMDB invece di usare la cache o la ricerca per nome.
+            let metadata = if let Ok(tmdb_id) = movie.tmdb_id.trim().parse::<i64>() {
+                match tmdb.movie_details(&tmdb_id.to_string()).await {
+                    Ok(details) => serde_json::json!({
+                        "id": details.id,
+                        "title": details.title,
+                        "original_title": details.original_title,
+                        "overview": details.overview,
+                        "poster_path": details.poster_path,
+                        "release_date": details.release_date,
+                        "source": "tmdb",
+                    }),
+                    Err(_) => stored_metadata,
+                }
+            } else if has_stored_metadata {
                 stored_metadata
             } else {
                 tmdb.search_movie(&movie.name, movie.year.parse().ok())
@@ -3145,6 +3164,8 @@ async fn update_movie(
         crate::config::sanitize_language_requirements(&input.language_requirements);
     movie.subtitle_requirements =
         crate::config::sanitize_subtitle_requirements(&input.subtitle_requirements);
+    movie.tmdb_id = input.tmdb_id.trim().to_string();
+    movie.tvdb_id = input.tvdb_id.trim().to_string();
     if let Some(enabled) = input.enabled {
         movie.enabled = enabled;
     }
