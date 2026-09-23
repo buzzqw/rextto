@@ -9,6 +9,8 @@
 #   scripts/clean.sh              # report (nessuna cancellazione)
 #   scripts/clean.sh --debug      # rimuove i profili debug e i report di test
 #   scripts/clean.sh --all        # cargo clean completo (debug + release)
+#   scripts/clean.sh --auto       # come --debug ma salta se una build è in corso
+#                                 # (usato dal timer systemd settimanale)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,8 +21,9 @@ for arg in "$@"; do
     case "$arg" in
         --debug) mode="debug" ;;
         --all) mode="all" ;;
+        --auto) mode="auto" ;;
         -h | --help)
-            sed -n '2,12p' "$0"
+            sed -n '2,13p' "$0"
             exit 0
             ;;
         *)
@@ -29,6 +32,18 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Modalità automatica (timer): non tocca nulla mentre una build è in corso, per
+# non cancellare artefatti che cargo/rustc stanno usando.
+if [ "$mode" = "auto" ]; then
+    if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 \
+        || pgrep -x cargo-leptos >/dev/null 2>&1; then
+        echo "$(date '+%F %T') build in corso: pulizia rimandata"
+        exit 0
+    fi
+    echo "$(date '+%F %T') pulizia automatica degli artefatti di sviluppo"
+    mode="debug"
+fi
 
 du_now() {
     [ -e "$1" ] && du -sh "$1" 2>/dev/null | cut -f1 || true

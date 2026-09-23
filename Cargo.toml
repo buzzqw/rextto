@@ -46,6 +46,21 @@ cc = "1"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
+# Build di sviluppo più leggere: target/debug non deve gonfiarsi all'infinito.
+# Teniamo solo le tabelle di riga per backtrace leggibili e nessuna info di
+# debug per le dipendenze (la parte più pesante).
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = 1
+
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 # Privilegiamo build e linking rapidi anche per il binario di deploy. LTO e una
 # sola codegen unit riducono di poco dimensioni/prestazioni, ma rendono ogni

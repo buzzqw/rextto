@@ -3,6 +3,12 @@ resolver = "2"
 members = ["app", "frontend", "server"]
 
 # need to be applied only to wasm build
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true

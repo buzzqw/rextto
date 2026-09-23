@@ -1,0 +1,7 @@
+[Unit]
+Description=Rextto: remove development build artifacts
+
+[Service]
+Type=oneshot
+# Skips automatically while a cargo/rustc build is running.
+ExecStart=__ROOT__/scripts/clean.sh --auto

@@ -228,6 +228,20 @@ cargo check                      # fastest feedback
 cargo test --all-targets         # tests
 ```
 
+Development builds stay small and never accumulate forever:
+
+- The `dev`/`test` profiles use line tables only and no debug info for
+  dependencies (`Cargo.toml`), which keeps `target/debug` around 1 GB instead of
+  ~10 GB.
+- `scripts/clean.sh` prints what is reclaimable; `--debug` removes the dev
+  artifacts (keeping the release binary and the served UI bundle).
+- A weekly systemd **user** timer runs `scripts/clean.sh --auto` (skips while a
+  build is running). Install it once with:
+
+```bash
+scripts/install-dev-clean-timer.sh
+```
+
 ## Migrating from a legacy instance
 
 An optional importer reads a stopped legacy data directory (series, archive,

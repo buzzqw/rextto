@@ -228,6 +228,19 @@ cargo check                      # feedback più rapido
 cargo test --all-targets         # test
 ```
 
+Le build di sviluppo restano piccole e non crescono all'infinito:
+
+- I profili `dev`/`test` usano solo tabelle di riga e nessuna info di debug per le
+  dipendenze (`Cargo.toml`): `target/debug` resta intorno a 1 GB invece di ~10 GB.
+- `scripts/clean.sh` mostra lo spazio recuperabile; `--debug` rimuove gli
+  artefatti di sviluppo (mantenendo il binario release e il bundle UI servito).
+- Un timer systemd **utente** settimanale esegue `scripts/clean.sh --auto` (salta
+  se una build è in corso). Si installa una volta con:
+
+```bash
+scripts/install-dev-clean-timer.sh
+```
+
 ## Migrazione da un'istanza precedente
 
 Un importer opzionale legge una data directory storica ferma (database serie,
