@@ -168,36 +168,28 @@ La guida dettagliata di ogni schermata è nel
 
 ### Terminal UI
 
-Per i server senza browser, Rextto include un client da terminale con due modalità.
+Per i server senza browser, Rextto include una TUI in Python senza dipendenze
+(solo libreria standard `curses` + `urllib`, niente da installare):
 
 ```bash
-./start-tui.sh                      # vista interattiva a schermo intero
-./start-tui.sh status               # comando testuale, adatto a pipe/script
+python3 scripts/rextto_tui.py
+# oppure verso un'altra istanza:
+REXTTO_URL=http://192.168.1.10:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 ```
 
-**Comandi testuali** (funzionano in qualsiasi shell, senza schermo intero):
+Schede: **Status · Torrents · Activity · Logs · Health** (auto-refresh).
 
-| Comando | Output |
+| Tasti | Azione |
 |---|---|
-| `rextto-tui status` | riepilogo (attivo, torrent, ultimo ciclo, feed) |
-| `rextto-tui torrents` | tabella dei torrent |
-| `rextto-tui events` | eventi torrent recenti |
-| `rextto-tui logs [n]` | ultime righe di log (default 80) |
-| `rextto-tui health` | report di salute (JSON) |
-| `rextto-tui cycle [series\|movies\|comics]` | avvia un ciclo |
-| `rextto-tui pause <hash>` / `resume <hash>` | controlla un torrent |
-| `rextto-tui rename-all` | rinomina della libreria in background |
-
-Senza argomenti, su un terminale reale, apre la vista interattiva
-(**Status, Torrents, Activity, Logs, Health**; `c` ciclo, `p` pausa/riprendi,
-`1-5` schede, `q` esci). Si punta altrove con `REXTTO_URL` / `REXTTO_API_TOKEN`.
-
-È inclusa anche una versione **Python** della stessa TUI, senza dipendenze da
-installare:
-
-```bash
-python3 scripts/rextto_tui.py      # solo libreria standard (curses + urllib)
-```
+| `1-5` / `Tab` | cambia scheda |
+| `↑↓` | seleziona un torrent |
+| `r` | aggiorna · `c` avvia un ciclo · `q` esci |
+| `a` | **aggiungi un magnet** |
+| `t` | **aggiungi un file `.torrent`** (percorso) |
+| `p` | pausa/riprendi il torrent selezionato |
+| `d` | rimuovilo (chiede se eliminare anche i file) |
+| `k` / `R` | recheck / reannounce |
+| `n` | attiva/disattiva "non rinominare" |
 
 ### Dati e log
 

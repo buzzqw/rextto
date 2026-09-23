@@ -168,36 +168,28 @@ A detailed walkthrough of every screen is in the
 
 ### Terminal UI
 
-For servers without a browser, Rextto ships a terminal client with two modes.
+For servers without a browser, Rextto ships a dependency-free Python TUI
+(standard library `curses` + `urllib`, nothing to install):
 
 ```bash
-./start-tui.sh                      # interactive full-screen view
-./start-tui.sh status               # text command, pipe/script friendly
+python3 scripts/rextto_tui.py
+# or point it at another instance:
+REXTTO_URL=http://192.168.1.10:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 ```
 
-**Text commands** (work in any shell, no full-screen required):
+Tabs: **Status · Torrents · Activity · Logs · Health** (auto-refresh).
 
-| Command | Output |
+| Keys | Action |
 |---|---|
-| `rextto-tui status` | daemon summary (active, torrents, last cycle, feeds) |
-| `rextto-tui torrents` | torrent session table |
-| `rextto-tui events` | recent torrent events |
-| `rextto-tui logs [n]` | last log lines (default 80) |
-| `rextto-tui health` | health report (JSON) |
-| `rextto-tui cycle [series\|movies\|comics]` | run a cycle |
-| `rextto-tui pause <hash>` / `resume <hash>` | control a torrent |
-| `rextto-tui rename-all` | background library rename |
-
-With no arguments on a real terminal it opens the interactive view
-(**Status, Torrents, Activity, Logs, Health**; `c` cycle, `p` pause/resume,
-`1-5` tabs, `q` quit). Point it elsewhere with `REXTTO_URL` /
-`REXTTO_API_TOKEN`.
-
-A dependency-free **Python** version of the same TUI is also included:
-
-```bash
-python3 scripts/rextto_tui.py      # stdlib curses + urllib, nothing to install
-```
+| `1-5` / `Tab` | switch tab |
+| `↑↓` | select a torrent |
+| `r` | refresh · `c` run a cycle · `q` quit |
+| `a` | **add a magnet link** |
+| `t` | **add a `.torrent` file** (path) |
+| `p` | pause/resume the selected torrent |
+| `d` | remove it (asks whether to delete the files) |
+| `k` / `R` | recheck / reannounce |
+| `n` | toggle "do not rename" for it |
 
 ### Data and logs
 

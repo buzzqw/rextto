@@ -1,7 +1,6 @@
 # Build output
 /target/
 /ui/target/
-/tui/target/
 /ui/end2end/
 **/*.profraw
 **/*.profdata

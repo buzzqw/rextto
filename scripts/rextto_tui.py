@@ -7,8 +7,10 @@ install:
     python3 scripts/rextto_tui.py
     REXTTO_URL=http://127.0.0.1:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 
-Keys: 1-5/Tab switch tabs · r refresh · c run cycle · p pause/resume selected
-torrent · ↑↓ select · q quit.
+Tabs: Status · Torrents · Activity · Logs · Health.
+Keys: 1-5/Tab switch · ↑↓ select · r refresh · q quit.
+Global: a add magnet · t add .torrent file · c run cycle.
+Torrents tab: p pause/resume · d remove · k recheck · R reannounce · n no-rename.
 
 It only talks to the daemon's HTTP API and never touches the databases.
 """
@@ -29,19 +31,22 @@ REFRESH_SECS = 2.0
 TABS = ["Status", "Torrents", "Activity", "Logs", "Health"]
 
 
-def api(path: str, method: str = "GET"):
+def api(path, method="GET", body=None, raw=None, content_type="application/json"):
     """Calls the daemon and returns parsed JSON, or raises RuntimeError."""
     url = f"{BASE}{path}"
     headers = {"Accept": "application/json"}
     if TOKEN:
         headers["x-rextto-token"] = TOKEN
     data = None
-    if method == "POST":
-        data = b"{}"
-        headers["Content-Type"] = "application/json"
+    if raw is not None:
+        data = raw
+        headers["Content-Type"] = content_type
+    elif method == "POST":
+        data = json.dumps(body if body is not None else {}).encode()
+        headers["Content-Type"] = content_type
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")
@@ -109,6 +114,13 @@ class App:
         else:
             self.selected = min(self.selected, count - 1)
 
+    def selected_hash(self):
+        if not self.torrents:
+            return None
+        return text(self.torrents[self.selected], "hash") or None
+
+    # --- actions ---------------------------------------------------------
+
     def run_cycle(self) -> None:
         try:
             api("/api/run-now", "POST")
@@ -116,31 +128,136 @@ class App:
         except RuntimeError as error:
             self.message = f"cycle failed: {error}"
 
+    def add_magnet(self, magnet: str) -> None:
+        if not magnet:
+            return
+        if not magnet.startswith("magnet:"):
+            self.message = "not a magnet link"
+            return
+        try:
+            api("/api/send-magnet", "POST", {"magnet": magnet})
+            self.message = "magnet added"
+        except RuntimeError as error:
+            self.message = f"add failed: {error}"
+
+    def add_torrent_file(self, path: str) -> None:
+        if not path:
+            return
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError as error:
+            self.message = f"file error: {error}"
+            return
+        if not data:
+            self.message = "empty file"
+            return
+        try:
+            api("/api/upload-torrent", "POST", raw=data,
+                content_type="application/x-bittorrent")
+            self.message = "torrent added"
+        except RuntimeError as error:
+            self.message = f"add failed: {error}"
+
     def toggle_selected(self) -> None:
-        if not self.torrents:
+        hash_value = self.selected_hash()
+        if not hash_value:
             self.message = "no torrent selected"
             return
-        torrent = self.torrents[self.selected]
-        hashes = text(torrent, "hash")
-        if not hashes:
-            return
-        action = "resume" if text(torrent, "state") == "paused" else "pause"
+        # Read the current state from the daemon: the cached list may be up to
+        # REFRESH_SECS old, so a second `p` would otherwise repeat the same
+        # action instead of toggling. The detail endpoint nests the fields
+        # under "torrent".
         try:
-            api(f"/api/torrents/{hashes}/{action}", "POST")
-            self.message = f"{action} {hashes[:8]}"
+            details = api(f"/api/torrents/{hash_value}")
+            current = details.get("torrent") if isinstance(details, dict) else None
+            if not isinstance(current, dict):
+                current = details
+        except RuntimeError:
+            current = self.torrents[self.selected]
+        paused = text(current, "state") == "paused"
+        action = "resume" if paused else "pause"
+        self._act(f"/api/torrents/{hash_value}/{action}", action)
+
+    def remove_selected(self, delete_files: bool) -> None:
+        hash_value = self.selected_hash()
+        if not hash_value:
+            self.message = "no torrent selected"
+            return
+        self._act(f"/api/torrents/{hash_value}/remove",
+                  "removed" if not delete_files else "removed with files",
+                  {"delete_files": delete_files, "blocklist": False})
+
+    def recheck_selected(self) -> None:
+        hash_value = self.selected_hash()
+        if hash_value:
+            self._act(f"/api/torrents/{hash_value}/recheck", "recheck requested")
+
+    def reannounce_selected(self) -> None:
+        hash_value = self.selected_hash()
+        if hash_value:
+            self._act(f"/api/torrents/{hash_value}/reannounce", "reannounce requested")
+
+    def toggle_no_rename(self) -> None:
+        hash_value = self.selected_hash()
+        if not hash_value:
+            self.message = "no torrent selected"
+            return
+        try:
+            details = api(f"/api/torrents/{hash_value}")
+            current = bool(details.get("no_rename"))
+            api(f"/api/torrents/{hash_value}/no_rename", "POST", {"value": not current})
+            self.message = f"no-rename {'off' if current else 'on'}"
         except RuntimeError as error:
-            self.message = f"{action} failed: {error}"
+            self.message = f"no-rename failed: {error}"
+
+    def _act(self, path: str, label: str, body=None) -> None:
+        try:
+            api(path, "POST", body)
+            self.message = label
+        except RuntimeError as error:
+            self.message = f"{label} failed: {error}"
 
 
 def add(win, y: int, x: int, value: str, attr: int = 0) -> None:
     height, width = win.getmaxyx()
     if y < 0 or y >= height or x >= width:
         return
-    value = value[: max(0, width - x - 1)]
     try:
-        win.addstr(y, x, value, attr)
+        win.addstr(y, x, value[: max(0, width - x - 1)], attr)
     except curses.error:
         pass
+
+
+def prompt_input(stdscr, label: str) -> str:
+    """Single-line input on the last row; Esc cancels, Enter confirms."""
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    height, width = stdscr.getmaxyx()
+    value = ""
+    while True:
+        stdscr.move(height - 1, 0)
+        stdscr.clrtoeol()
+        add(stdscr, height - 1, 1, (label + value)[: width - 3], curses.A_BOLD)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (10, 13, curses.KEY_ENTER):
+            break
+        if key == 27:
+            value = ""
+            break
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+        elif 32 <= key < 127:
+            value += chr(key)
+    curses.curs_set(0)
+    stdscr.timeout(200)
+    return value.strip()
+
+
+def confirm(stdscr, label: str) -> bool:
+    return prompt_input(stdscr, f"{label} [y/N] ").lower().startswith("y")
 
 
 def draw(app: "App", win, colors: dict) -> None:
@@ -151,49 +268,47 @@ def draw(app: "App", win, colors: dict) -> None:
         win.refresh()
         return
 
-    # Header.
     name = text(app.status, "name", "rextto")
     version = text(app.status, "version")
     active = bool(app.status.get("active"))
-    add(win, 0, 1, f"rextto v{version}  ", colors["header"] | curses.A_BOLD)
-    add(win, 0, 12, "ACTIVE" if active else "PAUSED",
+    add(win, 0, 1, f"{name} v{version}  ", colors["header"] | curses.A_BOLD)
+    add(win, 0, 14, "ACTIVE" if active else "PAUSED",
         colors["ok"] if active else colors["warn"])
 
-    # Tabs.
     x = 2
     for index, label in enumerate(TABS):
         attr = colors["tab_active"] | curses.A_BOLD if index == app.tab else colors["muted"]
         add(win, 1, x, f" {index + 1}:{label} ", attr)
         x += len(label) + 6
-    add(win, 1, x, "  (Tab/1-5 to switch)", colors["muted"])
+    add(win, 1, x, "  (Tab/1-5)", colors["muted"])
 
-    # Body.
     top = 3
     bottom = height - 2
     if app.error:
         add(win, top, 2, f"cannot reach daemon: {app.error}", colors["err"])
         add(win, top + 2, 2, "set REXTTO_URL / REXTTO_API_TOKEN", colors["muted"])
     elif app.tab == 0:
-        draw_status(app, win, top, bottom, width, colors)
+        draw_status(app, win, top, colors)
     elif app.tab == 1:
         draw_torrents(app, win, top, bottom, width, colors)
     elif app.tab == 2:
-        draw_events(app, win, top, bottom, width, colors)
+        draw_events(app, win, top, bottom, colors)
     elif app.tab == 3:
-        draw_lines(app.logs[-max(1, bottom - top):], win, top, bottom, width, colors)
+        draw_lines(app.logs[-(bottom - top):], win, top, bottom, colors)
     else:
         body = json.dumps(app.health, indent=2).splitlines()
-        draw_lines(body[: max(1, bottom - top)], win, top, bottom, width, colors)
+        draw_lines(body[: max(1, bottom - top)], win, top, bottom, colors)
 
-    # Footer.
-    help_text = " q quit · r refresh · c cycle · p pause/resume · ↑↓ select"
-    add(win, height - 1, 1, help_text, colors["muted"])
+    hints = " q quit · r refresh · a magnet · t file · c cycle"
+    if app.tab == 1:
+        hints += " · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+    add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
-        add(win, height - 1, len(help_text) + 3, app.message, colors["ok"])
+        add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
     win.refresh()
 
 
-def draw_lines(lines, win, top, bottom, width, colors) -> None:
+def draw_lines(lines, win, top, bottom, colors) -> None:
     for offset, line in enumerate(lines):
         y = top + offset
         if y >= bottom:
@@ -203,7 +318,7 @@ def draw_lines(lines, win, top, bottom, width, colors) -> None:
         add(win, y, 2, line, attr)
 
 
-def draw_status(app, win, top, bottom, width, colors) -> None:
+def draw_status(app, win, top, colors) -> None:
     status = app.status
     torrents = status.get("torrent_stats", {})
     cycle = status.get("last_cycle", {})
@@ -224,30 +339,28 @@ def draw_torrents(app, win, top, bottom, width, colors) -> None:
     add(win, top, 2, f"{'HASH':<9} {'STATE':<12} {'PROG':>6} {'DONE':>10} "
                      f"{'DOWN':>10} {'UP':>10}  NAME", colors["header"])
     name_width = max(10, width - 64)
-    visible = app.torrents[: max(1, bottom - top - 1)]
-    for index, torrent in enumerate(visible):
+    for index, torrent in enumerate(app.torrents[: max(1, bottom - top - 1)]):
         y = top + 1 + index
         if y >= bottom:
             break
         attr = colors["tab_active"] if index == app.selected else colors["normal"]
         progress = float(torrent.get("progress") or 0.0)
-        done = human_bytes(torrent.get("total_done") or 0)
-        down = human_bytes(torrent.get("download_rate") or 0)
-        up = human_bytes(torrent.get("upload_rate") or 0)
         line = (f"{shorten(text(torrent,'hash'),9):<9} {shorten(text(torrent,'state'),12):<12} "
-                f"{progress:>5.1f}% {done:>10} {down + '/s':>10} {up + '/s':>10}  "
+                f"{progress:>5.1f}% {human_bytes(torrent.get('total_done') or 0):>10} "
+                f"{human_bytes(torrent.get('download_rate') or 0) + '/s':>10} "
+                f"{human_bytes(torrent.get('upload_rate') or 0) + '/s':>10}  "
                 f"{shorten(text(torrent,'name'), name_width)}")
         add(win, y, 2, line, attr)
 
 
-def draw_events(app, win, top, bottom, width, colors) -> None:
-    events = list(reversed(app.events))[: max(1, bottom - top)]
-    for index, event in enumerate(events):
+def draw_events(app, win, top, bottom, colors) -> None:
+    for index, event in enumerate(list(reversed(app.events))[: max(1, bottom - top)]):
         y = top + index
         if y >= bottom:
             break
-        line = f"{shorten(text(event,'kind'),18):<18} {shorten(text(event,'hash'),9):<9} {text(event,'name')}"
-        add(win, y, 2, line, colors["normal"])
+        add(win, y, 2,
+            f"{shorten(text(event,'kind'),18):<18} {shorten(text(event,'hash'),9):<9} {text(event,'name')}",
+            colors["normal"])
 
 
 def main(stdscr) -> None:
@@ -275,8 +388,24 @@ def main(stdscr) -> None:
             app.message = "refreshed"
         elif key == ord("c"):
             app.run_cycle()
-        elif key == ord("p"):
+        elif key == ord("a"):
+            app.add_magnet(prompt_input(stdscr, "Magnet: "))
+        elif key == ord("t"):
+            app.add_torrent_file(prompt_input(stdscr, "File .torrent: "))
+        elif app.tab == 1 and key == ord("p"):
             app.toggle_selected()
+        elif app.tab == 1 and key == ord("d"):
+            name = text(app.torrents[app.selected], "name") if app.torrents else "?"
+            if app.torrents and confirm(stdscr, f"Remove '{shorten(name, 40)}'?"):
+                delete_files = confirm(stdscr, "Also delete downloaded files?")
+                app.remove_selected(delete_files)
+                app.refresh()
+        elif app.tab == 1 and key == ord("k"):
+            app.recheck_selected()
+        elif app.tab == 1 and key == ord("R"):
+            app.reannounce_selected()
+        elif app.tab == 1 and key == ord("n"):
+            app.toggle_no_rename()
         elif key == curses.KEY_DOWN:
             if app.torrents:
                 app.selected = min(app.selected + 1, len(app.torrents) - 1)
@@ -321,8 +450,7 @@ if __name__ == "__main__":
         print(__doc__)
         raise SystemExit(0)
     if not sys.stdout.isatty():
-        print("rextto_tui.py needs a terminal; use `rextto-tui status` for text output",
-              file=sys.stderr)
+        print("rextto_tui.py needs a terminal", file=sys.stderr)
         raise SystemExit(2)
     try:
         curses.wrapper(main)
