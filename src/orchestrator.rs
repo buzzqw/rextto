@@ -856,13 +856,21 @@ async fn refresh_series_metadata(cfg: &Config, db: &Arc<Mutex<Database>>) {
         return;
     }
     let tmdb = TmdbClient::with_language(cfg.tmdb_api_key.clone(), cfg.tmdb_language());
+    let known_statuses = db
+        .lock()
+        .unwrap()
+        .series_statuses()
+        .unwrap_or_default();
     for series in cfg.series.iter().filter(|series| series.enabled) {
         let stale = db
             .lock()
             .unwrap()
             .series_metadata_stale(&series.name, 24)
             .unwrap_or(true);
-        if !stale {
+        // Lo stato TMDB va recuperato anche se i metadati stagionali sono
+        // recenti ma lo stato non è mai stato salvato (prima volta).
+        let needs_status = !known_statuses.contains_key(&series.name);
+        if !stale && !needs_status {
             continue;
         }
         let tmdb_id = if !series.tmdb_id.trim().is_empty() {
@@ -873,19 +881,21 @@ async fn refresh_series_metadata(cfg: &Config, db: &Arc<Mutex<Database>>) {
         let Some(tmdb_id) = tmdb_id else {
             continue;
         };
-        match tmdb.season_counts(&tmdb_id).await {
-            Ok(counts) => {
-                let values = counts.into_iter().collect::<Vec<_>>();
-                if let Err(error) = db
-                    .lock()
-                    .unwrap()
-                    .save_series_metadata(&series.name, &values)
-                {
-                    tracing::warn!(series=%series.name, %error, "TMDB season metadata save failed");
+        if stale {
+            match tmdb.season_counts(&tmdb_id).await {
+                Ok(counts) => {
+                    let values = counts.into_iter().collect::<Vec<_>>();
+                    if let Err(error) = db
+                        .lock()
+                        .unwrap()
+                        .save_series_metadata(&series.name, &values)
+                    {
+                        tracing::warn!(series=%series.name, %error, "TMDB season metadata save failed");
+                    }
                 }
-            }
-            Err(error) => {
-                tracing::debug!(series=%series.name, %error, "TMDB season metadata refresh failed")
+                Err(error) => {
+                    tracing::debug!(series=%series.name, %error, "TMDB season metadata refresh failed")
+                }
             }
         }
         // Stato TMDB ("Ended"/"Returning Series") per il badge nell'elenco serie.
