@@ -8480,7 +8480,9 @@ async fn remove_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> 
     let delete_files = torrent_files_are_disposable(&s.db.lock().unwrap(), &hash);
     let removed = s.torrents.remove(&hash, delete_files);
     if matches!(removed, Ok(true)) {
-        let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
+        let db = s.db.lock().unwrap();
+        let _ = db.mark_torrent_removed(&hash);
+        let _ = db.forget_removed_torrent(&hash);
     }
     torrent_action(removed)
 }
@@ -8505,7 +8507,9 @@ async fn remove_torrent_with_options(
         input.delete_files || torrent_files_are_disposable(&s.db.lock().unwrap(), &hash);
     let removed = s.torrents.remove(&hash, delete_files);
     if matches!(removed, Ok(true)) {
-        let _ = s.db.lock().unwrap().mark_torrent_removed(&hash);
+        let db = s.db.lock().unwrap();
+        let _ = db.mark_torrent_removed(&hash);
+        let _ = db.forget_removed_torrent(&hash);
     }
     torrent_action(removed)
 }

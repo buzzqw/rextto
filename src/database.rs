@@ -899,6 +899,33 @@ impl Database {
         Ok(())
     }
 
+    /// Cleans up the database when a torrent is removed by the user (or is
+    /// abandoned). An archived row keeps its file but drops the pointer to the
+    /// removed release, so the same (or a better) release can be fetched again;
+    /// a fresh placeholder is deleted so the retry is unblocked. This also
+    /// covers season packs, whose upgrade backup only stores one episode.
+    pub fn forget_removed_torrent(&self, hash: &str) -> Result<()> {
+        let normalized = hash.to_ascii_lowercase();
+        self.conn.execute(
+            "UPDATE episodes SET magnet_hash=NULL WHERE lower(COALESCE(magnet_hash,''))=?1 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>'')",
+            [&normalized],
+        )?;
+        self.conn.execute(
+            "UPDATE movies SET magnet_hash=NULL WHERE lower(COALESCE(magnet_hash,''))=?1 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>'')",
+            [&normalized],
+        )?;
+        self.conn.execute(
+            "DELETE FROM episodes WHERE lower(COALESCE(magnet_hash,''))=?1 AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
+            [&normalized],
+        )?;
+        self.conn.execute(
+            "DELETE FROM movies WHERE lower(COALESCE(magnet_hash,''))=?1 AND downloaded_at IS NULL",
+            [&normalized],
+        )?;
+        self.conn.execute("DELETE FROM upgrade_backup WHERE new_hash=?1", [&normalized])?;
+        Ok(())
+    }
+
     pub fn queue_pending(&self, release: &Release, timeframe_hours: i64) -> Result<()> {
         let series_name = release.series.as_deref().unwrap_or(&release.title);
         self.conn.execute(

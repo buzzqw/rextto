@@ -20,6 +20,7 @@ from __future__ import annotations
 import curses
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -96,20 +97,36 @@ class App:
         self.logs = []
         self.health = {}
         self.detail = None
+        self.service_uptime = None
 
     def refresh(self) -> None:
+        selected_hash = self.selected_hash()
         try:
             self.status = api("/api/status")
-            self.torrents = api("/api/torrents") or []
+            torrents = api("/api/torrents") or []
+            self.torrents = sorted(
+                torrents,
+                key=lambda torrent: (
+                    text(torrent, "name").casefold(),
+                    text(torrent, "hash").casefold(),
+                ),
+            )
             self.logs = (api("/api/logs?limit=200") or {}).get("items", [])
             self.health = api("/api/health") or {}
             self.error = ""
         except RuntimeError as error:
             self.error = str(error)
+        self.service_uptime = systemd_service_uptime()
         self.last_refresh = time.time()
         count = len(self.torrents)
         if count == 0:
             self.selected = 0
+        elif selected_hash:
+            self.selected = next(
+                (index for index, torrent in enumerate(self.torrents)
+                 if text(torrent, "hash").lower() == selected_hash.lower()),
+                min(self.selected, count - 1),
+            )
         else:
             self.selected = min(self.selected, count - 1)
 
@@ -325,7 +342,7 @@ def draw(app: "App", win, colors: dict) -> None:
     if app.detail is not None:
         hints += " · Enter/Esc back"
     elif app.tab == 1:
-        hints += " · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+        hints += " · ↑↓ select · Enter details · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
     add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
         add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
@@ -360,16 +377,18 @@ def draw_status(app, win, top, colors) -> None:
 
 
 def draw_torrents(app, win, top, bottom, width, colors) -> None:
-    add(win, top, 2, f"{'HASH':<9} {'STATE':<12} {'PROG':>6} {'DONE':>10} "
+    selected_label = f"Torrents: {app.selected + 1}/{len(app.torrents)}  " if app.torrents else "Torrents: 0  "
+    add(win, top, 2, selected_label, colors["header"] | curses.A_BOLD)
+    add(win, top + 1, 2, f"{'HASH':<9} {'STATE':<12} {'PROG':>6} {'DONE':>10} "
                      f"{'DOWN':>10} {'UP':>10}  NAME", colors["header"])
     name_width = max(10, width - 64)
-    visible = max(1, bottom - top - 1)
+    visible = max(1, bottom - top - 2)
     start = max(0, min(app.selected - visible + 1,
                        max(0, len(app.torrents) - visible)))
     end = min(start + visible, len(app.torrents))
     for index in range(start, end):
         torrent = app.torrents[index]
-        y = top + 1 + index - start
+        y = top + 2 + index - start
         if y >= bottom:
             break
         attr = colors["tab_active"] if index == app.selected else colors["normal"]
@@ -379,6 +398,7 @@ def draw_torrents(app, win, top, bottom, width, colors) -> None:
                 f"{human_bytes(torrent.get('download_rate') or 0) + '/s':>10} "
                 f"{human_bytes(torrent.get('upload_rate') or 0) + '/s':>10}  "
                 f"{shorten(text(torrent,'name'), name_width)}")
+        add(win, y, 1, ">" if index == app.selected else " ", attr | curses.A_BOLD if index == app.selected else attr)
         add(win, y, 2, line, attr)
 
 
@@ -455,6 +475,26 @@ def human_duration(value) -> str:
     return f"{minutes}m"
 
 
+def systemd_service_uptime(service="rextto.service"):
+    """Returns the local systemd service uptime in seconds, if available."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", service, "-p", "ActiveEnterTimestampMonotonic", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        started_us = int(result.stdout.strip())
+        if started_us <= 0:
+            return None
+        # systemd's monotonic timestamp and time.monotonic() share the same
+        # CLOCK_MONOTONIC origin on Linux.
+        return max(0.0, time.monotonic() - started_us / 1_000_000.0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def draw_health(app: App, win, top, bottom, width, colors) -> None:
     health = app.health if isinstance(app.health, dict) else {}
     status = text(health, "status", "offline")
@@ -467,7 +507,7 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
     disk_free = health.get("disk_free_bytes") or 0
     writable = "yes" if health.get("data_dir_writable") else "no"
     summary = [
-        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(health.get('uptime_seconds'))} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
+        f"Process: PID {text(health, 'process_id', '-')} · service uptime {human_duration(app.service_uptime)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
         f"System: CPU {optional_number(health.get('cpu_percent'), '%')} · load {optional_number(health.get('load_average'), '', 2)} · RAM free {human_bytes(available_memory)} / {human_bytes(total_memory)}",
         f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
         f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",
