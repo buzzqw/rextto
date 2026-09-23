@@ -565,14 +565,29 @@ pub async fn run_cycle(
         }
         // 1B. Cerca nuovi pack: aggiorna anche le righe esistenti con link
         // vuoto, così una riga preesistente non blocca il download.
+        let mut weekly_checked = 0usize;
         for offset in 0..=7 {
             let date =
                 (chrono::Utc::now().date_naive() - chrono::Duration::days(offset)).to_string();
             if !weekly_from_date.trim().is_empty() && date < weekly_from_date {
                 continue;
             }
-            let Ok((_url, links)) = client.weekly_links(&date).await else {
-                continue;
+            weekly_checked += 1;
+            let links = match client.weekly_links(&date).await {
+                Ok((url, links)) => {
+                    tracing::info!(
+                        date = %date,
+                        url = %url,
+                        magnets = links.magnets.len(),
+                        torrents = links.torrents.len(),
+                        "comics: weekly pack page found"
+                    );
+                    links
+                }
+                Err(error) => {
+                    tracing::debug!(date = %date, %error, "comics: weekly pack not found");
+                    continue;
+                }
             };
             let magnet = links
                 .magnets
@@ -587,7 +602,9 @@ pub async fn run_cycle(
             if magnet.is_empty() && torrent_url.is_empty() {
                 continue;
             }
-            if !db.upsert_weekly_links(&date, magnet, torrent_url)? {
+            let eligible = db.upsert_weekly_links(&date, magnet, torrent_url)?;
+            tracing::info!(date = %date, eligible, "comics: weekly pack recorded");
+            if !eligible {
                 continue;
             }
             match send_weekly_pack(
@@ -601,6 +618,7 @@ pub async fn run_cycle(
             }
             break;
         }
+        tracing::info!(checked = weekly_checked, "comics: weekly check done");
     } else if db.setting("weekly_enabled", "no")? != "yes" {
         tracing::info!("comics: weekly packs disabled");
     }

@@ -182,7 +182,16 @@ pub async fn run_cycle_domain(
     let archive_gaps = if domain == Some("movies") || !gap_filling {
         Vec::new()
     } else {
-        db.lock().unwrap().archive_gaps()?
+        db.lock()
+            .unwrap()
+            .archive_gaps()?
+            // Rispetta la configurazione corrente: solo serie ancora presenti e
+            // attive, e stagioni monitorate (né disattivate né fuori `seasons`).
+            // Senza questo filtro il gap-fill cercava serie cancellate e stagioni
+            // che l'utente aveva disattivato.
+            .into_iter()
+            .filter(|(series, season, _)| cfg.find_series_match(series, Some(*season)).is_some())
+            .collect::<Vec<_>>()
     };
     let mut gap_summary = std::collections::HashMap::<(String, i64), Vec<i64>>::new();
     for (series, season, episode) in &archive_gaps {

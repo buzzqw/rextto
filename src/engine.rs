@@ -221,7 +221,7 @@ impl Engine {
                 if compatible > 0 {
                     targets_with_hits += 1;
                     step2_usable += compatible;
-                    tracing::info!(query = %query, releases = compatible, "🔎 trovato (compatibili)");
+                    tracing::info!("🔎 {}: {} release compatibili", query, compatible);
                 } else {
                     tracing::debug!(query = %query, found = items.len(), "🔎 search: nessuna release compatibile");
                 }
