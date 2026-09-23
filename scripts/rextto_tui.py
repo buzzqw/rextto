@@ -20,6 +20,7 @@ It only talks to the daemon's HTTP API and never touches the databases.
 from __future__ import annotations
 
 import curses
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
@@ -56,6 +57,22 @@ def api(path, method="GET", body=None, raw=None, content_type="application/json"
         raise RuntimeError(f"HTTP {error.code}: {detail[:200]}") from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise RuntimeError(str(error)) from error
+
+
+def fetch_snapshot():
+    """Fetches the data needed by the main view outside the curses loop."""
+    status = api("/api/status")
+    torrents = api("/api/torrents") or []
+    torrents = sorted(
+        torrents,
+        key=lambda torrent: (
+            text(torrent, "name").casefold(),
+            text(torrent, "hash").casefold(),
+        ),
+    )
+    logs = (api("/api/logs?limit=200") or {}).get("items", [])
+    health = api("/api/health") or {}
+    return status, torrents, logs, health, systemd_service_uptime()
 
 
 def human_bytes(value: float) -> str:
@@ -104,26 +121,27 @@ class App:
         self.log_filter = ""
         self.log_scroll = 0
         self.log_follow = True
+        self.loading = False
+        self._refresh_executor = ThreadPoolExecutor(max_workers=1)
+        self._refresh_future = None
 
     def refresh(self) -> None:
         selected_hash = self.selected_hash()
         try:
-            self.status = api("/api/status")
-            torrents = api("/api/torrents") or []
-            self.torrents = sorted(
-                torrents,
-                key=lambda torrent: (
-                    text(torrent, "name").casefold(),
-                    text(torrent, "hash").casefold(),
-                ),
-            )
-            self.logs = (api("/api/logs?limit=200") or {}).get("items", [])
-            self.health = api("/api/health") or {}
+            status, torrents, logs, health, service_uptime = fetch_snapshot()
+            self.status = status
+            self.torrents = torrents
+            self.logs = logs
+            self.health = health
+            self.service_uptime = service_uptime
             self.error = ""
         except RuntimeError as error:
             self.error = str(error)
-        self.service_uptime = systemd_service_uptime()
+        self.loading = False
         self.last_refresh = time.time()
+        self._restore_selection(selected_hash)
+
+    def _restore_selection(self, selected_hash) -> None:
         count = len(self.torrents)
         if count == 0:
             self.selected = 0
@@ -135,6 +153,37 @@ class App:
             )
         else:
             self.selected = min(self.selected, count - 1)
+
+    def start_refresh(self) -> bool:
+        if self._refresh_future is not None and not self._refresh_future.done():
+            return False
+        self.error = ""
+        self.loading = True
+        self._refresh_future = self._refresh_executor.submit(fetch_snapshot)
+        return True
+
+    def poll_refresh(self) -> None:
+        future = self._refresh_future
+        if future is None or not future.done():
+            return
+        self._refresh_future = None
+        selected_hash = self.selected_hash()
+        try:
+            status, torrents, logs, health, service_uptime = future.result()
+            self.status = status
+            self.torrents = torrents
+            self.logs = logs
+            self.health = health
+            self.service_uptime = service_uptime
+            self.error = ""
+        except Exception as error:  # Keep the curses loop alive on worker errors.
+            self.error = str(error)
+        self.loading = False
+        self.last_refresh = time.time()
+        self._restore_selection(selected_hash)
+
+    def close(self) -> None:
+        self._refresh_executor.shutdown(wait=False, cancel_futures=True)
 
     def selected_hash(self):
         if not self.torrents:
@@ -359,6 +408,8 @@ def draw(app: "App", win, colors: dict) -> None:
         draw_health(app, win, top, bottom, width, colors)
 
     hints = " q quit · ? help · r refresh · a magnet · t file · c cycle"
+    if app.loading:
+        hints += " · loading..."
     if app.detail is not None:
         hints += " · Enter/Esc back"
     elif app.tab == 1:
@@ -649,9 +700,10 @@ def main(stdscr) -> None:
     colors = build_colors()
 
     app = App()
-    app.refresh()
+    app.start_refresh()
 
     while True:
+        app.poll_refresh()
         draw(app, stdscr, colors)
         key = stdscr.getch()
         if app.help_visible:
@@ -678,14 +730,14 @@ def main(stdscr) -> None:
         elif ord("1") <= key <= ord("4"):
             app.tab = key - ord("1")
         elif key == ord("r"):
-            app.refresh()
-            app.message = "refreshed"
+            if app.start_refresh():
+                app.message = "refreshing"
         elif key == ord("c"):
             app.run_cycle()
         elif app.tab == 3 and key == ord("x"):
             if confirm(stdscr, "Delete all trash files now?"):
                 app.clean_trash()
-                app.refresh()
+                app.start_refresh()
         elif key == ord("a"):
             app.add_magnet(prompt_input(stdscr, "Magnet: "))
         elif key == ord("t"):
@@ -697,7 +749,7 @@ def main(stdscr) -> None:
             if app.torrents and confirm(stdscr, f"Remove '{shorten(name, 40)}'?"):
                 delete_files = confirm(stdscr, "Also delete downloaded files?")
                 app.remove_selected(delete_files)
-                app.refresh()
+                app.start_refresh()
         elif app.tab == 1 and key == ord("k"):
             app.recheck_selected()
         elif app.tab == 1 and key == ord("R"):
@@ -751,7 +803,9 @@ def main(stdscr) -> None:
                     app.log_scroll = 0
 
         if time.time() - app.last_refresh >= REFRESH_SECS:
-            app.refresh()
+            app.start_refresh()
+
+    app.close()
 
 
 def build_colors() -> dict:
