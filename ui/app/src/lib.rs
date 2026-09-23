@@ -2128,6 +2128,17 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     let add_save_path = RwSignal::new(String::new());
     let add_start = RwSignal::new(true);
     let add_no_rename = RwSignal::new(false);
+    // Configured default download folder, proposed as the placeholder so an
+    // empty field keeps the automatic RAM-disk/temp/final tier.
+    let default_download_path = Signal::derive(move || {
+        data.get()
+            .config
+            .get("paths")
+            .and_then(|paths| paths.get("libtorrent_dir"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
     let filtered = Signal::derive(move || {
         let snapshot = data.get();
         let term = tag_filter.get();
@@ -2224,25 +2235,32 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 }>
                     <div class="add-torrent-grid">
                         <label class="field" title=ctx_tr("Incolla un link magnet oppure un indirizzo http(s) che punta a un file .torrent")>
-                            <span>{ctx_tr("Opzione 1 — Magnet o URL .torrent")}</span>
+                            <span>{ctx_tr("Opzione 1 — Magnet o URL")}</span>
                             <input prop:value=magnet on:input=move |event| magnet.set(event_target_value(&event)) placeholder=ctx_tr("magnet:?xt=urn:btih:… oppure https://…/file.torrent") />
-                            <small class="hint">{ctx_tr("Copia/incolla un link: Rextto lo aggiunge alla sessione e inizia a scaricare.")}</small>
+                            <small class="hint">{ctx_tr("Copia/incolla un link: Rextto lo aggiunge e inizia a scaricare.")}</small>
                         </label>
                         <label class="field" title=ctx_tr("Carica un file .torrent salvato sul tuo computer, utile quando non c'è un link magnet")>
-                            <span>{ctx_tr("Opzione 2 — Carica un file .torrent dal computer")}</span>
+                            <span>{ctx_tr("Opzione 2 — File .torrent")}</span>
                             <input type="file" accept=".torrent" on:change=on_upload />
-                            <small class="hint">{ctx_tr("Qui carichi un file .torrent locale; a sinistra invece incolli un link. Usa una delle due opzioni.")}</small>
+                            <small class="hint">{ctx_tr("Carica un file .torrent locale (in alternativa al link a sinistra).")}</small>
                             <Show when=move || data.get().status.get("dry_run").and_then(Value::as_bool).unwrap_or(false)>
-                                <small class="hint">{ctx_tr("Dry-run attivo: il file viene accettato ma nessun download reale parte finché non passi in modalità attiva.")}</small>
+                                <small class="hint">{ctx_tr("Dry-run attivo: nessun download reale parte finché non passi in modalità attiva.")}</small>
                             </Show>
                             <small class="muted">{move || upload_message.get()}</small>
+                        </label>
+                        <label class="field" title=ctx_tr("Cartella di salvataggio. Lascia vuoto per usare la predefinita: i torrent entro la soglia vanno in RAM disk e poi su disco.")>
+                            <span>{ctx_tr("Percorso (opzionale)")}</span>
+                            <div class="path-picker">
+                                <input prop:value=add_save_path on:input=move |event| add_save_path.set(event_target_value(&event)) placeholder=move || default_download_path.get() />
+                                <BrowseButton value=add_save_path />
+                            </div>
+                            <small class="hint">{move || format!("Vuoto = predefinita ({})", default_download_path.get())}</small>
                         </label>
                         <div class="add-torrent-action">
                             <button class="btn primary" title=ctx_tr("Aggiungi il magnet o il link .torrent alla sessione")>{ctx_tr("Aggiungi")}</button>
                         </div>
                     </div>
                     <div class="toolbar" style="margin-top:10px">
-                        <PathPicker label="Percorso di salvataggio (opzionale)" value=add_save_path placeholder="/mnt/downloads" />
                         <label class="check" title=ctx_tr("Se disattivato, il torrent viene aggiunto in pausa e non parte finché non lo riprendi")><input type="checkbox" prop:checked=add_start on:change=move |event| add_start.set(event_target_checked(&event)) /> <span>{ctx_tr("Scarica subito")}</span></label>
                         <label class="check" title=ctx_tr("Il torrent non verrà rinominato al termine del download")><input type="checkbox" prop:checked=add_no_rename on:change=move |event| add_no_rename.set(event_target_checked(&event)) /> <span>{ctx_tr("Non rinominare")}</span></label>
                     </div>
@@ -7570,19 +7588,31 @@ fn highlight_log_line(line: &str) -> String {
         ("skipped", "hl-filter"),
         ("blocklist", "hl-filter"),
     ];
+    // Whole-word matching: avoids highlighting "error" inside "errors" or
+    // "moved" inside "removed".
+    fn is_word(character: char) -> bool {
+        character.is_alphanumeric() || character == '_'
+    }
     let lower = line.to_ascii_lowercase();
     let mut body = String::with_capacity(line.len() + 32);
     let mut index = 0;
+    let mut previous_is_word = false;
     while index < line.len() {
-        let mut best: Option<(usize, &str)> = None;
+        let mut best: Option<(usize, &str, bool)> = None;
         for &(keyword, class) in KEYWORDS {
-            if lower[index..].starts_with(keyword)
-                && best.map_or(true, |(len, _)| keyword.len() > len)
-            {
-                best = Some((keyword.len(), class));
+            if lower[index..].starts_with(keyword) {
+                let end = index + keyword.len();
+                let next_is_word = line[end..].chars().next().is_some_and(is_word);
+                let last_is_word = line[index..end].chars().next_back().is_some_and(is_word);
+                if !previous_is_word
+                    && !next_is_word
+                    && best.map_or(true, |(len, _, _)| keyword.len() > len)
+                {
+                    best = Some((keyword.len(), class, last_is_word));
+                }
             }
         }
-        if let Some((len, class)) = best {
+        if let Some((len, class, last_is_word)) = best {
             let matched = &line[index..index + len];
             body.push_str("<mark class=\"");
             body.push_str(class);
@@ -7590,11 +7620,13 @@ fn highlight_log_line(line: &str) -> String {
             body.push_str(&escape_html(matched));
             body.push_str("</mark>");
             index += len;
+            previous_is_word = last_is_word;
         } else {
             let ch = line[index..].chars().next().unwrap();
             let end = index + ch.len_utf8();
             body.push_str(&escape_html(&line[index..end]));
             index = end;
+            previous_is_word = is_word(ch);
         }
     }
     let class = if line.contains(" ERROR ") {

@@ -1238,6 +1238,20 @@ fn parse_media_tags(value: &serde_json::Value) -> MediaTags {
     }
 }
 
+/// Single video file for a season/episode inside a directory, if exactly one
+/// matches. Used when a completed torrent's file was already moved and renamed
+/// in the archive, so its original torrent name no longer exists.
+pub fn find_episode_file(dir: &Path, season: i64, episode: i64) -> Option<PathBuf> {
+    let files = video_files(dir).ok()?;
+    let mut matches = files.into_iter().filter(|file| {
+        file.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| filename_matches_episode(name, season, episode))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
 pub fn video_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(path

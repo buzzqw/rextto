@@ -263,7 +263,7 @@ label { color: var(--muted); font-size: 0.875rem; }
 .field textarea { min-height: 96px; resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.7812rem; }
 .form-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .form-actions .muted { font-size: 0.75rem; }
-.add-torrent-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 14px 16px; align-items: start; }
+.add-torrent-grid { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 14px 16px; align-items: start; }
 .add-torrent-action { align-self: start; padding-top: 24px; }
 .add-torrent-action .btn { white-space: nowrap; }
 @media (max-width: 820px) { .add-torrent-grid { grid-template-columns: 1fr; } .add-torrent-action { padding-top: 0; } }

@@ -9693,6 +9693,14 @@ async fn handle_torrent_event(
             false
         }
         "torrent_finished" => {
+            // Completion can be triggered twice (a recovered event after a
+            // restart, or storage_moved): never post-process an already
+            // completed release again, or the renamed file is looked up under
+            // its original name and fails.
+            if db.lock().unwrap().torrent_status(&event.hash)?.as_deref() == Some("completed") {
+                tracing::debug!(hash=%event.hash, "ignoring completion for already completed torrent");
+                return Ok(false);
+            }
             let destination = postprocess::destination_for(&metadata.release, cfg);
             let current = FsPath::new(&event.save_path);
             if metadata.release.is_pack {
@@ -9881,7 +9889,46 @@ async fn complete_torrent(
     release: &crate::models::Release,
     tmdb: &TmdbClient,
 ) -> anyhow::Result<bool> {
-    let path = postprocess::completion_path(event);
+    let mut path = postprocess::completion_path(event);
+    if !path.exists() {
+        // The file may already have been moved and renamed (a second completion
+        // pass, or the periodic rename repair). Resolve the archived file for
+        // this episode instead of failing the whole completion and rolling the
+        // release back.
+        let resolved = if release.kind == "series" {
+            release
+                .series
+                .as_deref()
+                .and_then(|name| cfg.find_series_by_name(name))
+                .and_then(|series| cfg.resolve_archive_path(series))
+                .and_then(|dir| match (release.season, release.episode) {
+                    (Some(season), Some(episode)) => {
+                        postprocess::find_episode_file(&dir, season, episode)
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        match resolved {
+            Some(found) => {
+                tracing::info!(
+                    hash = %event.hash,
+                    path = %found.display(),
+                    "completed file already renamed; using the archived file"
+                );
+                path = found;
+            }
+            None => {
+                tracing::warn!(
+                    hash = %event.hash,
+                    path = %path.display(),
+                    "completed torrent file not found (already moved or renamed); skipping completion"
+                );
+                return Ok(false);
+            }
+        }
+    }
     let size = postprocess::size_of_path(&path)?;
     let no_rename = db
         .lock()
