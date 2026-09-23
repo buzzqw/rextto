@@ -36,11 +36,14 @@ du_now() {
 
 targets=(
     "target/debug"
+    "target/fast"
     "ui/target/debug"
     "ui/target/front"
     "ui/target/wasm32-unknown-unknown"
+    "tui/target/debug"
     "ui/end2end/playwright-report"
     "ui/end2end/test-results"
+    "scripts/__pycache__"
 )
 
 if [ "$mode" = "report" ]; then
@@ -63,7 +66,11 @@ if [ "$mode" = "all" ]; then
 fi
 
 # --debug: rimuove solo artefatti rigenerabili e non usati in produzione.
-rm -rf target/debug ui/target/debug
-rm -rf ui/target/front ui/target/wasm32-unknown-unknown
+# Restano intatti target/release (binario del servizio), ui/target/site (bundle
+# servito) e tui/target/release (client installato).
+rm -rf target/debug target/fast
+rm -rf ui/target/debug ui/target/front ui/target/wasm32-unknown-unknown
+rm -rf tui/target/debug
 rm -rf ui/end2end/playwright-report ui/end2end/test-results
+rm -rf scripts/__pycache__
 echo "Profili debug e report di test rimossi. La prossima build di test sarà più lenta."
