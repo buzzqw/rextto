@@ -427,7 +427,7 @@ async fn fetch_html(client: &Client, url: &str, flaresolverr_url: Option<&str>) 
 
 async fn search_torrentscsv(client: &Client, query: &str) -> Result<Vec<(String, String, String)>> {
     let response = client
-        .get("https://torrents-csv.ml/service/search")
+        .get("https://torrents-csv.com/service/search")
         .query(&[("q", query), ("size", "20")])
         .send()
         .await?

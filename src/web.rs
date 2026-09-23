@@ -2702,7 +2702,13 @@ async fn series_rename_apply(
                 Err(error) => {
                     // Never surface API keys embedded in URLs (e.g. TMDB) in logs.
                     let error = crate::utils::redact_url_secrets(&error.to_string());
-                    tracing::warn!(file=%file.display(), %error, "archive file rename failed")
+                    // Un 404 TMDB (es. episodio 0/speciale assente) è atteso:
+                    // resta a debug per non sporcare il log.
+                    if error.contains("404") {
+                        tracing::debug!(file=%file.display(), %error, "archive file rename failed (not found)")
+                    } else {
+                        tracing::warn!(file=%file.display(), %error, "archive file rename failed")
+                    }
                 }
             }
         }

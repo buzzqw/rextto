@@ -501,6 +501,10 @@ pub fn parse_release_source(
     if title.trim().to_ascii_lowercase().starts_with("magnet:") {
         return None;
     }
+    // Un titolo vuoto non è una release valida (capita con item RSS malformati).
+    if title.trim().is_empty() {
+        return None;
+    }
     let torrent_url = torrent_url
         .map(str::trim)
         .filter(|value| is_torrent_url(value))

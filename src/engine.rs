@@ -262,16 +262,25 @@ impl Engine {
                 );
                 continue;
             }
-            let Some(hash) = magnet_hash(&release.magnet) else {
-                tracing::info!(
-                    title = %release.title,
-                    source = %release.source,
-                    reason = "missing magnet hash",
-                    "🚫 FILTER rejected"
-                );
-                continue;
+            // Un feed RSS con solo link `.torrent` (es. TorrentLeech) non ha un
+            // magnet: non va scartato qui, la risoluzione dell'infohash avviene
+            // nel ciclo. Si deduplica per URL in quel caso.
+            let dedup_key = match magnet_hash(&release.magnet) {
+                Some(hash) => hash,
+                None => match release.torrent_url.as_deref() {
+                    Some(url) => format!("url:{url}"),
+                    None => {
+                        tracing::debug!(
+                            title = %release.title,
+                            source = %release.source,
+                            reason = "missing magnet hash",
+                            "filter skipped"
+                        );
+                        continue;
+                    }
+                },
             };
-            if !seen.insert(hash) {
+            if !seen.insert(dedup_key) {
                 tracing::debug!(
                     title = %release.title,
                     source = %release.source,
