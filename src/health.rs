@@ -19,6 +19,7 @@ pub struct Health {
     pub uptime_seconds: u64,
     pub load_average: Option<f64>,
     pub cpu_percent: Option<f64>,
+    pub process_cpu_percent: Option<f64>,
     pub trash_file_count: u64,
     pub trash_bytes: u64,
     pub disks: Vec<DiskInfo>,
@@ -58,6 +59,14 @@ struct CpuSample {
 }
 
 static CPU_SAMPLE: Mutex<Option<CpuSample>> = Mutex::new(None);
+
+struct ProcessCpuSample {
+    ticks: u64,
+    at: Instant,
+    percent: Option<f64>,
+}
+
+static PROCESS_CPU_SAMPLE: Mutex<Option<ProcessCpuSample>> = Mutex::new(None);
 
 /// Legge `(total, idle)` da `/proc/stat`.
 fn cpu_snapshot() -> Option<(u64, u64)> {
@@ -121,6 +130,40 @@ fn system_cpu_percent() -> Option<f64> {
     result
 }
 
+/// Percentuale CPU del processo Rextto, calcolata sui suoi tick utime+stime.
+/// Il valore è riferito a un core (può quindi superare 100% con più thread).
+fn process_cpu_percent() -> Option<f64> {
+    let contents = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let command_end = contents.rfind(')')?;
+    let fields: Vec<&str> = contents.get(command_end + 2..)?.split_whitespace().collect();
+    // After pid and comm, fields[0] is state (field 3); utime/stime are
+    // fields 14/15 in procfs, hence indexes 11/12 here.
+    let ticks = fields.get(11)?.parse::<u64>().ok()?.saturating_add(fields.get(12)?.parse::<u64>().ok()?);
+    let now = Instant::now();
+    let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let mut guard = PROCESS_CPU_SAMPLE.lock().ok()?;
+    let Some(previous) = guard.as_ref() else {
+        *guard = Some(ProcessCpuSample {
+            ticks,
+            at: now,
+            percent: None,
+        });
+        return None;
+    };
+    let elapsed = now.duration_since(previous.at).as_secs_f64();
+    let percent = if elapsed > 0.0 {
+        Some((ticks.saturating_sub(previous.ticks) as f64 / clock_ticks / elapsed * 100.0).max(0.0))
+    } else {
+        previous.percent
+    };
+    *guard = Some(ProcessCpuSample {
+        ticks,
+        at: now,
+        percent,
+    });
+    percent
+}
+
 /// Contesto dei percorsi controllati dalla salute (permessi, spazio, ram disk).
 pub struct HealthPaths<'a> {
     pub data_dir: &'a Path,
@@ -179,6 +222,7 @@ pub fn check_with_paths(paths: &HealthPaths) -> Health {
         uptime_seconds,
         load_average,
         cpu_percent: system_cpu_percent(),
+        process_cpu_percent: process_cpu_percent(),
         trash_file_count,
         trash_bytes,
         disks: disks(),

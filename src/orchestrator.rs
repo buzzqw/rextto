@@ -187,7 +187,12 @@ pub async fn run_cycle_domain(
     }
     for ((series, season), mut episodes) in gap_summary {
         episodes.sort_unstable();
-        tracing::info!(series = %series, season, gaps = ?episodes, "gap-fill target identified");
+        tracing::info!(
+            series = %series,
+            season,
+            gaps = %episodes_label(&episodes),
+            "gap-fill target identified"
+        );
     }
     let gap_limit = cfg
         .settings
@@ -336,10 +341,7 @@ pub async fn run_cycle_domain(
                 .as_deref()
                 .and_then(|name| cfg.find_series_match(name, release.season))
             else {
-                log_candidate_rejected(
-                    &release,
-                    "series not monitored (no match or season ignored)",
-                );
+                // Not monitored: never log these, they are pure noise.
                 continue;
             };
             if !Config::series_release_allowed(series, &release.quality, &release.title) {
@@ -352,7 +354,7 @@ pub async fn run_cycle_domain(
             release.series = Some(series.name.clone());
         } else {
             let Some(movie) = cfg.find_movie_match(&release.title, release.year) else {
-                log_candidate_rejected(&release, "movie not monitored or filtered out");
+                // Not monitored: never log these, they are pure noise.
                 continue;
             };
             if !Config::movie_release_allowed(movie, &release.quality) {
@@ -397,12 +399,10 @@ pub async fn run_cycle_domain(
                     }
             }) {
                 tracing::info!(
-                    title = %release.title,
-                    series = %series,
-                    season,
+                    target = %release_target(&release),
                     score,
                     reason = "superseded by an equal or better release already selected",
-                    "🚫 FILTER candidate rejected"
+                    "🚫 release rejected"
                 );
                 continue;
             }
@@ -449,15 +449,13 @@ pub async fn run_cycle_domain(
     tracing::info!("🎯 CANDIDATES — {} release(s) survived the filters", best.len());
     for release in &best {
         tracing::debug!(
+            target = %release_target(release),
             kind = %release.kind,
-            series = ?release.series,
-            season = ?release.season,
-            episodes = ?release.episode_range,
-            gap_episodes = ?gap_episodes_for_release(&release, &gap_targets),
-            title = %release.title,
+            episodes = %episodes_label(&release.episode_range),
+            gap_episodes = %episodes_label(&gap_episodes_for_release(release, &gap_targets)),
             source = %release.source,
             score = release.quality.score_with_settings(&cfg.settings),
-            "candidate release ready for evaluation"
+            "candidate ready for evaluation"
         );
     }
     // Advanced setting: refuse to start downloads when the download disk is
@@ -506,12 +504,9 @@ pub async fn run_cycle_domain(
             {
                 if series.timeframe > 0 && !is_ready_pending {
                     tracing::info!(
-                        series = %series.name,
-                        season = ?release.season,
-                        episode = ?release.episode,
-                        title = %release.title,
+                        target = %release_target(&release),
                         timeframe_hours = series.timeframe,
-                        "release queued for timeframe"
+                        "queued for timeframe"
                     );
                     db.lock()
                         .unwrap()
@@ -575,17 +570,14 @@ pub async fn run_cycle_domain(
             match torrents.add_with_path(&release.magnet, cfg, download_dir.as_deref()) {
                 Ok(true) => {
                     tracing::info!(
+                        target = %release_target(&release),
                         kind = %release.kind,
-                        series = ?release.series,
-                        season = ?release.season,
-                        episode = ?release.episode,
-                        title = %release.title,
                         source = %release.source,
                         score,
                         reason = %decision_reason,
                         approval_reason = %approval_reason,
-                        gap_episodes = ?gap_episodes,
-                        hash = ?magnet_hash(&release.magnet),
+                        gap_episodes = %episodes_label(&gap_episodes),
+                        hash = %hash_label(&release),
                         "📥 DOWNLOAD STARTED"
                     );
                     db.lock().unwrap().register_torrent(&release)?;
@@ -643,19 +635,28 @@ pub async fn run_cycle_domain(
                 }
             }
         } else {
-            tracing::info!(
-                kind = %release.kind,
-                series = ?release.series,
-                season = ?release.season,
-                episode = ?release.episode,
-                title = %release.title,
-                source = %release.source,
-                score,
-                reason = %decision_reason,
-                approval_reason = %approval_reason,
-                gap_episodes = ?gap_episodes,
-                "⏭️ FILTER download skipped"
-            );
+            // A duplicate (equal or better already present) is routine noise:
+            // keep it at debug so the cycle log stays readable.
+            if approval_reason == "duplicate" {
+                tracing::debug!(
+                    target = %release_target(&release),
+                    score,
+                    reason = %decision_reason,
+                    approval_reason = %approval_reason,
+                    "download skipped (duplicate)"
+                );
+            } else {
+                tracing::info!(
+                    target = %release_target(&release),
+                    kind = %release.kind,
+                    source = %release.source,
+                    score,
+                    reason = %decision_reason,
+                    approval_reason = %approval_reason,
+                    gap_episodes = %episodes_label(&gap_episodes),
+                    "⏭️ download skipped"
+                );
+            }
         }
     }
     db.lock().unwrap().save_cycle(&stats)?;
@@ -677,15 +678,59 @@ pub async fn run_cycle_domain(
     Ok(stats)
 }
 
-/// Logs a release refused during candidate selection so the user can see which
-/// filters dropped what, and why, without enabling debug logging.
+/// Human-readable target of a release: `Series S01E02`, `Series S01`, or the
+/// title for movies. Keeps log lines free of Rust's `Some(...)` debug noise.
+fn release_target(release: &Release) -> String {
+    if release.kind == "series" {
+        if let Some(series) = release.series.as_deref() {
+            let season = release.season.map(|season| format!("S{season:02}"));
+            let episode = match release.episode {
+                Some(0) => Some("pack".to_string()),
+                Some(episode) => Some(format!("E{episode:02}")),
+                None => None,
+            };
+            let suffix = [season, episode]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("");
+            return if suffix.is_empty() {
+                series.to_string()
+            } else {
+                format!("{series} {suffix}")
+            };
+        }
+    }
+    release.title.clone()
+}
+
+/// `1,2,3`, or `none` when empty; avoids `[]` in the log.
+fn episodes_label(episodes: &[i64]) -> String {
+    if episodes.is_empty() {
+        "none".to_string()
+    } else {
+        episodes
+            .iter()
+            .map(|episode| episode.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn hash_label(release: &Release) -> String {
+    magnet_hash(&release.magnet).unwrap_or_else(|| "unknown".into())
+}
+
+/// A release for a monitored title that does not meet the quality/language/
+/// exclude rules is routine noise (thousands per cycle), so it is logged at
+/// debug only.
 fn log_candidate_rejected(release: &Release, reason: &str) {
-    tracing::info!(
+    tracing::debug!(
+        target = %release_target(release),
         kind = %release.kind,
-        title = %release.title,
         source = %release.source,
         reason,
-        "🚫 FILTER candidate rejected"
+        "release excluded by rules"
     );
 }
 

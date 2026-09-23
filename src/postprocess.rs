@@ -676,11 +676,15 @@ pub fn episode_name_conforms(path: &Path, release: &Release, cfg: &Config) -> bo
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_lowercase();
+    // Use the same sanitised series name as `episode_target`, otherwise a name
+    // with invalid characters (e.g. a colon in "Star Trek: ...") never matches
+    // the real target and triggers a pointless no-op rename.
+    let series_name = sanitize_invalid(&series.name);
     let prefix = match cfg.rename_format.as_str() {
         "custom" => {
             let rendered = cfg
                 .rename_template
-                .replace("{Serie}", &series.name)
+                .replace("{Serie}", &series_name)
                 .replace("{Stagione}", &format!("S{:02}", season))
                 .replace("{Episodio}", &format!("E{:02}", episode));
             match rendered.find('{') {
@@ -688,7 +692,7 @@ pub fn episode_name_conforms(path: &Path, release: &Release, cfg: &Config) -> bo
                 None => rendered,
             }
         }
-        _ => format!("{} - S{:02}E{:02} - ", series.name, season, episode),
+        _ => format!("{} - S{:02}E{:02} - ", series_name, season, episode),
     };
     // Nomi con gruppi vuoti (es. `[]` o `()`) o placeholder letterali sono
     // artefatti di un template applicato solo in parte: vanno rinominati per
@@ -1399,6 +1403,39 @@ mod tests {
             "Only Murders in the Building - S01E01 - True Crime - [480p][h264][AAC][IT].mkv",
         );
         assert!(episode_name_conforms(clean, &release, &cfg));
+    }
+
+    #[test]
+    fn conform_check_sanitizes_invalid_series_name_characters() {
+        // A colon cannot appear in a path: the real rename target uses the
+        // sanitised name, so the cheap conform check must use it too, otherwise
+        // it triggers a pointless no-op rename.
+        let mut cfg = Config::default();
+        cfg.rename_episodes = true;
+        cfg.rename_format = "standard".into();
+        cfg.series.push(SeriesConfig {
+            name: "Star Trek: Strange New Worlds".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        let release = Release {
+            title: "Star Trek Strange New Worlds S03E10".into(),
+            magnet: String::new(),
+            source: "archive".into(),
+            quality: Default::default(),
+            kind: "series".into(),
+            series: Some("Star Trek: Strange New Worlds".into()),
+            season: Some(3),
+            episode: Some(10),
+            is_pack: false,
+            episode_range: vec![10],
+            year: None,
+            discovered_at: chrono::Utc::now(),
+        };
+        let file = Path::new(
+            "/x/Star Trek Strange New Worlds - S03E10 - Nuove forme - [2160p][h265].mkv",
+        );
+        assert!(episode_name_conforms(file, &release, &cfg));
     }
 
     #[test]

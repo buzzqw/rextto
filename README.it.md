@@ -191,6 +191,7 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | `d` | rimuovilo (chiede se eliminare anche i file) |
 | `k` / `R` | recheck / reannounce |
 | `n` | attiva/disattiva "non rinominare" |
+| `x` | nella scheda Health, pulisce il trash (chiede conferma) |
 
 ### Dati e log
 

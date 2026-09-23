@@ -191,6 +191,7 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | `d` | remove it (asks whether to delete the files) |
 | `k` / `R` | recheck / reannounce |
 | `n` | toggle "do not rename" for it |
+| `x` | on the Health tab, clean the trash (asks for confirmation) |
 
 ### Data and logs
 

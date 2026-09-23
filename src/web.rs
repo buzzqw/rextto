@@ -229,6 +229,12 @@ pub struct RemoveCompletedInput {
     pub delete_files: bool,
 }
 #[derive(serde::Deserialize, Default)]
+pub struct CleanTrashInput {
+    /// When true, remove every trash entry instead of applying retention.
+    #[serde(default)]
+    pub force: bool,
+}
+#[derive(serde::Deserialize, Default)]
 pub struct RemoveOptionsInput {
     #[serde(default)]
     pub delete_files: bool,
@@ -2292,6 +2298,13 @@ async fn series_rename_apply(
         };
         match result {
             Ok(Some(target)) => {
+                if postprocess::same_path(&path, &target) {
+                    // No-op: the file already carries the target name (the cheap
+                    // conform check can miss it). Never log or count this as a
+                    // rename.
+                    already_ok.push(archive_path);
+                    continue;
+                }
                 tracing::info!(
                     series = %series.name,
                     season = episode.season,
@@ -2517,10 +2530,43 @@ async fn series_rename_apply(
         .filter(|item| item.get("error").is_some())
         .count();
     let renamed_count = items.len().saturating_sub(discarded_count + error_count);
+    let note = match (force, source_only) {
+        (true, _) => " [force]",
+        (_, true) => " [source only]",
+        _ => "",
+    };
     if execute {
-        tracing::info!(series=%series.name, episodes=considered, with_path, renamed=renamed_count, discarded=discarded_count, duplicates_removed, errors=error_count, already_ok=already_ok_count, force, "rename executed");
+        tracing::info!(
+            "🗂 rename '{}': {} renamed, {} already correct, {} discarded, {} duplicates removed, {} errors — {}/{} files present{}",
+            series.name,
+            renamed_count,
+            already_ok_count,
+            discarded_count,
+            duplicates_removed,
+            error_count,
+            with_path,
+            considered,
+            note
+        );
+    } else if items.is_empty() {
+        tracing::info!(
+            "🗂 rename preview '{}': nothing to rename ({} already correct, {}/{} files present){}",
+            series.name,
+            already_ok_count,
+            with_path,
+            considered,
+            note
+        );
     } else {
-        tracing::info!(series=%series.name, episodes=considered, with_path, changes=items.len(), already_ok=already_ok_count, "rename preview");
+        tracing::info!(
+            "🗂 rename preview '{}': {} file(s) would change, {} already correct — {}/{} files present{}",
+            series.name,
+            items.len(),
+            already_ok_count,
+            with_path,
+            considered,
+            note
+        );
     }
     (
         StatusCode::OK,
@@ -3462,7 +3508,7 @@ async fn backup_test_ftp(
         entered_path = report.entered_path,
         uploaded = report.uploaded,
         deleted = report.deleted,
-        error = ?report.error,
+        error = %report.error.as_deref().unwrap_or("none"),
         "FTP test result"
     );
     (
@@ -6021,9 +6067,9 @@ async fn execute_scheduled_backup(cfg: &Config, notifier: &Notifier) -> anyhow::
     tracing::info!(
         path = %steps.path.display(),
         ftp_uploaded = steps.ftp_uploaded,
-        ftp_error = ?steps.ftp_error,
+        ftp_error = %steps.ftp_error.as_deref().unwrap_or("none"),
         cloud_copied = steps.cloud_copied,
-        cloud_error = ?steps.cloud_error,
+        cloud_error = %steps.cloud_error.as_deref().unwrap_or("none"),
         telegram_uploaded,
         "scheduled backup completed"
     );
@@ -6115,9 +6161,9 @@ async fn create_backup(State(s): State<AppState>) -> impl IntoResponse {
             tracing::info!(
                 path = %steps.path.display(),
                 ftp_uploaded = steps.ftp_uploaded,
-                ftp_error = ?steps.ftp_error,
+                ftp_error = %steps.ftp_error.as_deref().unwrap_or("none"),
                 cloud_copied = steps.cloud_copied,
-                cloud_error = ?steps.cloud_error,
+                cloud_error = %steps.cloud_error.as_deref().unwrap_or("none"),
                 telegram_uploaded,
                 "backup completed"
             );
@@ -6740,7 +6786,10 @@ async fn restore_source(
     )
 }
 
-async fn clean_trash(State(s): State<AppState>) -> impl IntoResponse {
+async fn clean_trash(
+    State(s): State<AppState>,
+    input: Option<Json<CleanTrashInput>>,
+) -> impl IntoResponse {
     if s.cfg.dry_run {
         return (
             StatusCode::CONFLICT,
@@ -6753,12 +6802,17 @@ async fn clean_trash(State(s): State<AppState>) -> impl IntoResponse {
             Json(serde_json::json!({"ok":false,"error":"trash path is not configured"})),
         );
     };
-    let retention_days = latest_config(&s)
-        .settings
-        .get("trash_retention_days")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
+    let force = input.map(|Json(value)| value.force).unwrap_or(false);
+    let retention_days = if force {
+        0
+    } else {
+        latest_config(&s)
+            .settings
+            .get("trash_retention_days")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    };
     match remove_trash_contents(root, retention_days) {
         Ok((files, bytes)) => (
             StatusCode::OK,
@@ -9650,7 +9704,11 @@ async fn handle_torrent_event(
                         let error = "season pack filenames do not match declared season";
                         tracing::warn!(
                             hash = %event.hash,
-                            declared_season = ?metadata.release.season,
+                            declared_season = %metadata
+                                .release
+                                .season
+                                .map(|season| season.to_string())
+                                .unwrap_or_else(|| "unknown".into()),
                             source = %source.display(),
                             "season pack rejected"
                         );
@@ -9710,7 +9768,6 @@ async fn handle_torrent_event(
                         destination = %destination.display(),
                         size = %crate::logging::human_bytes_i64(size),
                         episode_count = episodes.len(),
-                        episodes = ?episodes,
                         "🎉 SEASON PACK COMPLETE — archived to NAS"
                     );
                     let notification = notifier.notify_event("season_pack_completed", serde_json::json!({
@@ -10002,11 +10059,18 @@ async fn run_now(State(s): State<AppState>, Query(query): Query<RunNowQuery>) ->
         .filter(|value| matches!(*value, "series" | "movies" | "comics"))
         .map(str::to_owned);
     let running = s.cycle_lock.try_lock().is_err();
-    tracing::info!(domain = ?domain, queued = running, "manual cycle requested");
+    tracing::info!(
+        domain = %domain.as_deref().unwrap_or("full"),
+        queued = running,
+        "manual cycle requested"
+    );
     let task_domain = domain.clone();
     tokio::spawn(async move {
         let _cycle_guard = s.cycle_lock.lock().await;
-        tracing::info!(domain = ?task_domain, "manual cycle started");
+        tracing::info!(
+            domain = %task_domain.as_deref().unwrap_or("full"),
+            "manual cycle started"
+        );
         // Publish the start time immediately so the dashboard does not show
         // "non avviato" while the cycle is still running.
         *s.last_cycle.lock().unwrap() = crate::models::CycleStats {

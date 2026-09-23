@@ -32,7 +32,7 @@ REFRESH_SECS = 2.0
 TABS = ["Status", "Torrents", "Logs", "Health"]
 
 
-def api(path, method="GET", body=None, raw=None, content_type="application/json"):
+def api(path, method="GET", body=None, raw=None, content_type="application/json", timeout=20):
     """Calls the daemon and returns parsed JSON, or raises RuntimeError."""
     url = f"{BASE}{path}"
     headers = {"Accept": "application/json"}
@@ -47,7 +47,7 @@ def api(path, method="GET", body=None, raw=None, content_type="application/json"
         headers["Content-Type"] = content_type
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")
@@ -167,6 +167,14 @@ class App:
             self.message = "cycle requested"
         except RuntimeError as error:
             self.message = f"cycle failed: {error}"
+
+    def clean_trash(self) -> None:
+        try:
+            result = api("/api/maintenance/clean-trash", "POST", {"force": True}, timeout=120)
+            files = result.get("files") if isinstance(result, dict) else None
+            self.message = f"trash cleaned ({files} files)" if files is not None else "trash cleaned"
+        except RuntimeError as error:
+            self.message = f"trash cleanup failed: {error}"
 
     def add_magnet(self, magnet: str) -> None:
         if not magnet:
@@ -343,6 +351,8 @@ def draw(app: "App", win, colors: dict) -> None:
         hints += " · Enter/Esc back"
     elif app.tab == 1:
         hints += " · ↑↓ select · Enter details · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+    elif app.tab == 3:
+        hints += " · x empty trash"
     add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
         add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
@@ -507,7 +517,7 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
     disk_free = health.get("disk_free_bytes") or 0
     writable = "yes" if health.get("data_dir_writable") else "no"
     summary = [
-        f"Process: PID {text(health, 'process_id', '-')} · service uptime {human_duration(app.service_uptime)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
+        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(app.service_uptime)} · CPU {optional_number(health.get('process_cpu_percent'), '%', 1)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
         f"System: CPU {optional_number(health.get('cpu_percent'), '%')} · load {optional_number(health.get('load_average'), '', 2)} · RAM free {human_bytes(available_memory)} / {human_bytes(total_memory)}",
         f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
         f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",
@@ -604,6 +614,10 @@ def main(stdscr) -> None:
             app.message = "refreshed"
         elif key == ord("c"):
             app.run_cycle()
+        elif app.tab == 3 and key == ord("x"):
+            if confirm(stdscr, "Delete all trash files now?"):
+                app.clean_trash()
+                app.refresh()
         elif key == ord("a"):
             app.add_magnet(prompt_input(stdscr, "Magnet: "))
         elif key == ord("t"):
