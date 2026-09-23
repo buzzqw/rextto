@@ -1176,6 +1176,21 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
         if total > 0.0 { format!("{:.1}%", resident / total * 100.0) } else { "-".into() }
     });
     let consumption = Signal::derive(move || data.get().stats.get("consumption").cloned().unwrap_or_default());
+    // Cestino: contenuto caricato solo all'apertura della modale.
+    let trash_open = RwSignal::new(false);
+    let trash_items = RwSignal::new(Vec::<Value>::new());
+    let trash_total = RwSignal::new(0_i64);
+    let trash_path = RwSignal::new(String::new());
+    let trash_busy = RwSignal::new(false);
+    let load_trash = move || {
+        spawn_local(async move {
+            if let Ok(value) = get("/api/trash").await {
+                trash_items.set(array(&value, "items"));
+                trash_total.set(value.get("total_bytes").and_then(Value::as_i64).unwrap_or(0));
+                trash_path.set(text(&value, "path", ""));
+            }
+        });
+    };
     let search = use_context::<GlobalSearch>().expect("global search context");
     let global_query = search.query;
     let global_results = search.results;
@@ -1357,12 +1372,14 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         <button class="btn" on:click=move |_| { run_post(data, "/api/run_now?domain=movies", None, "Ciclo film avviato"); }>{ctx_tr("Film")}</button>
                         <button class="btn" on:click=move |_| { run_post(data, "/api/run_now?domain=comics", None, "Ciclo fumetti avviato"); }>{ctx_tr("Fumetti")}</button>
                         <button class="btn" on:click=move |_| { run_post(data, "/api/backup", None, "Backup creato"); }>{ctx_tr("Backup")}</button>
+                        <button class="btn" title=ctx_tr("Mostra il contenuto del cestino e permette di eliminare i file singolarmente o tutti insieme") on:click=move |_| { trash_open.set(true); load_trash(); }>{ctx_tr("Mostra/Svuota cestino")}</button>
                     </div>
                     <div class="stack" style="margin-top:12px">
                         <StatLine label="Ultimo ciclo" value=Signal::derive(move || short_datetime(&text(&last.get(), "last_started_at", ""))) />
                         <StatLine label="Candidati / avviati" value=Signal::derive(move || format!("{} / {}", number(&last.get(), "candidates"), number(&last.get(), "downloads_started"))) />
                         <StatLine label="Gap riempiti" value=Signal::derive(move || number(&last.get(), "gaps_filled")) />
                         <StatLine label="Feed RSS / Indexer" value=Signal::derive(move || format!("{} / {}", array(&data.get().config, "feed_urls").len(), array(&data.get().config, "indexers").len())) />
+                        <StatLine label="Cestino" value=Signal::derive(move || format!("{} · {} file", size(&data.get().health, "trash_bytes"), number(&data.get().health, "trash_file_count"))) />
                     </div>
                 </Panel>
                 <Panel title="Consumo banda e spazio disco">
@@ -1504,6 +1521,79 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                     <button class="btn" on:click=move |_| page.set("maintenance".into())>{ctx_tr("🛠 Manutenzione")}</button>
                 </div>
             </Panel>
+            <Show when=move || trash_open.get()>
+                <div class="modal-backdrop" on:click=move |_| trash_open.set(false)>
+                    <div class="modal" style="width:min(900px,96vw)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
+                        <div class="modal-head">
+                            <strong>{ctx_tr("Cestino")}</strong>
+                            <button type="button" class="btn sm" on:click=move |_| trash_open.set(false)>{ctx_tr("Chiudi")}</button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="muted mono truncate" title=move || trash_path.get()>{move || trash_path.get()}</p>
+                            <div class="toolbar" style="margin:8px 0 10px">
+                                <span class="muted">{move || format!("{} elementi · {}", trash_items.get().len(), size_str(trash_total.get() as f64))}</span>
+                                <button class="btn sm danger" disabled=move || trash_busy.get() || trash_items.get().is_empty() on:click=move |_| {
+                                    trash_busy.set(true);
+                                    spawn_local(async move {
+                                        match send("POST", "/api/trash/delete", Some(json!({"all": true}))).await {
+                                            Ok(value) => push_toast(data, "ok", format!("Cestino svuotato: {} elementi", number(&value, "removed"))),
+                                            Err(error) => push_toast(data, "err", error),
+                                        }
+                                        if let Ok(value) = get("/api/trash").await {
+                                            trash_items.set(array(&value, "items"));
+                                            trash_total.set(value.get("total_bytes").and_then(Value::as_i64).unwrap_or(0));
+                                        }
+                                        trash_busy.set(false);
+                                        trigger_refresh();
+                                    });
+                                }>{ctx_tr("Svuota tutto")}</button>
+                                <button class="btn sm" disabled=move || trash_busy.get() on:click=move |_| load_trash()>{ctx_tr("Aggiorna")}</button>
+                            </div>
+                            <Show when=move || !trash_busy.get() && trash_items.get().is_empty()>
+                                <Empty text="Cestino vuoto." />
+                            </Show>
+                            <div class="table-wrap">
+                                <table class="data-table">
+                                    <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("Tipo")}</th><th>{ctx_tr("Dimensione")}</th><th></th></tr></thead>
+                                    <tbody>
+                                        {move || trash_items.get().into_iter().map(|item| {
+                                            let name = text(&item, "name", "-");
+                                            let name_title = name.clone();
+                                            let is_dir = item.get("is_dir").and_then(Value::as_bool).unwrap_or(false);
+                                            let delete_name = name.clone();
+                                            view! {
+                                                <tr>
+                                                    <td class="truncate mono" title=name_title>{name}</td>
+                                                    <td class="muted">{if is_dir { "cartella" } else { "file" }}</td>
+                                                    <td class="numeric">{size(&item, "size_bytes")}</td>
+                                                    <td>
+                                                        <button class="btn sm danger" disabled=move || trash_busy.get() on:click=move |_| {
+                                                            let name = delete_name.clone();
+                                                            trash_busy.set(true);
+                                                            spawn_local(async move {
+                                                                match send("POST", "/api/trash/delete", Some(json!({"names": [name]}))).await {
+                                                                    Ok(_) => push_toast(data, "ok", "Elemento eliminato dal cestino".into()),
+                                                                    Err(error) => push_toast(data, "err", error),
+                                                                }
+                                                                if let Ok(value) = get("/api/trash").await {
+                                                                    trash_items.set(array(&value, "items"));
+                                                                    trash_total.set(value.get("total_bytes").and_then(Value::as_i64).unwrap_or(0));
+                                                                }
+                                                                trash_busy.set(false);
+                                                                trigger_refresh();
+                                                            });
+                                                        }>{ctx_tr("Elimina")}</button>
+                                                    </td>
+                                                </tr>
+                                            }
+                                        }).collect_view()}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </Show>
         </div>
     }
 }

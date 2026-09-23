@@ -338,7 +338,9 @@ pub async fn run_cycle(
 ) -> Result<usize> {
     let monitored = db.list_monitored(true)?;
     let mut downloaded = 0;
+    tracing::info!(monitored = monitored.len(), "comics cycle: checking monitored titles");
     for comic in monitored {
+        tracing::info!(comic=%comic.title, tag=%comic.tag_url, "comics: checking title");
         let posts = match client.tag_posts(&comic.tag_url, &comic.from_date).await {
             Ok(posts) => posts,
             Err(error) => {
@@ -347,6 +349,8 @@ pub async fn run_cycle(
                 continue;
             }
         };
+        tracing::info!(comic=%comic.title, posts=posts.len(), "comics: tag posts fetched");
+        let mut queued = 0usize;
         for post in posts {
             if db.already_sent(&post.url)? {
                 continue;
@@ -438,6 +442,7 @@ pub async fn run_cycle(
                             db.add_torrent(&hash, &post.url, &post.title, &target)?;
                         }
                         downloaded += 1;
+                        queued += 1;
                         if let Err(error) = notifier
                             .notify_comic_complete(
                                 &post.title,
@@ -459,9 +464,11 @@ pub async fn run_cycle(
             }
         }
         db.mark_checked(comic.id)?;
+        tracing::info!(comic=%comic.title, queued, "comics: title checked");
     }
     if db.setting("weekly_enabled", "no")? == "yes" && !cfg.dry_run {
         let weekly_from_date = db.setting("weekly_from_date", "")?;
+        tracing::info!(from_date=%weekly_from_date, "comics: checking weekly packs");
         for offset in 0..=7 {
             let date =
                 (chrono::Utc::now().date_naive() - chrono::Duration::days(offset)).to_string();
@@ -497,6 +504,7 @@ pub async fn run_cycle(
                         )?;
                         db.mark_weekly_sent(&date)?;
                         let _ = notifier.notify_event("comic_queued", serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"})).await;
+                        tracing::info!(date=%date, "comics: weekly pack queued");
                     }
                 }
             } else if let Some(url) = links.torrents.first() {
@@ -512,6 +520,7 @@ pub async fn run_cycle(
                         )?;
                         db.mark_weekly_sent(&date)?;
                         let _ = notifier.notify_event("comic_queued", serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"})).await;
+                        tracing::info!(date=%date, "comics: weekly pack queued");
                     }
                 }
             }

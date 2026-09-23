@@ -756,6 +756,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/comics/weekly", get(comics_weekly))
         .route("/api/browse_dir", get(browse_dir))
         .route("/api/mkdir", post(make_directory))
+        .route("/api/trash/delete", post(delete_trash_entries))
         .route("/api/backup", get(list_backups).post(create_backup))
         .route("/api/backup/list", get(list_backups))
         .route(
@@ -3412,6 +3413,92 @@ async fn trash_entries(State(s): State<AppState>) -> impl IntoResponse {
         })),
     )
 }
+#[derive(serde::Deserialize, Default)]
+pub struct TrashDeleteInput {
+    /// Nomi (un solo componente) da eliminare dal cestino.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Elimina tutto il contenuto del cestino.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Elimina dal cestino singoli elementi (per nome) oppure tutto. Accetta solo
+/// nomi di un componente per impedire traversal fuori dalla cartella trash.
+async fn delete_trash_entries(
+    State(s): State<AppState>,
+    Json(input): Json<TrashDeleteInput>,
+) -> impl IntoResponse {
+    if s.cfg.dry_run {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"dry-run does not delete trash"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    let root = cfg
+        .trash_path
+        .clone()
+        .unwrap_or_else(|| cfg.data_dir.join("trash"));
+    let names = if input.all {
+        std::fs::read_dir(&root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    } else {
+        input.names
+    };
+    if names.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"nessun elemento da eliminare"})),
+        );
+    }
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for name in names {
+        let candidate = std::path::Path::new(&name);
+        // Un solo componente, niente "." / "..": resta dentro il trash.
+        if name.trim().is_empty()
+            || candidate.components().count() != 1
+            || matches!(name.as_str(), "." | "..")
+        {
+            errors.push(name);
+            continue;
+        }
+        let target = root.join(candidate);
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            errors.push(name);
+            continue;
+        };
+        let size = if metadata.is_dir() {
+            directory_size(&target)
+        } else {
+            metadata.len()
+        };
+        let outcome = if metadata.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        match outcome {
+            Ok(()) => {
+                removed += 1;
+                bytes = bytes.saturating_add(size);
+            }
+            Err(_) => errors.push(name),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"removed":removed,"bytes":bytes,"errors":errors})),
+    )
+}
+
 async fn db_info(State(s): State<AppState>) -> impl IntoResponse {
     let info = match s.db.lock().unwrap().info() {
         Ok(value) => value,
