@@ -9090,6 +9090,30 @@ async fn torrent_event_worker(
                     let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
                 }
             }
+            // A completed single episode/movie is moved into the archive and
+            // renamed, so the file is no longer at the path libtorrent tracks.
+            // It can no longer seed and would re-download the release on the
+            // next check (seen as a duplicate). Drop those torrents, but keep
+            // no-rename/in-place completions seeding as before.
+            if processed && matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
+                let is_pack = db
+                    .lock()
+                    .unwrap()
+                    .torrent_meta(&event.hash)
+                    .ok()
+                    .flatten()
+                    .map(|meta| meta.release.is_pack)
+                    .unwrap_or(false);
+                if !is_pack && !postprocess::completion_path(&event).exists() {
+                    if let Ok(true) = torrents.remove(&event.hash, false) {
+                        let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
+                        tracing::info!(
+                            hash = %event.hash,
+                            "completed torrent removed: file renamed into the archive"
+                        );
+                    }
+                }
+            }
             if processed && matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
                 let completion_meta = db.lock().unwrap().torrent_meta(&event.hash).ok().flatten();
                 let is_pack = completion_meta
@@ -10003,6 +10027,10 @@ async fn complete_torrent(
     release: &crate::models::Release,
     tmdb: &TmdbClient,
 ) -> anyhow::Result<bool> {
+    // Keep the rename repair off this series while the completion (resolve,
+    // rename, dedup) runs: it would otherwise move the file mid-operation and
+    // make `size_of_path` fail, leaving libtorrent free to re-download it.
+    let _import_guard = ArchiveImportGuard::acquire(release.series.as_deref());
     let mut path = postprocess::completion_path(event);
     if !path.exists() {
         // The file may already have been moved and renamed (a second completion
@@ -10016,9 +10044,13 @@ async fn complete_torrent(
                 .and_then(|name| cfg.find_series_by_name(name))
                 .and_then(|series| cfg.resolve_archive_path(series))
                 .and_then(|dir| match (release.season, release.episode) {
-                    (Some(season), Some(episode)) => {
-                        postprocess::find_episode_file(&dir, season, episode)
-                    }
+                    (Some(season), Some(episode)) => postprocess::find_episode_file(
+                        &dir, season, episode,
+                    )
+                    // Duplicates may coexist (e.g. a partial re-download next
+                    // to the kept file): fall back to the best match instead of
+                    // giving up and letting the torrent re-download.
+                    .or_else(|| postprocess::best_episode_file(&dir, season, episode)),
                     _ => None,
                 })
         } else {
