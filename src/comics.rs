@@ -1315,6 +1315,24 @@ mod tests {
         assert_eq!(clean_search_title(""), "");
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn debug_weekly_links_network() {
+        let client = GetComicsClient::new();
+        for date in ["2026-09-16", "2026-09-23", "2026-09-09"] {
+            match client.weekly_links(date).await {
+                Ok((url, links)) => println!(
+                    "{date}: OK {url} magnets={} torrents={} mega={} direct={}",
+                    links.magnets.len(),
+                    links.torrents.len(),
+                    links.mega.len(),
+                    links.direct.len()
+                ),
+                Err(error) => println!("{date}: ERR {error}"),
+            }
+        }
+    }
+
     #[test]
     fn parse_links_ignores_invalid_hrefs() {
         // Un href non valido non deve far fallire il parsing degli altri link.
