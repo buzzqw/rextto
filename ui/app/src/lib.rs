@@ -3241,6 +3241,10 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                     let downloaded = item.get("episodes_downloaded").and_then(Value::as_i64).unwrap_or(0);
                                     let completeness = if total > 0 { format!("{:.0}%", downloaded as f64 / total as f64 * 100.0) } else { "—".into() };
                                     let complete = total > 0 && downloaded >= total;
+                                    let ended = matches!(
+                                        text(&item, "tmdb_status", "").to_ascii_lowercase().as_str(),
+                                        "ended" | "canceled" | "cancelled"
+                                    );
                                     view! {
                                         <tr>
                                             <td><input type="checkbox" title=ctx_tr("Seleziona la serie per le azioni bulk") prop:checked=move || selected_series.get().contains(&selected_name) on:change=move |_| selected_series.update(|items| { if items.contains(&selected_name_toggle) { items.retain(|name| name != &selected_name_toggle); } else { items.push(selected_name_toggle.clone()); } }) /></td>
@@ -3252,12 +3256,16 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                             <td class="numeric" title=ctx_tr("Percentuale di episodi scaricati")>{completeness}</td>
                                             <td class="muted" title=ctx_tr("Ultimo download")>{short_date(&text(&item, "last_downloaded_at", ""))}</td>
                                             <td>
-                                                {if complete {
-                                                    view! { <span class="badge ok" title=ctx_tr("Serie completa: tutti gli episodi disponibili sono archiviati sul NAS")>{ctx_tr("✓✓ completa")}</span> }.into_any()
+                                                {if ended && complete {
+                                                    view! { <span class="badge ok" title=ctx_tr("Serie terminata e completa: tutti gli episodi disponibili sono archiviati")>{ctx_tr("🏁 ✓✓")}</span> }.into_any()
+                                                } else if ended {
+                                                    view! { <span class="badge" title=ctx_tr("Serie terminata: mancano ancora episodi")>{ctx_tr("🏁 terminata")}</span> }.into_any()
+                                                } else if complete {
+                                                    view! { <span class="badge ok" title=ctx_tr("Serie completa: tutti gli episodi disponibili sono archiviati")>{ctx_tr("✓✓ completa")}</span> }.into_any()
                                                 } else {
                                                     view! { <span class="badge" class:ok=enabled>{if enabled { "attiva" } else { "in pausa" }}</span> }.into_any()
                                                 }}
-                                                <Show when=move || complete && !enabled>
+                                                <Show when=move || (ended || complete) && !enabled>
                                                     <span class="badge" title=ctx_tr("Serie in pausa")>{ctx_tr("in pausa")}</span>
                                                 </Show>
                                             </td>
@@ -4359,7 +4367,10 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                      <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field span-full" title=ctx_tr("Parole che non devono comparire nel titolo della release (separate da virgola)")><span>{ctx_tr("Parole vietate (exclude)")}</span><input prop:value=exclude on:input=move |event| exclude.set(event_target_value(&event)) placeholder=ctx_tr("cam, ts, screener") /></label>
-                                    <label class="field" title=ctx_tr("Sottotitoli")><span>{ctx_tr("Sottotitoli")}</span><input prop:value=subtitle on:input=move |event| subtitle.set(event_target_value(&event)) placeholder=ctx_tr("es. ita, eng") /></label>
+                                    <div class="grid-2" style="grid-column: 1 / -1">
+                                        <label class="field" title=ctx_tr("Lingue dei sottotitoli desiderate (es. ita, eng). Una release senza questi sottotitoli viene scartata; se compili 'Requisiti sottotitoli', questo campo viene ignorato.")><span>{ctx_tr("Sottotitoli")}</span><input prop:value=subtitle on:input=move |event| subtitle.set(event_target_value(&event)) placeholder=ctx_tr("es. ita, eng") /></label>
+                                        <label class="field" title=ctx_tr("Lingue di sottotitoli obbligatorie (es. ita,eng): la release viene scartata se non le contiene. Se compilato, sostituisce il campo 'Sottotitoli'.")><span>{ctx_tr("Requisiti sottotitoli")}</span><input prop:value=subtitle_reqs on:input=move |event| subtitle_reqs.set(event_target_value(&event)) placeholder=ctx_tr("ita,eng") /></label>
+                                    </div>
                                     <div class="field span-full" title=ctx_tr("Lingue che devono essere presenti nella release; con 'obbligatoria' la release senza quella lingua viene scartata")>
                                         <span>{ctx_tr("Lingue richieste (fino a 3)")}</span>
                                         <div class="language-rows-compact">
@@ -4379,7 +4390,6 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                             if active.is_empty() { "Nessuna lingua aggiuntiva richiesta.".to_string() } else { format!("Anteprima: {}", active.join(", ")) }
                                         }}</small>
                                     </div>
-                                    <label class="field" title=ctx_tr("Lingue richieste per i sottotitoli (separate da virgola)")><span>{ctx_tr("Requisiti sottotitoli")}</span><input prop:value=subtitle_reqs on:input=move |event| subtitle_reqs.set(event_target_value(&event)) placeholder=ctx_tr("ita,eng") /></label>
                                 </div>
                                      <div class="form-actions">
                                      <button class="btn primary">{ctx_tr("Salva")}</button>

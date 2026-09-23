@@ -881,5 +881,23 @@ async fn refresh_series_metadata(cfg: &Config, db: &Arc<Mutex<Database>>) {
                 tracing::debug!(series=%series.name, %error, "TMDB season metadata refresh failed")
             }
         }
+        // Stato TMDB ("Ended"/"Returning Series") per il badge nell'elenco serie.
+        if let Ok(Some(info)) = tmdb.series_info(&series.name, Some(&tmdb_id)).await {
+            let status = info
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let last_air_date = info
+                .get("last_air_date")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if let Err(error) = db
+                .lock()
+                .unwrap()
+                .save_series_status(&series.name, status, last_air_date)
+            {
+                tracing::warn!(series=%series.name, %error, "series status save failed");
+            }
+        }
     }
 }

@@ -1551,6 +1551,7 @@ async fn save_tag_dir_rules(
 async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
     let db = s.db.lock().unwrap();
+    let statuses = db.series_statuses().unwrap_or_default();
     let series = cfg
         .series
         .iter()
@@ -1599,6 +1600,7 @@ async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
                 "episodes_total": total,
                 "episodes_downloaded": downloaded,
                 "last_downloaded_at": last,
+                "tmdb_status": statuses.get(&series.name).cloned().unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
@@ -2002,6 +2004,25 @@ async fn series_metadata_refresh(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
         );
+    }
+    // Stato TMDB salvato per l'indicatore "terminata" nell'elenco serie.
+    if let Ok(Some(info)) = tmdb.series_info(&series.name, Some(resolved.as_str())).await {
+        let status = info
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let last_air_date = info
+            .get("last_air_date")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Err(error) = s
+            .db
+            .lock()
+            .unwrap()
+            .save_series_status(&series.name, status, last_air_date)
+        {
+            tracing::warn!(series=%series.name, %error, "series status save failed");
+        }
     }
     let mut stored = false;
     if series.tmdb_id.trim().is_empty() {
@@ -11205,11 +11226,16 @@ fn cleanup_empty_temp_dirs(cfg: &Config, torrents: &LibtorrentClient) {
     let Some(temp) = cfg.libtorrent_temp_dir.as_deref() else {
         return;
     };
-    let active = torrents
-        .list()
-        .into_iter()
-        .map(|torrent| torrent.name)
+    let live = torrents.list();
+    let active = live
+        .iter()
+        .map(|torrent| torrent.name.clone())
         .collect::<std::collections::HashSet<_>>();
+    // Cartelle (e sottocartelle) usate dai torrent attivi: mai toccarle.
+    let active_paths = live
+        .iter()
+        .map(|torrent| std::path::PathBuf::from(torrent.save_path.clone()))
+        .collect::<Vec<_>>();
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
     };
@@ -11220,6 +11246,9 @@ fn cleanup_empty_temp_dirs(cfg: &Config, torrents: &LibtorrentClient) {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if active.contains(&name) {
+            continue;
+        }
+        if active_paths.iter().any(|active| active.starts_with(&path)) {
             continue;
         }
         if dir_has_files(&path) {

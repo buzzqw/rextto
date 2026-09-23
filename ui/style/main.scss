@@ -427,6 +427,9 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 /* Search feedback */
 .search-row { display: flex; gap: 10px; align-items: center; }
 .search-row input { flex: 1; min-width: 0; }
+/* Il select globale è width:100%: nella search-row deve restare compatto e
+   lasciare spazio al campo di ricerca/testo. */
+.search-row select { flex: none; width: auto; max-width: 45%; }
 .search-row .btn { flex: none; white-space: nowrap; }
 @media (max-width: 720px) { .search-row { flex-wrap: wrap; } .search-row input { flex-basis: 100%; } }
 .search-status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.75rem; }
