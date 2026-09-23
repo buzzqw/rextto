@@ -175,25 +175,62 @@ impl Engine {
         for _ in 0..QUERY_CONCURRENCY {
             schedule(&mut set, &mut iter);
         }
+        // Conteggio "compatibili": una release è utile solo se supera i filtri
+        // globali e quelli della serie/film cercato (lingua, qualità, exclude,
+        // sottotitoli). Così il log non annuncia release che poi non verranno
+        // mai scaricate.
+        let usable = |query: &str, items: &[Release]| -> usize {
+            if let Some(series) = cfg.series.iter().find(|series| series.name == query) {
+                items
+                    .iter()
+                    .filter(|release| {
+                        cfg.release_allowed(release)
+                            && Config::series_release_allowed(
+                                series,
+                                &release.quality,
+                                &release.title,
+                            )
+                    })
+                    .count()
+            } else if let Some(movie) = cfg
+                .movies
+                .iter()
+                .find(|movie| format!("{} {}", movie.name, movie.year) == query)
+            {
+                items
+                    .iter()
+                    .filter(|release| {
+                        cfg.release_allowed(release)
+                            && Config::movie_release_allowed(movie, &release.quality)
+                    })
+                    .count()
+            } else {
+                items
+                    .iter()
+                    .filter(|release| cfg.release_allowed(release))
+                    .count()
+            }
+        };
         let mut targets_done = 0usize;
         let mut targets_with_hits = 0usize;
-        let mut step2_releases = 0usize;
+        let mut step2_usable = 0usize;
         while let Some(joined) = set.join_next().await {
             if let Ok((query, items)) = joined {
                 targets_done += 1;
-                if items.is_empty() {
-                    tracing::debug!(query = %query, "🔎 search: nessun risultato");
-                } else {
+                let compatible = usable(&query, &items);
+                if compatible > 0 {
                     targets_with_hits += 1;
-                    step2_releases += items.len();
-                    tracing::info!(query = %query, releases = items.len(), "🔎 trovato");
+                    step2_usable += compatible;
+                    tracing::info!(query = %query, releases = compatible, "🔎 trovato (compatibili)");
+                } else {
+                    tracing::debug!(query = %query, found = items.len(), "🔎 search: nessuna release compatibile");
                 }
                 all.extend(items);
             }
             schedule(&mut set, &mut iter);
         }
         tracing::info!(
-            "🔎 Step 2/2 completato: {targets_done} target analizzati · {targets_with_hits} con risultati · {step2_releases} release trovate"
+            "🔎 Step 2/2 completato: {targets_done} target analizzati · {targets_with_hits} con release compatibili · {step2_usable} release compatibili"
         );
         let engine_failures = websearch::take_engine_failures();
         if !engine_failures.is_empty() {
