@@ -547,6 +547,24 @@ pub async fn run_cycle(
     if db.setting("weekly_enabled", "no")? == "yes" && !cfg.dry_run {
         let weekly_from_date = db.setting("weekly_from_date", "")?;
         tracing::info!(from_date=%weekly_from_date, "comics: checking weekly packs");
+        // 1A. Ritenta i pack registrati ma mai inviati (come il legacy extto).
+        for (date, magnet, torrent_url) in db.pending_weekly().unwrap_or_default() {
+            match send_weekly_pack(
+                db, client, torrents, notifier, default_root, cfg, &date, &magnet, &torrent_url,
+            )
+            .await
+            {
+                Ok(true) => tracing::info!(date=%date, "comics: pending weekly pack sent"),
+                Ok(false) => {
+                    tracing::debug!(date=%date, "comics: pending weekly pack not accepted")
+                }
+                Err(error) => {
+                    tracing::warn!(date=%date, %error, "comics: pending weekly pack failed")
+                }
+            }
+        }
+        // 1B. Cerca nuovi pack: aggiorna anche le righe esistenti con link
+        // vuoto, così una riga preesistente non blocca il download.
         for offset in 0..=7 {
             let date =
                 (chrono::Utc::now().date_naive() - chrono::Duration::days(offset)).to_string();
@@ -556,56 +574,95 @@ pub async fn run_cycle(
             let Ok((_url, links)) = client.weekly_links(&date).await else {
                 continue;
             };
-            if !db.add_weekly(
-                &date,
-                links
-                    .magnets
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                links
-                    .torrents
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            )? {
+            let magnet = links
+                .magnets
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
+            let torrent_url = links
+                .torrents
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
+            if magnet.is_empty() && torrent_url.is_empty() {
                 continue;
             }
-            if let Some(magnet) = links.magnets.first() {
-                if let Some(hash) = magnet_hash(magnet) {
-                    if torrents.add(magnet, cfg)? {
-                        db.add_torrent(
-                            &hash,
-                            &format!("weekly:{date}"),
-                            &format!("Weekly Pack {date}"),
-                            &cfg.libtorrent_dir,
-                        )?;
-                        db.mark_weekly_sent(&date)?;
-                        let _ = notifier.notify_event("comic_queued", serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"})).await;
-                        tracing::info!(date=%date, "comics: weekly pack queued");
-                    }
-                }
-            } else if let Some(url) = links.torrents.first() {
-                let torrent_dir = default_root.join(".torrents");
-                if let Ok(path) = client.download_torrent(url, &torrent_dir).await {
-                    if let Ok(Some(hash)) = torrents.add_torrent_file(&path, &cfg.libtorrent_dir) {
-                        let _ = std::fs::remove_file(path);
-                        db.add_torrent(
-                            &hash,
-                            &format!("weekly:{date}"),
-                            &format!("Weekly Pack {date}"),
-                            &cfg.libtorrent_dir,
-                        )?;
-                        db.mark_weekly_sent(&date)?;
-                        let _ = notifier.notify_event("comic_queued", serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"})).await;
-                        tracing::info!(date=%date, "comics: weekly pack queued");
-                    }
-                }
+            if !db.upsert_weekly_links(&date, magnet, torrent_url)? {
+                continue;
+            }
+            match send_weekly_pack(
+                db, client, torrents, notifier, default_root, cfg, &date, magnet, torrent_url,
+            )
+            .await
+            {
+                Ok(true) => tracing::info!(date=%date, "comics: weekly pack queued"),
+                Ok(false) => tracing::debug!(date=%date, "comics: weekly pack not accepted"),
+                Err(error) => tracing::warn!(date=%date, %error, "comics: weekly pack failed"),
             }
             break;
         }
+    } else if db.setting("weekly_enabled", "no")? != "yes" {
+        tracing::info!("comics: weekly packs disabled");
     }
     Ok(downloaded)
+}
+
+/// Invia al client un weekly pack (magnet o file `.torrent`). Ritorna `true` se
+/// è stato accettato e marcato come inviato.
+#[allow(clippy::too_many_arguments)]
+async fn send_weekly_pack(
+    db: &ComicsDb,
+    client: &GetComicsClient,
+    torrents: &LibtorrentClient,
+    notifier: &Notifier,
+    default_root: &Path,
+    cfg: &Config,
+    date: &str,
+    magnet: &str,
+    torrent_url: &str,
+) -> Result<bool> {
+    if !magnet.is_empty() {
+        if let Some(hash) = magnet_hash(magnet) {
+            if torrents.add(magnet, cfg)? {
+                db.add_torrent(
+                    &hash,
+                    &format!("weekly:{date}"),
+                    &format!("Weekly Pack {date}"),
+                    &cfg.libtorrent_dir,
+                )?;
+                db.mark_weekly_sent(date)?;
+                let _ = notifier
+                    .notify_event(
+                        "comic_queued",
+                        serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"}),
+                    )
+                    .await;
+                return Ok(true);
+            }
+        }
+    } else if !torrent_url.is_empty() {
+        let torrent_dir = default_root.join(".torrents");
+        if let Ok(path) = client.download_torrent(torrent_url, &torrent_dir).await {
+            if let Ok(Some(hash)) = torrents.add_torrent_file(&path, &cfg.libtorrent_dir) {
+                let _ = std::fs::remove_file(path);
+                db.add_torrent(
+                    &hash,
+                    &format!("weekly:{date}"),
+                    &format!("Weekly Pack {date}"),
+                    &cfg.libtorrent_dir,
+                )?;
+                db.mark_weekly_sent(date)?;
+                let _ = notifier
+                    .notify_event(
+                        "comic_queued",
+                        serde_json::json!({"title": format!("Weekly Pack {date}"), "hash": hash, "method": "torrent"}),
+                    )
+                    .await;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
@@ -824,6 +881,50 @@ impl ComicsDb {
             [pack_date],
         )?;
         Ok(())
+    }
+
+    /// Registra i link di un weekly pack, **riempiendo** anche una riga già
+    /// presente ma creata prima che il torrent fosse disponibile (caso previsto
+    /// dal legacy extto). Ritorna `true` se la riga ora ha un link ed è ancora
+    /// da inviare, così il ciclo può scaricarla.
+    pub fn upsert_weekly_links(
+        &self,
+        pack_date: &str,
+        magnet: &str,
+        torrent_url: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO comics_weekly(pack_date,magnet,torrent_url) VALUES (?1,?2,?3)
+             ON CONFLICT(pack_date) DO UPDATE SET
+                 magnet=CASE WHEN COALESCE(comics_weekly.magnet,'')='' THEN excluded.magnet ELSE comics_weekly.magnet END,
+                 torrent_url=CASE WHEN COALESCE(comics_weekly.torrent_url,'')='' THEN excluded.torrent_url ELSE comics_weekly.torrent_url END",
+            params![pack_date, magnet, torrent_url],
+        )?;
+        Ok(conn.query_row(
+            "SELECT sent_at IS NULL AND (COALESCE(magnet,'')<>'' OR COALESCE(torrent_url,'')<>'') FROM comics_weekly WHERE pack_date=?1",
+            [pack_date],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Weekly pack registrati ma mai inviati che hanno già un link: da ritentare
+    /// ad ogni ciclo, come il legacy extto.
+    pub fn pending_weekly(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT pack_date,COALESCE(magnet,''),COALESCE(torrent_url,'') FROM comics_weekly
+             WHERE sent_at IS NULL AND (COALESCE(magnet,'')<>'' OR COALESCE(torrent_url,'')<>'')
+             ORDER BY pack_date",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -1188,6 +1289,37 @@ mod tests {
             "The Amazing Spider Man"
         );
         assert_eq!(clean_search_title(""), "");
+    }
+
+    #[test]
+    fn upsert_weekly_fills_missing_links_and_reports_eligibility() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-comics-weekly-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = ComicsDb::open(&path).unwrap();
+        // Riga registrata senza link: pack trovato ma torrent non ancora pronto.
+        assert!(!db.upsert_weekly_links("2026-09-16", "", "").unwrap());
+        assert!(db.pending_weekly().unwrap().is_empty());
+        // Arriva il magnet: la riga esistente va riempita e diventa eleggibile.
+        assert!(db
+            .upsert_weekly_links(
+                "2026-09-16",
+                "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                "",
+            )
+            .unwrap());
+        assert_eq!(db.pending_weekly().unwrap().len(), 1);
+        // Dopo l'invio non è più pending.
+        db.mark_weekly_sent("2026-09-16").unwrap();
+        assert!(db.pending_weekly().unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]
