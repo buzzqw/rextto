@@ -379,10 +379,13 @@ def draw(app: "App", win, colors: dict) -> None:
 
     name = text(app.status, "name", "rextto")
     version = text(app.status, "version")
-    active = bool(app.status.get("active"))
+    active = app.status.get("active") if isinstance(app.status, dict) else None
+    activity_label = "ACTIVE" if active is True else (
+        "PAUSED" if active is False else "LOADING")
+    activity_attr = colors["ok"] if active is True else (
+        colors["warn"] if active is False else colors["muted"])
     add(win, 0, 1, f"{name} v{version}  ", colors["header"] | curses.A_BOLD)
-    add(win, 0, 14, "ACTIVE" if active else "PAUSED",
-        colors["ok"] if active else colors["warn"])
+    add(win, 0, 14, activity_label, activity_attr)
 
     x = 2
     for index, label in enumerate(TABS):
