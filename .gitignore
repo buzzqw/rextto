@@ -42,3 +42,7 @@ dist/
 *apikey*
 *api_key*
 *token*
+
+# Python bytecode
+__pycache__/
+*.pyc
