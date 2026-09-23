@@ -8456,6 +8456,7 @@ async fn jellyfin_refresh(State(s): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     match client
         .post(&endpoint)
+        .header("Authorization", format!("MediaBrowser Token=\"{key}\""))
         .header("X-Emby-Token", key)
         .send()
         .await
@@ -8546,6 +8547,7 @@ async fn jellyfin_test(State(s): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     match client
         .get(&endpoint)
+        .header("Authorization", format!("MediaBrowser Token=\"{key}\""))
         .header("X-Emby-Token", key)
         .send()
         .await
@@ -8658,6 +8660,10 @@ async fn refresh_media_libraries(cfg: &Config) {
         let endpoint = format!("{}/Library/Refresh", jellyfin_url.trim_end_matches('/'));
         match client
             .post(endpoint)
+            .header(
+                "Authorization",
+                format!("MediaBrowser Token=\"{jellyfin_key}\""),
+            )
             .header("X-Emby-Token", jellyfin_key)
             .send()
             .await

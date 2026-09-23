@@ -246,12 +246,60 @@ impl GetComicsClient {
                 }
             }
         }
+        // Strategia 3 (come il legacy extto): ricerca testuale
+        // "YYYY.MM.DD Weekly Pack" e verifica i link del post trovato.
+        if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+            let query = format!("{} Weekly Pack", parsed.format("%Y.%m.%d"));
+            if let Ok((_url, posts)) = self.search_posts(&query).await {
+                for post in posts {
+                    let title = post.title.to_lowercase();
+                    if !title.contains("weekly") || !title.contains("pack") {
+                        continue;
+                    }
+                    if let Ok(links) = self.links(&post.url).await {
+                        if !links.magnets.is_empty()
+                            || !links.torrents.is_empty()
+                            || !links.mega.is_empty()
+                            || !links.direct.is_empty()
+                        {
+                            return Ok((post.url, links));
+                        }
+                    }
+                }
+            }
+        }
         anyhow::bail!("weekly pack not found")
     }
 
     fn absolute(&self, path: &str) -> Result<String> {
         Ok(url::Url::parse(&self.base_url)?.join(path)?.to_string())
     }
+}
+
+/// Titolo "pulito" per la ricerca per nome su GetComics: rimuove il numero
+/// dell'albo (`#41`) e l'anno (`(2026)`), come faceva il legacy extto. Serve a
+/// trovare le uscite anche quando il tag salvato è obsoleto o inesistente.
+fn clean_search_title(title: &str) -> String {
+    let base = title.split('#').next().unwrap_or(title).trim();
+    let without_year = base
+        .strip_suffix(')')
+        .and_then(|value| value.rsplit_once('('))
+        .filter(|(_, year)| year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
+        .map(|(name, _)| name.trim())
+        .unwrap_or(base);
+    without_year
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == ' ' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_articles(html: &str, from_date: &str, page_url: &str) -> Vec<ComicPost> {
@@ -341,15 +389,45 @@ pub async fn run_cycle(
     tracing::info!(monitored = monitored.len(), "comics cycle: checking monitored titles");
     for comic in monitored {
         tracing::info!(comic=%comic.title, tag=%comic.tag_url, "comics: checking title");
-        let posts = match client.tag_posts(&comic.tag_url, &comic.from_date).await {
-            Ok(posts) => posts,
-            Err(error) => {
-                tracing::warn!(comic=%comic.title, %error, "comics tag fetch failed");
-                db.mark_checked(comic.id)?;
-                continue;
+        // Anche col tag obsoleto (404) la ricerca per nome, come nel legacy
+        // extto, trova comunque le nuove uscite: uniamo le due fonti.
+        let (mut posts, tag_error) = match client.tag_posts(&comic.tag_url, &comic.from_date).await {
+            Ok(posts) => (posts, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let clean = clean_search_title(&comic.title);
+        let search_posts = if clean.is_empty() {
+            Vec::new()
+        } else {
+            match client.search_posts(&clean).await {
+                Ok((_url, posts)) => posts,
+                Err(error) => {
+                    tracing::warn!(comic=%comic.title, %error, "comics: name search failed");
+                    Vec::new()
+                }
             }
         };
-        tracing::info!(comic=%comic.title, posts=posts.len(), "comics: tag posts fetched");
+        match (tag_error.as_deref(), search_posts.is_empty()) {
+            (Some(error), false) => {
+                tracing::info!(comic=%comic.title, %error, "comics: tag unavailable, using name search")
+            }
+            (Some(error), true) => {
+                tracing::warn!(comic=%comic.title, %error, "comics tag fetch failed and name search returned nothing")
+            }
+            _ => {}
+        }
+        let mut merged: BTreeMap<String, ComicPost> = BTreeMap::new();
+        for post in posts.drain(..).chain(search_posts) {
+            if !comic.from_date.trim().is_empty()
+                && !post.date.is_empty()
+                && post.date.as_str() < comic.from_date.as_str()
+            {
+                continue;
+            }
+            merged.insert(post.url.clone(), post);
+        }
+        let posts = merged.into_values().collect::<Vec<_>>();
+        tracing::info!(comic=%comic.title, posts=posts.len(), "comics: candidate posts");
         let mut queued = 0usize;
         for post in posts {
             if db.already_sent(&post.url)? {
@@ -1099,6 +1177,18 @@ pub fn import_from_extto(source: &Path, destination: &Connection) -> Result<Comi
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cleans_comic_search_title() {
+        assert_eq!(clean_search_title("Poison Ivy #41 (2026)"), "Poison Ivy");
+        assert_eq!(clean_search_title("Spawn #373 (2026)"), "Spawn");
+        assert_eq!(clean_search_title("Batman (2026)"), "Batman");
+        assert_eq!(
+            clean_search_title("The Amazing Spider-Man #1"),
+            "The Amazing Spider Man"
+        );
+        assert_eq!(clean_search_title(""), "");
+    }
 
     #[test]
     fn monitored_history_and_weekly_records_are_idempotent() {
