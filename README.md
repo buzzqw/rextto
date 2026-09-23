@@ -168,15 +168,30 @@ A detailed walkthrough of every screen is in the
 
 ### Terminal UI
 
-For servers without a browser, Rextto ships a small terminal client:
+For servers without a browser, Rextto ships a terminal client with two modes.
 
 ```bash
-./start-tui.sh          # builds on first run, connects to 127.0.0.1:5000
+./start-tui.sh                      # interactive full-screen view
+./start-tui.sh status               # text command, pipe/script friendly
 ```
 
-It shows **Status, Torrents, Activity, Logs, Health**, triggers a cycle (`c`)
-and pauses/resumes the selected torrent (`p`). Point it elsewhere with
-`REXTTO_URL` / `REXTTO_API_TOKEN`.
+**Text commands** (work in any shell, no full-screen required):
+
+| Command | Output |
+|---|---|
+| `rextto-tui status` | daemon summary (active, torrents, last cycle, feeds) |
+| `rextto-tui torrents` | torrent session table |
+| `rextto-tui events` | recent torrent events |
+| `rextto-tui logs [n]` | last log lines (default 80) |
+| `rextto-tui health` | health report (JSON) |
+| `rextto-tui cycle [series\|movies\|comics]` | run a cycle |
+| `rextto-tui pause <hash>` / `resume <hash>` | control a torrent |
+| `rextto-tui rename-all` | background library rename |
+
+With no arguments on a real terminal it opens the interactive view
+(**Status, Torrents, Activity, Logs, Health**; `c` cycle, `p` pause/resume,
+`1-5` tabs, `q` quit). Point it elsewhere with `REXTTO_URL` /
+`REXTTO_API_TOKEN`.
 
 ### Data and logs
 

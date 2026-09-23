@@ -13,4 +13,4 @@ if [[ ! -x "$BIN" ]] || find "$ROOT/tui/src" "$ROOT/tui/Cargo.toml" -newer "$BIN
     cargo build --release --manifest-path "$ROOT/tui/Cargo.toml"
 fi
 
-exec "$BIN"
+exec "$BIN" "$@"

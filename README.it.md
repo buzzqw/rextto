@@ -168,15 +168,29 @@ La guida dettagliata di ogni schermata è nel
 
 ### Terminal UI
 
-Per i server senza browser, Rextto include un client da terminale:
+Per i server senza browser, Rextto include un client da terminale con due modalità.
 
 ```bash
-./start-tui.sh          # compila al primo avvio, si collega a 127.0.0.1:5000
+./start-tui.sh                      # vista interattiva a schermo intero
+./start-tui.sh status               # comando testuale, adatto a pipe/script
 ```
 
-Mostra **Status, Torrents, Activity, Logs, Health**, avvia un ciclo (`c`) e mette
-in pausa/riprende il torrent selezionato (`p`). Si punta altrove con `REXTTO_URL`
-e `REXTTO_API_TOKEN`.
+**Comandi testuali** (funzionano in qualsiasi shell, senza schermo intero):
+
+| Comando | Output |
+|---|---|
+| `rextto-tui status` | riepilogo (attivo, torrent, ultimo ciclo, feed) |
+| `rextto-tui torrents` | tabella dei torrent |
+| `rextto-tui events` | eventi torrent recenti |
+| `rextto-tui logs [n]` | ultime righe di log (default 80) |
+| `rextto-tui health` | report di salute (JSON) |
+| `rextto-tui cycle [series\|movies\|comics]` | avvia un ciclo |
+| `rextto-tui pause <hash>` / `resume <hash>` | controlla un torrent |
+| `rextto-tui rename-all` | rinomina della libreria in background |
+
+Senza argomenti, su un terminale reale, apre la vista interattiva
+(**Status, Torrents, Activity, Logs, Health**; `c` ciclo, `p` pausa/riprendi,
+`1-5` schede, `q` esci). Si punta altrove con `REXTTO_URL` / `REXTTO_API_TOKEN`.
 
 ### Dati e log
 
