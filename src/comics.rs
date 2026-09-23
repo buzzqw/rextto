@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::io::AsyncWriteExt;
 
@@ -975,6 +975,15 @@ impl ComicsDb {
     }
 }
 
+/// Tentativi per un download diretto: gli host di file dietro Cloudflare a
+/// volte chiudono lo stream a metà ("error decoding response body" è proprio
+/// questo, non un problema di compressione). Riprendendo dal file `.part` con
+/// una Range request non si riscarica da zero.
+const HTTP_DOWNLOAD_ATTEMPTS: u32 = 3;
+/// Timeout del singolo tentativo di download. Il timeout di 15 s del client è
+/// pensato per le pagine HTML e taglierebbe i fumetti da decine/centinaia di MB.
+const HTTP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
+
 pub async fn download_http(
     client: &reqwest::Client,
     url: &str,
@@ -982,73 +991,29 @@ pub async fn download_http(
     title: &str,
 ) -> Result<PathBuf> {
     let id = register_http_download(title, "http");
-    let result = async {
-        let parsed = url::Url::parse(url).context("invalid comic download URL")?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            anyhow::bail!("invalid comic download URL");
+    let mut outcome: Option<PathBuf> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=HTTP_DOWNLOAD_ATTEMPTS {
+        match download_http_once(client, &id, url, target_dir, title).await {
+            Ok(path) => {
+                outcome = Some(path);
+                break;
+            }
+            Err(error) => {
+                let error = error.context(format!("GET {url}"));
+                if attempt < HTTP_DOWNLOAD_ATTEMPTS {
+                    tracing::warn!(attempt, %error, "comic download attempt failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                }
+                last_error = Some(error);
+            }
         }
-        std::fs::create_dir_all(target_dir)?;
-        let mut response = client.get(url).send().await?.error_for_status()?;
-        if response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-        {
-            anyhow::bail!("comic download returned HTML instead of a file");
-        }
-        let total = response.content_length();
-        update_http_download(&id, |download| download.total_bytes = total);
-        let filename = format!(
-            "{}.cbz",
-            title
-                .chars()
-                .map(
-                    |value| if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
-                        value
-                    } else {
-                        ' '
-                    }
-                )
-                .collect::<String>()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        let destination = target_dir.join(filename);
-        let temporary = destination.with_extension("part");
-        let mut file = tokio::fs::File::create(&temporary).await?;
-        let started = Instant::now();
-        let mut downloaded = 0_u64;
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk).await?;
-            downloaded = downloaded.saturating_add(chunk.len() as u64);
-            let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
-            update_http_download(&id, |download| {
-                download.downloaded_bytes = downloaded;
-                download.speed_bytes = speed;
-                download.progress = total
-                    .map(|size| {
-                        if size == 0 {
-                            0.0
-                        } else {
-                            (downloaded as f64 * 100.0 / size as f64).min(100.0)
-                        }
-                    })
-                    .unwrap_or(-1.0);
-                download.eta_seconds = total.and_then(|size| {
-                    (speed > 0 && downloaded < size).then_some((size - downloaded) / speed)
-                });
-            });
-        }
-        file.flush().await?;
-        if downloaded == 0 {
-            anyhow::bail!("comic download is empty");
-        }
-        std::fs::rename(&temporary, &destination)?;
-        Ok(destination)
     }
-    .await;
+    let result = match (outcome, last_error) {
+        (Some(path), _) => Ok(path),
+        (None, Some(error)) => Err(error),
+        (None, None) => Err(anyhow::anyhow!("comic download failed")),
+    };
     match &result {
         Ok(_) => update_http_download(&id, |download| {
             download.status = "completed".into();
@@ -1064,6 +1029,114 @@ pub async fn download_http(
         }),
     }
     result
+}
+
+async fn download_http_once(
+    client: &reqwest::Client,
+    id: &str,
+    url: &str,
+    target_dir: &Path,
+    title: &str,
+) -> Result<PathBuf> {
+    let parsed = url::Url::parse(url).context("invalid comic download URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("invalid comic download URL");
+    }
+    std::fs::create_dir_all(target_dir)?;
+    let filename = format!(
+        "{}.cbz",
+        title
+            .chars()
+            .map(
+                |value| if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_') {
+                    value
+                } else {
+                    ' '
+                }
+            )
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let destination = target_dir.join(filename);
+    let temporary = destination.with_extension("part");
+    let offset = std::fs::metadata(&temporary)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut request = client
+        .get(url)
+        // File binari: nessuna decompressione, così un eventuale errore del
+        // decoder non può coinvolgere il contenuto.
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .timeout(HTTP_DOWNLOAD_TIMEOUT);
+    if offset > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+    }
+    let response = request.send().await?;
+    // Il file `.part` era già completo: il server risponde 416 e basta rinominarlo.
+    if offset > 0 && response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        std::fs::rename(&temporary, &destination)?;
+        return Ok(destination);
+    }
+    let mut response = response.error_for_status()?;
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    {
+        anyhow::bail!("comic download returned HTML instead of a file");
+    }
+    // Riprende solo se il server conferma la Range (206); altrimenti riparte da zero.
+    let resumed = offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if offset > 0 && !resumed {
+        std::fs::remove_file(&temporary).ok();
+    }
+    let mut file = if resumed {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&temporary)
+            .await?
+    } else {
+        tokio::fs::File::create(&temporary).await?
+    };
+    let base = if resumed { offset } else { 0 };
+    let total = response.content_length().map(|value| base + value);
+    update_http_download(id, |download| {
+        download.total_bytes = total;
+        download.downloaded_bytes = base;
+    });
+    let started = Instant::now();
+    let mut downloaded = base;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        let speed =
+            ((downloaded - base) as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+        update_http_download(id, |download| {
+            download.downloaded_bytes = downloaded;
+            download.speed_bytes = speed;
+            download.progress = total
+                .map(|size| {
+                    if size == 0 {
+                        0.0
+                    } else {
+                        (downloaded as f64 * 100.0 / size as f64).min(100.0)
+                    }
+                })
+                .unwrap_or(-1.0);
+            download.eta_seconds = total.and_then(|size| {
+                (speed > 0 && downloaded < size).then_some((size - downloaded) / speed)
+            });
+        });
+    }
+    file.flush().await?;
+    if downloaded == 0 {
+        anyhow::bail!("comic download is empty");
+    }
+    std::fs::rename(&temporary, &destination)?;
+    Ok(destination)
 }
 
 pub async fn download_torrent_file(
@@ -1363,6 +1436,77 @@ mod tests {
         let links = parse_links(html, "https://getcomics.org/post/").expect("parse");
         assert_eq!(links.magnets.len(), 1);
         assert_eq!(links.torrents.len(), 1);
+    }
+
+    /// Riproduce lo stream troncato dietro Cloudflare ("error decoding response
+    /// body"): il server dichiara la lunghezza piena ma chiude a metà. Il retry
+    /// deve riprendere dal file `.part` con una Range request, non da zero.
+    #[tokio::test]
+    async fn download_http_resumes_after_truncated_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let payload: Vec<u8> = (0..200_000_u32).map(|index| (index % 251) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served_payload = payload.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = 0usize;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buffer = vec![0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+                let offset = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .and_then(|value| value.split('-').next())
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if offset >= served_payload.len() {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                connections += 1;
+                // La lunghezza dichiarata è sempre quella piena: al primo giro il
+                // server scrive solo metà corpo, come un peer che chiude a metà.
+                let length = served_payload.len() - offset;
+                let write_end = if connections == 1 {
+                    offset + length / 2
+                } else {
+                    served_payload.len()
+                };
+                let status = if offset > 0 {
+                    "206 Partial Content"
+                } else {
+                    "200 OK"
+                };
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&served_payload[offset..write_end]).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rextto-comic-dl-{}", uuid::Uuid::new_v4()));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/file.cbz");
+        let path = download_http(&client, &url, &dir, "Resume Test")
+            .await
+            .expect("download should resume and complete");
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        assert!(!path.with_extension("part").exists());
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
