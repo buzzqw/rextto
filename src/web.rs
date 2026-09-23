@@ -2138,20 +2138,29 @@ async fn rename_all(
         progress.total = total;
         progress.message = "running".into();
     }
+    // Run on a dedicated thread with its own runtime: the archive is on NFS and
+    // blocking filesystem I/O must not stall the daemon's async runtime.
     let state = s.clone();
-    tokio::spawn(async move {
+    std::thread::spawn(move || {
         let mut errors = 0usize;
-        for (index, name) in names.iter().enumerate() {
-            {
-                let mut progress = state.rename_progress.lock().unwrap();
-                progress.current = index;
-                progress.series = name.clone();
-            }
-            let (status, _) =
-                series_rename_apply(&state, name, true, force, source_only).await;
-            if status != StatusCode::OK {
-                errors += 1;
-            }
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(async {
+                for (index, name) in names.iter().enumerate() {
+                    {
+                        let mut progress = state.rename_progress.lock().unwrap();
+                        progress.current = index;
+                        progress.series = name.clone();
+                    }
+                    let (status, _) =
+                        series_rename_apply(&state, name, true, force, source_only).await;
+                    if status != StatusCode::OK {
+                        errors += 1;
+                    }
+                }
+            });
         }
         let mut progress = state.rename_progress.lock().unwrap();
         progress.running = false;
@@ -10161,6 +10170,8 @@ async fn run_now(State(s): State<AppState>, Query(query): Query<RunNowQuery>) ->
 
 async fn cycle_worker(state: AppState) {
     let mut last_rename_check = Instant::now() - Duration::from_secs(6 * 3600);
+    // Guards against overlapping archive repairs (they can be slow on NFS).
+    let rename_repair_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut last_inactive_log: Option<Instant> = None;
     loop {
         let cfg = match Config::load(&state.config_path) {
@@ -10212,16 +10223,39 @@ async fn cycle_worker(state: AppState) {
             {
                 last_rename_check = Instant::now();
                 if cfg.rename_episodes {
-                    // legacy repairs archive names periodically, not just the
-                    // database paths. Reuse the same guarded implementation
-                    // exposed by the manual series-rename endpoint.
-                    for series in &cfg.series {
-                        let _ = series_rename_apply(&state, &series.name, true, false, false).await;
+                    // The archive lives on a (possibly slow) NFS mount, so run
+                    // the repair on a dedicated thread with its own runtime:
+                    // blocking filesystem I/O there cannot stall the daemon's
+                    // async runtime, keeping the API/UI responsive.
+                    if !rename_repair_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let state = state.clone();
+                        let names = cfg
+                            .series
+                            .iter()
+                            .map(|series| series.name.clone())
+                            .collect::<Vec<_>>();
+                        let flag = rename_repair_running.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                runtime.block_on(async {
+                                    for name in &names {
+                                        let _ = series_rename_apply(
+                                            &state, name, true, false, false,
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+                            tracing::info!(
+                                series = names.len(),
+                                "periodic archive rename repair completed"
+                            );
+                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
                     }
-                    tracing::info!(
-                        series = cfg.series.len(),
-                        "periodic archive rename repair completed"
-                    );
                 } else if let Ok(files) = state.db.lock().unwrap().archived_episode_files() {
                     let missing = files
                         .iter()
