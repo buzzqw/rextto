@@ -8707,6 +8707,11 @@ async fn torrent_event_worker(
     let mut metadata_wait_start = HashMap::new();
     let mut metadata_first_seen = HashMap::new();
     let mut stall_wait_start = HashMap::new();
+    // Periodic RAM-disk reconciliation: the metadata event fires once, so a
+    // missed event (restart/race) used to leave an oversized torrent on the
+    // tmpfs forever. `ramdisk_attempts` rate-limits retries per hash.
+    let mut ramdisk_attempts: HashMap<String, Instant> = HashMap::new();
+    let mut last_ramdisk_check = Instant::now() - Duration::from_secs(120);
     let mut last_metadata_promotion = Instant::now() - Duration::from_secs(30);
     let mut last_queue_priority = Instant::now() - Duration::from_secs(60);
     let mut last_dynamic_adjustment = Instant::now() - Duration::from_secs(90);
@@ -8818,6 +8823,10 @@ async fn torrent_event_worker(
         )
         .await;
         monitor_stalled(&cfg, &torrents, &db, &notifier, &mut stall_wait_start).await;
+        if now.duration_since(last_ramdisk_check) >= Duration::from_secs(30) {
+            reconcile_ramdisk(&cfg, &torrents, &mut ramdisk_attempts);
+            last_ramdisk_check = now;
+        }
         let mut torrent_events = torrents.poll_events();
         let mut event_hashes = torrent_events
             .iter()
@@ -9367,46 +9376,85 @@ fn post_seed_relocate(
 /// when metadata arrives, a torrent sitting on the RAM disk is moved to the
 /// temporary (or final) directory if it would exceed the configured per-torrent
 /// threshold or leave less than the safety margin free once written.
-fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &TorrentEvent) {
+/// Reason a torrent currently on the RAM disk should move to disk, if any;
+/// returns the human-readable reason and the destination directory.
+fn ramdisk_relocation(
+    cfg: &Config,
+    torrents: &LibtorrentClient,
+    hash: &str,
+    save_path: &str,
+) -> Option<(String, PathBuf)> {
     if !cfg.ramdisk_enabled() {
-        return;
+        return None;
     }
-    let Some(ramdisk) = cfg.ramdisk_dir() else {
-        return;
-    };
-    let current = FsPath::new(&event.save_path);
+    let ramdisk = cfg.ramdisk_dir()?;
+    let current = FsPath::new(save_path);
     if !crate::libtorrent::path_on_ramdisk(current, &ramdisk) {
-        return;
+        return None;
     }
-    let Some(torrent) = torrents
+    let torrent = torrents
         .list()
         .into_iter()
-        .find(|torrent| torrent.hash.eq_ignore_ascii_case(&event.hash))
-    else {
-        return;
-    };
-    let Some(free) = crate::libtorrent::free_space_bytes(&ramdisk) else {
-        tracing::warn!(hash=%event.hash, "RAM disk free space is unavailable");
-        return;
-    };
-    let uncommitted = torrents.ramdisk_uncommitted_bytes(&ramdisk, &event.hash);
-    let reason = match crate::libtorrent::ramdisk_fits(
+        .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))?;
+    let free = crate::libtorrent::free_space_bytes(&ramdisk)?;
+    let uncommitted = torrents.ramdisk_uncommitted_bytes(&ramdisk, hash);
+    let reason = crate::libtorrent::ramdisk_fits(
         cfg.ramdisk_threshold_bytes(),
         cfg.ramdisk_margin_bytes(),
         free,
         uncommitted,
         torrent.total_size.max(0) as u64,
-    ) {
-        Ok(()) => return,
-        Err(reason) => reason,
-    };
+    )
+    .err()?;
     let destination = cfg
         .libtorrent_temp_dir
         .clone()
         .unwrap_or_else(|| cfg.libtorrent_dir.clone());
     if postprocess::same_path(current, &destination) {
+        return None;
+    }
+    clear_empty_destination(&destination, &torrent.name);
+    Some((reason, destination))
+}
+
+/// `LibtorrentClient::move_storage` uses `fail_if_exist`: a leftover *empty*
+/// destination directory (from an earlier attempt) makes the move fail
+/// silently. Remove it so the relocation can proceed. A non-empty destination
+/// is left alone (real data) and the move failure is surfaced by the native
+/// `storage_moved_failed` alert.
+fn clear_empty_destination(destination: &FsPath, name: &str) {
+    if name.trim().is_empty() {
         return;
     }
+    let target = destination.join(name);
+    if !target.is_dir() {
+        return;
+    }
+    let empty = std::fs::read_dir(&target)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if !empty {
+        return;
+    }
+    match std::fs::remove_dir(&target) {
+        Ok(()) => tracing::info!(
+            target = %target.display(),
+            "removed empty destination directory before storage move"
+        ),
+        Err(error) => tracing::warn!(
+            target = %target.display(),
+            %error,
+            "cannot remove empty destination directory"
+        ),
+    }
+}
+
+fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &TorrentEvent) {
+    let Some((reason, destination)) =
+        ramdisk_relocation(cfg, torrents, &event.hash, &event.save_path)
+    else {
+        return;
+    };
     match torrents.move_storage(&event.hash, &destination) {
         Ok(true) => tracing::info!(
             hash=%event.hash,
@@ -9418,6 +9466,71 @@ fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &T
             tracing::warn!(hash=%event.hash, %reason, "RAM disk relocation was not applied")
         }
         Err(error) => tracing::warn!(hash=%event.hash, %error, "RAM disk relocation failed"),
+    }
+}
+
+/// Self-healing sweep: move every torrent that no longer fits off the RAM disk.
+/// Runs periodically so a lost `metadata_received` event can no longer pin an
+/// oversized torrent (and fill the tmpfs) until the next restart.
+fn reconcile_ramdisk(
+    cfg: &Config,
+    torrents: &LibtorrentClient,
+    attempts: &mut HashMap<String, Instant>,
+) {
+    if !cfg.ramdisk_enabled() {
+        attempts.clear();
+        return;
+    }
+    let Some(ramdisk) = cfg.ramdisk_dir() else {
+        attempts.clear();
+        return;
+    };
+    let now = Instant::now();
+    // Move at most a few per sweep: each relocation triggers a recheck, so a
+    // large batch would compete with the ongoing downloads for disk I/O.
+    let mut moved = 0usize;
+    for torrent in torrents.list() {
+        if moved >= 3 {
+            break;
+        }
+        let hash = torrent.hash.to_ascii_lowercase();
+        // Wait for the real size and leave seeding data to `post_seed_relocate`.
+        if torrent.total_size <= 0
+            || matches!(torrent.state.as_str(), "seeding" | "finished")
+            || !crate::libtorrent::path_on_ramdisk(FsPath::new(&torrent.save_path), &ramdisk)
+        {
+            continue;
+        }
+        if attempts
+            .get(&hash)
+            .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(600))
+        {
+            continue;
+        }
+        let Some((reason, destination)) =
+            ramdisk_relocation(cfg, torrents, &hash, &torrent.save_path)
+        else {
+            attempts.remove(&hash);
+            continue;
+        };
+        attempts.insert(hash.clone(), now);
+        moved += 1;
+        match torrents.move_storage(&hash, &destination) {
+            Ok(true) => tracing::info!(
+                hash = %hash,
+                %reason,
+                destination = %destination.display(),
+                "🔁 RAM disk reconciliation: moving torrent to disk"
+            ),
+            Ok(false) => tracing::warn!(
+                hash = %hash,
+                %reason,
+                "RAM disk reconciliation: relocation not applied"
+            ),
+            Err(error) => {
+                tracing::warn!(hash = %hash, %error, "RAM disk reconciliation failed")
+            }
+        }
     }
 }
 
@@ -9662,6 +9775,15 @@ async fn handle_torrent_event(
             } else {
                 complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
             }
+        }
+        "storage_move_failed" => {
+            tracing::warn!(
+                hash = %event.hash,
+                name = %event.name,
+                save_path = %event.save_path,
+                "storage move failed (destination may already exist); torrent kept in place"
+            );
+            false
         }
         "storage_moved" => {
             // A post-seeding relocation happens after the release was already
@@ -10234,6 +10356,21 @@ mod tests {
             Some((4, 12))
         );
         assert_eq!(parse_season_episode("film 2025 1080p.mkv"), None);
+    }
+
+    #[test]
+    fn clear_empty_destination_removes_only_empty_dirs() {
+        let root = std::env::temp_dir().join(format!("rextto-cleardst-{}", uuid::Uuid::new_v4()));
+        let empty = root.join("Empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        clear_empty_destination(&root, "Empty");
+        assert!(!empty.exists(), "empty destination must be removed");
+        let full = root.join("Full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("file.mkv"), b"x").unwrap();
+        clear_empty_destination(&root, "Full");
+        assert!(full.exists(), "non-empty destination must be kept");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn test_state() -> (AppState, PathBuf) {

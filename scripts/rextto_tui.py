@@ -7,8 +7,8 @@ install:
     python3 scripts/rextto_tui.py
     REXTTO_URL=http://127.0.0.1:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 
-Tabs: Status · Torrents · Activity · Logs · Health.
-Keys: 1-5/Tab switch · ↑↓ select · r refresh · q quit.
+Tabs: Status · Torrents · Logs · Health.
+Keys: 1-4/Tab switch · ↑↓ select · Enter details · r refresh · q quit.
 Global: a add magnet · t add .torrent file · c run cycle.
 Torrents tab: p pause/resume · d remove · k recheck · R reannounce · n no-rename.
 
@@ -28,7 +28,7 @@ import urllib.request
 BASE = os.environ.get("REXTTO_URL", "http://127.0.0.1:5000").rstrip("/")
 TOKEN = os.environ.get("REXTTO_API_TOKEN", "").strip()
 REFRESH_SECS = 2.0
-TABS = ["Status", "Torrents", "Activity", "Logs", "Health"]
+TABS = ["Status", "Torrents", "Logs", "Health"]
 
 
 def api(path, method="GET", body=None, raw=None, content_type="application/json"):
@@ -93,15 +93,14 @@ class App:
         self.error = ""
         self.status = {}
         self.torrents = []
-        self.events = []
         self.logs = []
         self.health = {}
+        self.detail = None
 
     def refresh(self) -> None:
         try:
             self.status = api("/api/status")
             self.torrents = api("/api/torrents") or []
-            self.events = api("/api/torrent-events") or []
             self.logs = (api("/api/logs?limit=200") or {}).get("items", [])
             self.health = api("/api/health") or {}
             self.error = ""
@@ -118,6 +117,30 @@ class App:
         if not self.torrents:
             return None
         return text(self.torrents[self.selected], "hash") or None
+
+    def open_selected_details(self) -> None:
+        hash_value = self.selected_hash()
+        if not hash_value:
+            self.message = "no torrent selected"
+            return
+        try:
+            response = api(f"/api/torrents/{hash_value}")
+            torrent = response.get("torrent") if isinstance(response, dict) else None
+            if not isinstance(torrent, dict):
+                torrent = response if isinstance(response, dict) else None
+            if torrent is None:
+                raise RuntimeError("invalid torrent details")
+            self.detail = {
+                "torrent": torrent,
+                "magnet": text(response, "magnet"),
+                "no_rename": bool(response.get("no_rename")),
+            }
+            self.message = ""
+        except RuntimeError as error:
+            self.message = f"details failed: {error}"
+
+    def close_details(self) -> None:
+        self.detail = None
 
     # --- actions ---------------------------------------------------------
 
@@ -280,27 +303,28 @@ def draw(app: "App", win, colors: dict) -> None:
         attr = colors["tab_active"] | curses.A_BOLD if index == app.tab else colors["muted"]
         add(win, 1, x, f" {index + 1}:{label} ", attr)
         x += len(label) + 6
-    add(win, 1, x, "  (Tab/1-5)", colors["muted"])
+    add(win, 1, x, "  (Tab/1-4)", colors["muted"])
 
     top = 3
     bottom = height - 2
     if app.error:
         add(win, top, 2, f"cannot reach daemon: {app.error}", colors["err"])
         add(win, top + 2, 2, "set REXTTO_URL / REXTTO_API_TOKEN", colors["muted"])
+    elif app.detail is not None:
+        draw_torrent_details(app, win, top, bottom, width, colors)
     elif app.tab == 0:
         draw_status(app, win, top, colors)
     elif app.tab == 1:
         draw_torrents(app, win, top, bottom, width, colors)
     elif app.tab == 2:
-        draw_events(app, win, top, bottom, colors)
-    elif app.tab == 3:
         draw_lines(app.logs[-(bottom - top):], win, top, bottom, colors)
     else:
-        body = json.dumps(app.health, indent=2).splitlines()
-        draw_lines(body[: max(1, bottom - top)], win, top, bottom, colors)
+        draw_health(app, win, top, bottom, width, colors)
 
     hints = " q quit · r refresh · a magnet · t file · c cycle"
-    if app.tab == 1:
+    if app.detail is not None:
+        hints += " · Enter/Esc back"
+    elif app.tab == 1:
         hints += " · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
     add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
@@ -339,8 +363,13 @@ def draw_torrents(app, win, top, bottom, width, colors) -> None:
     add(win, top, 2, f"{'HASH':<9} {'STATE':<12} {'PROG':>6} {'DONE':>10} "
                      f"{'DOWN':>10} {'UP':>10}  NAME", colors["header"])
     name_width = max(10, width - 64)
-    for index, torrent in enumerate(app.torrents[: max(1, bottom - top - 1)]):
-        y = top + 1 + index
+    visible = max(1, bottom - top - 1)
+    start = max(0, min(app.selected - visible + 1,
+                       max(0, len(app.torrents) - visible)))
+    end = min(start + visible, len(app.torrents))
+    for index in range(start, end):
+        torrent = app.torrents[index]
+        y = top + 1 + index - start
         if y >= bottom:
             break
         attr = colors["tab_active"] if index == app.selected else colors["normal"]
@@ -353,14 +382,153 @@ def draw_torrents(app, win, top, bottom, width, colors) -> None:
         add(win, y, 2, line, attr)
 
 
-def draw_events(app, win, top, bottom, colors) -> None:
-    for index, event in enumerate(list(reversed(app.events))[: max(1, bottom - top)]):
-        y = top + index
+def draw_torrent_details(app: App, win, top, bottom, width, colors) -> None:
+    detail = app.detail or {}
+    torrent = detail.get("torrent", {})
+    if not isinstance(torrent, dict):
+        add(win, top, 2, "invalid torrent details", colors["err"])
+        return
+
+    ratio = torrent.get("seed_ratio")
+    days = torrent.get("seed_days")
+    if ratio == 0 or days == 0:
+        seed_limit = "infinite"
+    elif ratio is None and days is None:
+        seed_limit = "-"
+    else:
+        seed_limit = f"ratio {text(torrent, 'seed_ratio', '-')} · {text(torrent, 'seed_days', '-')} days"
+
+    metadata = "present" if torrent.get("has_metadata") else "pending"
+    rows = [
+        ("Name", text(torrent, "name", "-")),
+        ("Hash", text(torrent, "hash", "-")),
+        ("State", text(torrent, "state", "-")),
+        ("Progress", f"{float(torrent.get('progress') or 0.0):.1f}%"),
+        ("Size", human_bytes(torrent.get("total_size") or 0)),
+        ("Downloaded", human_bytes(torrent.get("total_done") or 0)),
+        ("All-time download", human_bytes(torrent.get("all_time_download") or 0)),
+        ("All-time upload", human_bytes(torrent.get("all_time_upload") or 0)),
+        ("Rates", f"{human_bytes(torrent.get('download_rate') or 0)}/s down · "
+                  f"{human_bytes(torrent.get('upload_rate') or 0)}/s up"),
+        ("Peers / seeds", f"{text(torrent, 'num_peers', '0')} / {text(torrent, 'num_seeds', '0')}"),
+        ("Queue position", text(torrent, "queue_position", "-")),
+        ("Seed limit", seed_limit),
+        ("Metadata", metadata),
+        ("Torrent version", text(torrent, "torrent_version", "-")),
+        ("Auto-managed", "yes" if torrent.get("auto_managed") else "no"),
+        ("No rename", "yes" if detail.get("no_rename") else "no"),
+        ("Save path", text(torrent, "save_path", "-")),
+        ("Magnet", detail.get("magnet") or "-"),
+    ]
+    value_width = max(1, width - 23)
+    for offset, (label, value) in enumerate(rows):
+        y = top + offset
         if y >= bottom:
             break
+        add(win, y, 2, f"{label:<18} {shorten(str(value), value_width)}", colors["normal"])
+
+
+def optional_number(value, suffix="", decimals=0) -> str:
+    if value is None:
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if decimals == 0:
+        return f"{number:.0f}{suffix}"
+    return f"{number:.{decimals}f}{suffix}"
+
+
+def human_duration(value) -> str:
+    try:
+        seconds = max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return "-"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, _ = divmod(seconds, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def draw_health(app: App, win, top, bottom, width, colors) -> None:
+    health = app.health if isinstance(app.health, dict) else {}
+    status = text(health, "status", "offline")
+    status_attr = colors["ok"] if status.lower() == "ok" else colors["warn"]
+    add(win, top, 2, f"Health: {status.upper()}", status_attr | curses.A_BOLD)
+
+    total_memory = health.get("memory_total_bytes") or 0
+    available_memory = health.get("memory_available_bytes") or 0
+    disk_total = health.get("disk_total_bytes") or 0
+    disk_free = health.get("disk_free_bytes") or 0
+    writable = "yes" if health.get("data_dir_writable") else "no"
+    summary = [
+        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(health.get('uptime_seconds'))} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
+        f"System: CPU {optional_number(health.get('cpu_percent'), '%')} · load {optional_number(health.get('load_average'), '', 2)} · RAM free {human_bytes(available_memory)} / {human_bytes(total_memory)}",
+        f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
+        f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",
+    ]
+    for offset, line in enumerate(summary, 1):
+        if top + offset >= bottom:
+            return
+        add(win, top + offset, 2, shorten(line, max(1, width - 4)), colors["normal"])
+
+    y = top + len(summary) + 1
+    if y < bottom:
+        add(win, y, 2, "Paths", colors["header"] | curses.A_BOLD)
+        y += 1
+    paths = health.get("paths", [])
+    for path in paths if isinstance(paths, list) else []:
+        if y >= bottom:
+            return
+        exists = bool(path.get("exists"))
+        path_writable = bool(path.get("writable"))
+        good = exists and path_writable
+        state = "OK" if good else "FAIL"
+        label = text(path, "label", "-")
+        path_name = shorten(text(path, "path", "-"), max(1, width - 25))
+        add(win, y, 2, f"{state:<4} {label:<14} {path_name}",
+            colors["ok"] if good else colors["err"])
+        y += 1
+
+    disks = health.get("disks", [])
+    if y < bottom:
+        add(win, y, 2, "Disks", colors["header"] | curses.A_BOLD)
+        y += 1
+    for disk in disks if isinstance(disks, list) else []:
+        if y >= bottom:
+            return
+        total = disk.get("total_bytes") or 0
+        free = disk.get("free_bytes") or 0
+        try:
+            used = max(0.0, min(100.0, (1.0 - float(free) / float(total)) * 100.0)) if total else 0.0
+        except (TypeError, ValueError):
+            used = 0.0
+        mount = shorten(text(disk, "mount", "-"), max(1, width - 48))
+        line = f"{mount:<18} {human_bytes(free)} free / {human_bytes(total)} · {used:.0f}% used"
+        add(win, y, 2, shorten(line, max(1, width - 4)), colors["normal"])
+        y += 1
+
+    ramdisk = health.get("ramdisk")
+    if isinstance(ramdisk, dict) and y < bottom:
         add(win, y, 2,
-            f"{shorten(text(event,'kind'),18):<18} {shorten(text(event,'hash'),9):<9} {text(event,'name')}",
-            colors["normal"])
+            shorten(f"RAM disk: {text(ramdisk, 'path', '-')} · {human_bytes(ramdisk.get('free_bytes') or 0)} free / {human_bytes(ramdisk.get('total_bytes') or 0)}",
+                    max(1, width - 4)), colors["normal"])
+        y += 1
+
+    errors = health.get("last_errors", [])
+    if isinstance(errors, list) and errors and y < bottom:
+        add(win, y, 2, "Recent errors", colors["err"] | curses.A_BOLD)
+        y += 1
+        for error in errors[-2:]:
+            if y >= bottom:
+                break
+            add(win, y, 2, shorten(str(error), max(1, width - 4)), colors["err"])
+            y += 1
 
 
 def main(stdscr) -> None:
@@ -375,13 +543,21 @@ def main(stdscr) -> None:
     while True:
         draw(app, stdscr, colors)
         key = stdscr.getch()
-        if key in (ord("q"), 27):
+        if key == ord("q"):
             break
-        if key in (9, curses.KEY_RIGHT):
+        if app.detail is not None:
+            if key in (10, 13, curses.KEY_ENTER, 27):
+                app.close_details()
+            elif key == ord("r"):
+                app.refresh()
+                app.open_selected_details()
+        elif key == 27:
+            break
+        elif key in (9, curses.KEY_RIGHT):
             app.tab = (app.tab + 1) % len(TABS)
         elif key in (getattr(curses, "KEY_BTAB", 353), curses.KEY_LEFT):
             app.tab = (app.tab - 1) % len(TABS)
-        elif ord("1") <= key <= ord("5"):
+        elif ord("1") <= key <= ord("4"):
             app.tab = key - ord("1")
         elif key == ord("r"):
             app.refresh()
@@ -406,10 +582,12 @@ def main(stdscr) -> None:
             app.reannounce_selected()
         elif app.tab == 1 and key == ord("n"):
             app.toggle_no_rename()
-        elif key == curses.KEY_DOWN:
+        elif app.tab == 1 and key in (10, 13, curses.KEY_ENTER):
+            app.open_selected_details()
+        elif app.tab == 1 and key == curses.KEY_DOWN:
             if app.torrents:
                 app.selected = min(app.selected + 1, len(app.torrents) - 1)
-        elif key == curses.KEY_UP:
+        elif app.tab == 1 and key == curses.KEY_UP:
             app.selected = max(0, app.selected - 1)
 
         if time.time() - app.last_refresh >= REFRESH_SECS:

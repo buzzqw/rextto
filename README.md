@@ -177,12 +177,13 @@ python3 scripts/rextto_tui.py
 REXTTO_URL=http://192.168.1.10:5000 REXTTO_API_TOKEN=... python3 scripts/rextto_tui.py
 ```
 
-Tabs: **Status · Torrents · Activity · Logs · Health** (auto-refresh).
+Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 
 | Keys | Action |
 |---|---|
-| `1-5` / `Tab` | switch tab |
-| `↑↓` | select a torrent |
+| `1-4` / `Tab` | switch tab |
+| `↑↓` | select a torrent in the Torrents tab |
+| `Enter` | open the selected torrent details (`Enter`/`Esc` to go back) |
 | `r` | refresh · `c` run a cycle · `q` quit |
 | `a` | **add a magnet link** |
 | `t` | **add a `.torrent` file** (path) |

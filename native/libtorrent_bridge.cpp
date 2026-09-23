@@ -168,6 +168,10 @@ static void collect_events(rextto_lt_session* session) {
         if (const auto* event = lt::alert_cast<lt::metadata_received_alert>(alert)) { kind = 1; handle = event->handle; handle.set_flags(lt::torrent_flags::auto_managed); }
         else if (const auto* event = lt::alert_cast<lt::torrent_finished_alert>(alert)) { kind = 2; handle = event->handle; }
         else if (const auto* event = lt::alert_cast<lt::storage_moved_alert>(alert)) { kind = 3; handle = event->handle; moved_path = event->storage_path(); }
+        // Surface failed storage moves instead of dropping them silently: a
+        // move can fail with `fail_if_exist` when the destination already
+        // exists, leaving the torrent on the RAM disk forever.
+        else if (const auto* event = lt::alert_cast<lt::storage_moved_failed_alert>(alert)) { kind = 4; handle = event->handle; }
         if (kind == 0 || !handle.is_valid()) continue;
         auto status = handle.status(lt::torrent_handle::query_name | lt::torrent_handle::query_save_path);
         rextto_lt_event output{};
