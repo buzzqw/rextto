@@ -93,9 +93,13 @@ struct rextto_lt_session {
     lt::session session;
     std::deque<rextto_lt_event> events;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> active_since;
-    std::vector<std::string> last_queue_order;
     std::deque<std::pair<std::chrono::steady_clock::time_point, std::int64_t>> dynamic_rate_samples;
     std::chrono::steady_clock::time_point dynamic_last_change =
+        std::chrono::steady_clock::now() - std::chrono::seconds(600);
+    // Cooldown separato per la salita: quando la banda è inutilizzata bisogna
+    // recuperare in fretta, non aspettare il cooldown di dieci minuti pensato
+    // per evitare l'oscillazione in discesa.
+    std::chrono::steady_clock::time_point dynamic_last_increase =
         std::chrono::steady_clock::now() - std::chrono::seconds(600);
     std::chrono::steady_clock::time_point dynamic_seed_state_since = std::chrono::steady_clock::now();
     bool dynamic_seed_state = false;
@@ -548,41 +552,12 @@ size_t rextto_lt_ensure_auto_managed(rextto_lt_session* session) {
     return changed;
 }
 
-void rextto_lt_prioritize_queue(rextto_lt_session* session) {
-    if (session == nullptr) return;
-    struct candidate { lt::torrent_handle handle; std::string hash; double score; };
-    const auto now = std::chrono::steady_clock::now();
-    std::vector<candidate> candidates;
-    std::vector<std::string> protected_order;
-    for (auto const& handle : session->session.get_torrents()) {
-        auto status = handle.status();
-        const auto hash = hex_hash(handle);
-        if (status.is_seeding || status.is_finished || !status.has_metadata) continue;
-        if (!(status.flags & lt::torrent_flags::paused)) session->active_since.try_emplace(hash, now);
-        const auto active = session->active_since.find(hash);
-        if (active != session->active_since.end() && now - active->second < std::chrono::seconds(600)) {
-            protected_order.push_back(hash);
-            continue;
-        }
-        const double remaining = static_cast<double>(std::max<std::int64_t>(0, status.total_wanted - status.total_wanted_done));
-        const int sources = status.num_peers + status.num_seeds;
-        const double score = status.download_rate > 0 ? remaining / status.download_rate : (sources > 0 ? remaining / (1.0 + sources) : remaining);
-        candidates.push_back({handle, hash, score});
-    }
-    // Lower badness means a lower ETA / better source availability.  legacy
-    // therefore puts the smallest score first; sorting in reverse starved
-    // torrents that were already close to completion.
-    std::sort(candidates.begin(), candidates.end(), [](candidate const& left, candidate const& right) { return left.score < right.score; });
-    std::vector<std::string> order = protected_order;
-    for (auto const& item : candidates) order.push_back(item.hash);
-    if (order == session->last_queue_order) return;
-    session->last_queue_order = order;
-    for (auto const& item : candidates) item.handle.queue_position_top();
-    for (auto const& hash : protected_order) {
-        auto handle = find_torrent(session, hash.c_str());
-        if (handle.is_valid()) handle.queue_position_top();
-    }
-}
+// Nota: il riordino custom della coda è stato rimosso di proposito. Ordinava i
+// torrent per rate/peer *live*, ma un torrent in coda (pausa) ha zero peer e
+// zero rate, quindi finiva sempre in fondo: i torrent con fonti ma in attesa
+// venivano affamati e la coda non ruotava più (`active_downloads` restava basso
+// e l'aggregato crollava a zero). L'ordinamento e la rotazione sono lasciati
+// all'auto-manager nativo di libtorrent, che non ha questo punto cieco.
 
 void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_downloads, int minimum, int maximum, int static_seeds, int static_limit, int global_download_limit) {
     if (session == nullptr) return;
@@ -619,7 +594,6 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
     int active_limit = settings.get_int(lt::settings_pack::active_limit);
     std::int64_t aggregate_rate = 0;
     int queued_count = 0;
-    int queued_with_sources = 0;
     bool priority_download = false;
     struct active_torrent { lt::torrent_handle handle; int tier; };
     std::vector<active_torrent> active;
@@ -630,7 +604,6 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
         const int sources = status.num_peers + status.num_seeds;
         if (paused) {
             ++queued_count;
-            if (sources > 0) ++queued_with_sources;
             continue;
         }
         const int tier = status.download_rate > 0 ? 0 : (sources > 0 ? 1 : 2);
@@ -639,49 +612,48 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
         active.push_back({handle, tier});
     }
 
-    // Moving-window hysteresis, matching legacy: three coherent samples and a
-    // ten-minute cooldown prevent queue oscillation on a fluctuating link.
+    // Moving-window hysteresis per la discesa: campioni coerenti e cooldown di
+    // dieci minuti evitano l'oscillazione su una linea instabile. La salita usa
+    // un cooldown corto e non pretende di "vedere fonti": un torrent in coda è
+    // in pausa e quindi ha sempre zero peer, non si può sapere se è scaricabile
+    // finché non lo si attiva. Se la banda è inutilizzata e ci sono torrent in
+    // attesa, si sale.
     session->dynamic_rate_samples.emplace_back(now, aggregate_rate);
     while (!session->dynamic_rate_samples.empty()
         && now - session->dynamic_rate_samples.front().first > std::chrono::seconds(600)) {
         session->dynamic_rate_samples.pop_front();
     }
-    if (now - session->dynamic_last_change >= std::chrono::seconds(600)) {
-        if (global_download_limit > 0 && session->dynamic_rate_samples.size() >= 3) {
-            std::int64_t sum = 0;
-            for (auto const& sample : session->dynamic_rate_samples) sum += sample.second;
-            const double ratio = static_cast<double>(sum) / session->dynamic_rate_samples.size() / global_download_limit;
-            if (ratio >= 0.9 && downloads > minimum) {
-                ++session->dynamic_saturation;
-                session->dynamic_underused = 0;
-                if (session->dynamic_saturation >= 3) {
-                    downloads = std::max(minimum, downloads - 1);
-                    session->dynamic_saturation = 0;
-                    session->dynamic_last_change = now;
-                }
-            } else if (queued_with_sources > 0 && ratio <= 0.5 && downloads < maximum) {
-                ++session->dynamic_underused;
+    const bool decrease_ready = now - session->dynamic_last_change >= std::chrono::seconds(600);
+    const bool increase_ready = now - session->dynamic_last_increase >= std::chrono::seconds(90);
+    if (global_download_limit > 0 && session->dynamic_rate_samples.size() >= 3) {
+        std::int64_t sum = 0;
+        for (auto const& sample : session->dynamic_rate_samples) sum += sample.second;
+        const double ratio = static_cast<double>(sum) / session->dynamic_rate_samples.size() / global_download_limit;
+        if (ratio >= 0.9 && downloads > minimum && decrease_ready) {
+            ++session->dynamic_saturation;
+            session->dynamic_underused = 0;
+            if (session->dynamic_saturation >= 3) {
+                downloads = std::max(minimum, downloads - 1);
                 session->dynamic_saturation = 0;
-                if (session->dynamic_underused >= 3) {
-                    downloads = std::min(maximum, downloads + 1);
-                    session->dynamic_underused = 0;
-                    session->dynamic_last_change = now;
-                }
-            } else {
-                session->dynamic_saturation = 0;
-                session->dynamic_underused = 0;
-            }
-        } else if (global_download_limit <= 0 && queued_with_sources > 0 && downloads < maximum) {
-            ++session->dynamic_underused;
-            if (session->dynamic_underused >= 3) {
-                downloads = std::min(maximum, downloads + 1);
-                session->dynamic_underused = 0;
                 session->dynamic_last_change = now;
             }
+        } else if (queued_count > 0 && ratio <= 0.5 && downloads < maximum && increase_ready) {
+            session->dynamic_underused = 0;
+            session->dynamic_saturation = 0;
+            // Salita più decisa quando la linea è quasi ferma.
+            downloads = std::min(maximum, downloads + (ratio <= 0.2 ? 2 : 1));
+            session->dynamic_last_increase = now;
         } else {
             session->dynamic_saturation = 0;
             session->dynamic_underused = 0;
         }
+    } else if (global_download_limit <= 0 && queued_count > 0 && downloads < maximum && increase_ready) {
+        session->dynamic_underused = 0;
+        downloads = std::min(maximum, downloads + 1);
+        session->dynamic_last_increase = now;
+    } else {
+        session->dynamic_saturation = 0;
+        session->dynamic_underused = 0;
     }
 
     const bool seed_priority_state = queued_count > 0;

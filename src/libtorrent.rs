@@ -70,7 +70,6 @@ unsafe extern "C" {
     ) -> i32;
     fn rextto_lt_promote_metadata(session: *mut c_void);
     fn rextto_lt_ensure_auto_managed(session: *mut c_void) -> usize;
-    fn rextto_lt_prioritize_queue(session: *mut c_void);
     fn rextto_lt_adjust_queue(
         session: *mut c_void,
         enabled: i32,
@@ -1045,12 +1044,6 @@ impl LibtorrentClient {
         0
     }
 
-    pub fn prioritize_queue(&self) {
-        if let Some(session) = &self.session {
-            unsafe { rextto_lt_prioritize_queue(session.0) };
-        }
-    }
-
     pub fn adjust_queue(&self, cfg: &Config) {
         let Some(session) = &self.session else {
             return;
@@ -1596,7 +1589,6 @@ mod tests {
         assert!(client.list().is_empty());
         assert!(client.poll_events().is_empty());
         client.promote_metadata();
-        client.prioritize_queue();
         client.adjust_queue(&cfg);
         assert!(!client
             .pause("0123456789012345678901234567890123456789")

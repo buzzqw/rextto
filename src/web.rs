@@ -9633,7 +9633,6 @@ async fn torrent_event_worker(
     let mut ramdisk_attempts: HashMap<String, Instant> = HashMap::new();
     let mut last_ramdisk_check = Instant::now() - Duration::from_secs(120);
     let mut last_metadata_promotion = Instant::now() - Duration::from_secs(30);
-    let mut last_queue_priority = Instant::now() - Duration::from_secs(60);
     let mut last_dynamic_adjustment = Instant::now() - Duration::from_secs(90);
     let mut last_speed_policy = Instant::now() - Duration::from_secs(60);
     let mut last_speed: Option<(i64, i64)> = None;
@@ -9683,26 +9682,26 @@ async fn torrent_event_worker(
             }
             last_metadata_promotion = now;
         }
-        if now.duration_since(last_queue_priority) >= Duration::from_secs(60) {
-            torrents.prioritize_queue();
-            last_queue_priority = now;
-        }
         if now.duration_since(last_dynamic_adjustment) >= Duration::from_secs(90) {
             torrents.adjust_queue(&cfg);
             last_dynamic_adjustment = now;
         }
         if now.duration_since(last_speed_policy) >= Duration::from_secs(60) {
-            // Log only when the effective limits change (informative, not noisy).
             let (download_kib, upload_kib) = current_speed_limits(&cfg);
-            if last_speed != Some((download_kib, upload_kib)) {
-                match torrents.set_global_speed_limits(download_kib, upload_kib) {
-                    Ok(_) => {
+            // Riafferma sempre, non solo al cambio: "Applica ora" e
+            // l'ottimizzazione impostano il limite della sessione al valore non
+            // programmato (es. 3000 di giorno) e la policy deve correggerlo da
+            // sola entro un minuto. Il log resta solo sui cambi reali.
+            let changed = last_speed != Some((download_kib, upload_kib));
+            match torrents.set_global_speed_limits(download_kib, upload_kib) {
+                Ok(_) => {
+                    if changed {
                         tracing::info!(download_kib, upload_kib, "global speed limits applied")
                     }
-                    Err(error) => tracing::debug!(%error, "speed policy apply failed"),
                 }
-                last_speed = Some((download_kib, upload_kib));
+                Err(error) => tracing::debug!(%error, "speed policy apply failed"),
             }
+            last_speed = Some((download_kib, upload_kib));
             last_speed_policy = now;
         }
         // `debug_enabled`: periodic diagnostics for crashes/RAM/loops.
