@@ -277,6 +277,19 @@ impl GetComicsClient {
     }
 }
 
+/// Data canonica `YYYY-MM-DD` dal titolo di un weekly pack (che può usare
+/// separatori con punto o trattino, es. "2026.09.16 Weekly Pack").
+fn extract_pack_date(title: &str) -> Option<String> {
+    let pattern = crate::utils::cached_regex(r"(\d{4})[.\-](\d{2})[.\-](\d{2})").ok()?;
+    let captures = pattern.captures(title)?;
+    Some(format!(
+        "{}-{}-{}",
+        captures.get(1)?.as_str(),
+        captures.get(2)?.as_str(),
+        captures.get(3)?.as_str()
+    ))
+}
+
 /// Titolo "pulito" per la ricerca per nome su GetComics: rimuove il numero
 /// dell'albo (`#41`) e l'anno (`(2026)`), come faceva il legacy extto. Serve a
 /// trovare le uscite anche quando il tag salvato è obsoleto o inesistente.
@@ -566,58 +579,68 @@ pub async fn run_cycle(
         }
         // 1B. Cerca nuovi pack: aggiorna anche le righe esistenti con link
         // vuoto, così una riga preesistente non blocca il download.
+        // 1B. Cerca i pack recenti con UNA sola ricerca (come il legacy extto):
+        // così non si fanno decine di richieste per data (che su GetComics
+        // finiscono in rate-limit e facevano fallire il pack giusto).
         let mut weekly_checked = 0usize;
-        for offset in 0..=7 {
-            let date =
-                (chrono::Utc::now().date_naive() - chrono::Duration::days(offset)).to_string();
-            if !weekly_from_date.trim().is_empty() && date < weekly_from_date {
-                continue;
-            }
-            weekly_checked += 1;
-            let links = match client.weekly_links(&date).await {
-                Ok((url, links)) => {
-                    tracing::info!(
-                        date = %date,
-                        url = %url,
-                        magnets = links.magnets.len(),
-                        torrents = links.torrents.len(),
-                        "comics: weekly pack page found"
-                    );
-                    links
+        match client.search_posts("Weekly Pack").await {
+            Ok((_url, posts)) => {
+                for post in posts {
+                    let title = post.title.to_lowercase();
+                    if !title.contains("weekly") || !title.contains("pack") {
+                        continue;
+                    }
+                    let Some(date) = extract_pack_date(&post.title) else {
+                        continue;
+                    };
+                    if !weekly_from_date.trim().is_empty() && date < weekly_from_date {
+                        continue;
+                    }
+                    weekly_checked += 1;
+                    let Ok(links) = client.links(&post.url).await else {
+                        tracing::debug!(date = %date, post = %post.url, "comics: weekly pack links failed");
+                        continue;
+                    };
+                    let magnet = links
+                        .magnets
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let torrent_url = links
+                        .torrents
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if magnet.is_empty() && torrent_url.is_empty() {
+                        tracing::info!(date = %date, "comics: weekly pack found without magnet/torrent yet");
+                        continue;
+                    }
+                    let eligible = db.upsert_weekly_links(&date, magnet, torrent_url)?;
+                    tracing::info!(date = %date, eligible, "comics: weekly pack recorded");
+                    if !eligible {
+                        continue;
+                    }
+                    match send_weekly_pack(
+                        db, client, torrents, notifier, default_root, cfg, &date, magnet, torrent_url,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            tracing::info!(date=%date, "comics: weekly pack queued");
+                            break;
+                        }
+                        Ok(false) => {
+                            tracing::debug!(date=%date, "comics: weekly pack not accepted")
+                        }
+                        Err(error) => {
+                            tracing::warn!(date=%date, %error, "comics: weekly pack failed")
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(date = %date, %error, "comics: weekly pack not found");
-                    continue;
-                }
-            };
-            let magnet = links
-                .magnets
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default();
-            let torrent_url = links
-                .torrents
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default();
-            if magnet.is_empty() && torrent_url.is_empty() {
-                continue;
             }
-            let eligible = db.upsert_weekly_links(&date, magnet, torrent_url)?;
-            tracing::info!(date = %date, eligible, "comics: weekly pack recorded");
-            if !eligible {
-                continue;
+            Err(error) => {
+                tracing::warn!(%error, "comics: weekly pack search failed");
             }
-            match send_weekly_pack(
-                db, client, torrents, notifier, default_root, cfg, &date, magnet, torrent_url,
-            )
-            .await
-            {
-                Ok(true) => tracing::info!(date=%date, "comics: weekly pack queued"),
-                Ok(false) => tracing::debug!(date=%date, "comics: weekly pack not accepted"),
-                Err(error) => tracing::warn!(date=%date, %error, "comics: weekly pack failed"),
-            }
-            break;
         }
         tracing::info!(checked = weekly_checked, "comics: weekly check done");
     } else if db.setting("weekly_enabled", "no")? != "yes" {
