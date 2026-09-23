@@ -274,7 +274,7 @@ pub fn cleanup_old_episode(
         return Ok(0);
     }
     let pattern = crate::utils::cached_regex(
-        r"(?i)^(?P<name>.+?)[ ._-]+s(?P<season>\d{1,2})e(?P<episode>\d{1,4})(?:[ ._-]|$)",
+        r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})(?:[ ._-]|$)",
     )?;
     let normalized = normalize_series_name(series);
     let preferred = cfg.default_language();
@@ -291,6 +291,7 @@ pub fn cleanup_old_episode(
         };
         if captures
             .name("season")
+            .or_else(|| captures.name("nseason"))
             .and_then(|value| value.as_str().parse::<i64>().ok())
             != Some(season)
             || captures
@@ -522,7 +523,7 @@ pub fn discard_if_inferior(
         return Ok(false);
     }
     let pattern = crate::utils::cached_regex(
-        r"(?i)^(?P<name>.+?)[ ._-]+s(?P<season>\d{1,2})e(?P<episode>\d{1,4})(?:[ ._-]|$)",
+        r"(?i)^(?P<name>.+?)[ ._-]+(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})(?:[ ._-]|$)",
     )?;
     let normalized = normalize_series_name(series);
     let preferred = cfg.default_language();
@@ -538,6 +539,7 @@ pub fn discard_if_inferior(
         };
         if captures
             .name("season")
+            .or_else(|| captures.name("nseason"))
             .and_then(|value| value.as_str().parse::<i64>().ok())
             != Some(season)
             || captures
@@ -828,6 +830,34 @@ mod tests {
         );
         assert!(trash.join("Example.S01E01.720p.WEB-DL.mkv").is_file());
         assert!(kept.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_recognizes_legacy_nxnn_episode_names() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-nxnn-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let archive = root.join("archive");
+        let trash = root.join("trash");
+        fs::create_dir_all(&archive).unwrap();
+        let old = archive.join("Example.1x01.720p.WEB-DL.mkv");
+        fs::write(&old, b"old").unwrap();
+        let kept = archive.join("Example - S01E01 - Title - [1080p][h265].mkv");
+        fs::write(&kept, b"new").unwrap();
+        let mut cfg = Config::default();
+        cfg.cleanup_upgrades = true;
+        cfg.trash_path = Some(trash.clone());
+        assert_eq!(
+            cleanup_old_episode(
+                &cfg, "Example", 1, 1,
+                parse_quality("Example.S01E01.1080p.WEB-DL.mkv").score(),
+                &kept, &archive,
+            ).unwrap(),
+            1,
+        );
+        assert!(trash.join("Example.1x01.720p.WEB-DL.mkv").is_file());
         let _ = fs::remove_dir_all(root);
     }
 

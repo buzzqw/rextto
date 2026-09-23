@@ -189,8 +189,19 @@ fn copy_files(files: &[PathBuf], source: &Path, destination: &Path) -> Result<Ve
             .write(true)
             .create_new(true)
             .open(&target)?;
-        std::io::copy(&mut input, &mut output)?;
+        let copied_bytes = std::io::copy(&mut input, &mut output)?;
         output.sync_all()?;
+        let source_bytes = file.metadata()?.len();
+        if copied_bytes != source_bytes || target.metadata()?.len() != source_bytes {
+            let _ = fs::remove_file(&target);
+            bail!(
+                "season pack copy size mismatch for {}: source={} copied={} target={}",
+                file.display(),
+                source_bytes,
+                copied_bytes,
+                target.metadata().map(|value| value.len()).unwrap_or(0),
+            );
+        }
         copied.push(target);
     }
     if copied.is_empty() {
@@ -207,17 +218,31 @@ pub fn copy_pack_files(source: &Path, destination: &Path) -> Result<Vec<PathBuf>
 /// Returns only pack files whose season and episode range agree with the
 /// release metadata. This prevents a mislabeled pack (for example S05 files
 /// advertised as S06) from being copied into the NAS before it is rejected.
-pub fn matching_pack_files(source: &Path, release: &Release) -> Result<Vec<PathBuf>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackSourceFile {
+    pub path: PathBuf,
+    pub season: i64,
+    pub episode: i64,
+}
+
+/// Resolves the episode identity of every file that can safely be imported from
+/// a pack. Standard `SxxEyy`/`NxNN` names are preferred. As a compatibility
+/// fallback, a partial pack may contain files named only `01.mkv` or
+/// `Episode 01.mkv`: those are accepted only when their explicit numbers are
+/// all members of the release range. A complete, unlabelled pack remains
+/// deliberately rejected because there is no safe episode mapping.
+pub fn matching_pack_files(source: &Path, release: &Release) -> Result<Vec<PackSourceFile>> {
     let episode_pattern =
         crate::utils::cached_regex(r"(?i)(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})")?;
-    Ok(video_files(source)?
-        .into_iter()
-        .filter(|file| {
+    let files = video_files(source)?;
+    let mut matched = files
+        .iter()
+        .filter_map(|file| {
             let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
-                return false;
+                return None;
             };
             let Some(capture) = episode_pattern.captures(name) else {
-                return false;
+                return None;
             };
             let season = capture
                 .name("season")
@@ -226,14 +251,63 @@ pub fn matching_pack_files(source: &Path, release: &Release) -> Result<Vec<PathB
             let episode = capture
                 .name("episode")
                 .and_then(|value| value.as_str().parse::<i64>().ok());
-            season == release.season
-                && episode.is_some_and(|episode| {
+            let episode = episode.filter(|episode| {
                     release.episode_range.is_empty()
                         || release.episode_range.contains(&0)
-                        || release.episode_range.contains(&episode)
-                })
+                        || release.episode_range.contains(episode)
+                });
+            match (season, episode) {
+                (Some(season), Some(episode)) if Some(season) == release.season => {
+                    Some(PackSourceFile { path: file.clone(), season, episode })
+                }
+                _ => None,
+            }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let expected = release
+        .episode_range
+        .iter()
+        .copied()
+        .filter(|episode| *episode > 0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let bare_episode = crate::utils::cached_regex(r"(?i)^(?:e(?:pisode)?[ ._-]?)?0*(\d{1,4})$")?;
+    // A complete pack has no trustworthy explicit episode list. In that case,
+    // import only files carrying their own season/episode identity.
+    if expected.is_empty() || release.season.is_none() {
+        return Ok(matched);
+    }
+    // A partial pack is complete only when every declared episode is accounted
+    // for. Combine explicit SxxEyy/NxNN names with the narrowly accepted bare
+    // numeric fallback; never silently import half a declared range.
+    let mut found = matched
+        .iter()
+        .map(|file| file.episode)
+        .collect::<std::collections::BTreeSet<_>>();
+    for file in files {
+        if matched.iter().any(|item| item.path == file) {
+            continue;
+        }
+        let Some(stem) = file.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(capture) = bare_episode.captures(stem) else {
+            continue;
+        };
+        let Some(episode) = capture.get(1).and_then(|value| value.as_str().parse::<i64>().ok()) else {
+            return Ok(Vec::new());
+        };
+        if !expected.contains(&episode) || !found.insert(episode) {
+            return Ok(Vec::new());
+        }
+        matched.push(PackSourceFile {
+            path: file,
+            season: release.season.unwrap_or_default(),
+            episode,
+        });
+    }
+    matched.sort_by_key(|file| file.episode);
+    matched.dedup_by_key(|file| file.episode);
+    Ok((found == expected).then_some(matched).unwrap_or_default())
 }
 
 pub fn copy_matching_pack_files(
@@ -248,7 +322,11 @@ pub fn copy_matching_pack_files(
             source.display()
         );
     }
-    copy_files(&files, source, destination)
+    copy_files(
+        &files.into_iter().map(|file| file.path).collect::<Vec<_>>(),
+        source,
+        destination,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -293,29 +371,17 @@ pub fn best_episode_file(dir: &Path, season: i64, episode: i64) -> Option<PathBu
 /// or better quality (a previous import that was then renamed), the existing
 /// file is returned instead of copying again.
 pub fn stage_pack_file(
-    file: &Path,
+    file: &PackSourceFile,
     source: &Path,
     destination: &Path,
     cfg: &Config,
+    release_quality_score: i64,
 ) -> Result<Option<PathBuf>> {
-    let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+    let Some(name) = file.path.file_name().and_then(|value| value.to_str()) else {
         return Ok(None);
     };
-    let episode_pattern =
-        crate::utils::cached_regex(r"(?i)(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})")?;
-    let Some(capture) = episode_pattern.captures(name) else {
-        return Ok(None);
-    };
-    let season = capture
-        .name("season")
-        .or_else(|| capture.name("nseason"))
-        .and_then(|value| value.as_str().parse::<i64>().ok());
-    let episode = capture
-        .name("episode")
-        .and_then(|value| value.as_str().parse::<i64>().ok());
-    let (Some(season), Some(episode)) = (season, episode) else {
-        return Ok(None);
-    };
+    let season = file.season;
+    let episode = file.episode;
     if let Some(existing) = best_episode_file(destination, season, episode) {
         let existing_score = existing
             .file_name()
@@ -325,67 +391,63 @@ pub fn stage_pack_file(
             .unwrap_or(0);
         let incoming_score = crate::parser::parse_quality(name)
             .score_with_settings(&cfg.settings);
-        if existing_score >= incoming_score {
+        if existing_score >= incoming_score.max(release_quality_score) {
             return Ok(Some(existing));
         }
     }
-    let target = destination.join(name);
+    // Files named only `01.mkv` are supported for a validated partial pack,
+    // but cannot be written directly into a series root: S01E01 and S02E01
+    // would otherwise collide before their final rename. Give these opaque
+    // names a unique, temporary episode identity.
+    let has_episode_identity = crate::utils::cached_regex(
+        r"(?i)(?:s\d{1,2}e|\d{1,2}x)\d{1,4}",
+    )?
+    .is_match(name);
+    let target_name = if has_episode_identity {
+        name.to_owned()
+    } else {
+        format!(".rextto-pack-S{season:02}E{episode:02}-{name}")
+    };
+    let target = destination.join(target_name);
     if target.exists() {
         return Ok(Some(target));
     }
     validate_destination_from(source, destination)?;
     let temp = destination.join(format!("{name}.rextto-part"));
     let _ = fs::remove_file(&temp);
-    let mut input = fs::File::open(file)?;
+    let mut input = fs::File::open(&file.path)?;
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)?;
-    std::io::copy(&mut input, &mut output)?;
+    let copied_bytes = std::io::copy(&mut input, &mut output)?;
     output.sync_all()?;
     drop(output);
+    let source_bytes = file.path.metadata()?.len();
+    if copied_bytes != source_bytes || temp.metadata()?.len() != source_bytes {
+        let _ = fs::remove_file(&temp);
+        bail!(
+            "season pack copy size mismatch for {}: source={} copied={} target={}",
+            file.path.display(),
+            source_bytes,
+            copied_bytes,
+            temp.metadata().map(|value| value.len()).unwrap_or(0),
+        );
+    }
     fs::rename(&temp, &target)?;
     Ok(Some(target))
 }
 
 pub async fn process_pack_files(
-    files: &[PathBuf],
+    files: &[(PathBuf, PackSourceFile)],
     release: &Release,
     cfg: &Config,
     tmdb: &TmdbClient,
 ) -> Result<Vec<PackFileResult>> {
-    let episode_pattern =
-        crate::utils::cached_regex(r"(?i)(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})")?;
     let mut results = Vec::new();
-    for file in files {
-        let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(capture) = episode_pattern.captures(name) else {
-            continue;
-        };
-        let season = capture
-            .name("season")
-            .or_else(|| capture.name("nseason"))
-            .and_then(|value| value.as_str().parse::<i64>().ok());
-        let Some(season) = season else {
-            continue;
-        };
-        if release.season != Some(season) {
-            continue;
-        }
-        let Some(episode) = capture
-            .name("episode")
-            .and_then(|value| value.as_str().parse::<i64>().ok())
-        else {
-            continue;
-        };
-        if !release.episode_range.is_empty()
-            && !release.episode_range.contains(&0)
-            && !release.episode_range.contains(&episode)
-        {
-            continue;
-        }
+    for (file, pack_file) in files {
+        let season = pack_file.season;
+        let episode = pack_file.episode;
         let mut episode_release = release.clone();
         episode_release.is_pack = false;
         episode_release.episode = Some(episode);
@@ -1368,7 +1430,7 @@ pub fn video_files(path: &Path) -> Result<Vec<PathBuf>> {
             .filter(|ext| {
                 matches!(
                     ext.to_ascii_lowercase().as_str(),
-                    "mkv" | "mp4" | "avi" | "m4v" | "mov" | "ts"
+                    "mkv" | "mp4" | "avi" | "m4v" | "mov" | "ts" | "webm" | "wmv"
                 )
             })
             .map(|_| vec![path.to_path_buf()])
@@ -1392,7 +1454,7 @@ pub fn video_files(path: &Path) -> Result<Vec<PathBuf>> {
             .is_some_and(|ext| {
                 matches!(
                     ext.to_ascii_lowercase().as_str(),
-                    "mkv" | "mp4" | "avi" | "m4v" | "mov" | "ts"
+                    "mkv" | "mp4" | "avi" | "m4v" | "mov" | "ts" | "webm" | "wmv"
                 )
             })
         {
@@ -1696,6 +1758,68 @@ mod tests {
         assert_eq!(copied.len(), 1);
         assert!(source.join("Example.S01E01.mkv").is_file());
         assert!(destination.join("Example.S01E01.mkv").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matches_numbered_partial_pack_without_season_in_file_names() {
+        let root = std::env::temp_dir().join(format!("rextto-numbered-pack-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("01.mkv"), b"one").unwrap();
+        fs::write(root.join("Episode 02.mkv"), b"two").unwrap();
+        let release = Release {
+            title: "Example.S03E01-02.1080p.WEB-DL".into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: "test".into(), quality: Default::default(), kind: "series".into(),
+            series: Some("Example".into()), season: Some(3), episode: Some(1),
+            is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: chrono::Utc::now(),
+        };
+        let files = matching_pack_files(&root, &release).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files.iter().map(|file| file.episode).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(files.iter().all(|file| file.season == 3));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn does_not_guess_episodes_for_complete_pack_with_opaque_names() {
+        let root = std::env::temp_dir().join(format!("rextto-opaque-pack-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("01.mkv"), b"one").unwrap();
+        let release = Release {
+            title: "Example.S03.COMPLETE.1080p.WEB-DL".into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: "test".into(), quality: Default::default(), kind: "series".into(),
+            series: Some("Example".into()), season: Some(3), episode: Some(0),
+            is_pack: true, episode_range: vec![0], year: None, discovered_at: chrono::Utc::now(),
+        };
+        assert!(matching_pack_files(&root, &release).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_partial_pack_when_any_declared_episode_is_missing() {
+        let root = std::env::temp_dir().join(format!("rextto-incomplete-pack-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Example.S03E01.mkv"), b"one").unwrap();
+        let release = Release {
+            title: "Example.S03E01-02.1080p.WEB-DL".into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: "test".into(), quality: Default::default(), kind: "series".into(),
+            series: Some("Example".into()), season: Some(3), episode: Some(1),
+            is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: chrono::Utc::now(),
+        };
+        assert!(matching_pack_files(&root, &release).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_files_include_legacy_webm_and_wmv_extensions() {
+        let root = std::env::temp_dir().join(format!("rextto-video-ext-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Example.S01E01.webm"), b"webm").unwrap();
+        fs::write(root.join("Example.S01E02.wmv"), b"wmv").unwrap();
+        assert_eq!(video_files(&root).unwrap().len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 

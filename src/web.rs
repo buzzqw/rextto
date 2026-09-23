@@ -9856,12 +9856,13 @@ async fn handle_torrent_event(
                             &source,
                             &destination,
                             cfg,
+                            metadata.release.quality.score_with_settings(&cfg.settings),
                         )?
                         else {
                             continue;
                         };
                         let mut partial = postprocess::process_pack_files(
-                            &[placed],
+                            &[(placed, file.clone())],
                             &metadata.release,
                             cfg,
                             tmdb,
@@ -9934,28 +9935,17 @@ async fn handle_torrent_event(
                             tracing::warn!(hash=%event.hash, event="season_pack_completed", %error, "completion notification failed")
                         }
                     }
-                    let move_episodes = cfg
-                        .settings
-                        .get("move_episodes")
-                        .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
-                        .unwrap_or(false);
-                    if move_episodes {
-                        // legacy parity: move the pack out of the download folder
-                        // (spurious files go to the trash) and drop the torrent.
-                        if let Some(trash) = cfg.trash_path.as_deref() {
-                            if let Err(error) = crate::cleaner::move_to_trash(&source, trash) {
-                                tracing::warn!(hash=%event.hash, %error, "moving pack to trash failed");
-                            }
-                        } else if let Err(error) = std::fs::remove_dir_all(&source) {
-                            tracing::warn!(hash=%event.hash, %error, "removing pack source failed");
-                        }
-                        if let Ok(true) = torrents.remove(&event.hash, false) {
-                            let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
-                        }
-                        tracing::info!(hash=%event.hash, destination=%destination.display(), size=%crate::logging::human_bytes_i64(size), "📁 SEASON PACK MOVED TO NAS (source removed after rename)");
-                    } else {
-                        tracing::info!(hash=%event.hash, destination=%destination.display(), size=%crate::logging::human_bytes_i64(size), "📁 SEASON PACK COPIED TO NAS (source kept for seeding)");
-                    }
+                    // A pack is copied into the library, never moved out of its
+                    // torrent storage here: libtorrent must retain the exact
+                    // original tree to seed and verify it. `auto_remove_completed`
+                    // and the normal ratio/time cleanup are the only code paths
+                    // allowed to discard this now-redundant source tree.
+                    tracing::info!(
+                        hash=%event.hash,
+                        destination=%destination.display(),
+                        size=%crate::logging::human_bytes_i64(size),
+                        "📁 SEASON PACK COPIED TO NAS (source kept for seeding)"
+                    );
                     true
                 } else {
                     complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
