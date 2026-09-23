@@ -256,7 +256,96 @@ pub struct PackFileResult {
     pub episode: i64,
     pub path: PathBuf,
     pub size_bytes: i64,
+    pub quality_score: i64,
     pub discarded: bool,
+}
+
+/// Best-quality video file in `dir` that matches the given season/episode.
+///
+/// Used to recover the real path of a pack episode whose copy-time name no
+/// longer exists because a rename moved it, and to decide whether the
+/// destination already holds an equivalent or better file.
+pub fn best_episode_file(dir: &Path, season: i64, episode: i64) -> Option<PathBuf> {
+    let mut best: Option<(i64, PathBuf)> = None;
+    for file in video_files(dir).ok()? {
+        let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !filename_matches_episode(name, season, episode) {
+            continue;
+        }
+        let score = crate::parser::parse_quality(name).score();
+        match &best {
+            Some((current, _)) if *current >= score => {}
+            _ => best = Some((score, file)),
+        }
+    }
+    best.map(|(_, file)| file)
+}
+
+/// Copies one season-pack episode into the destination through a temporary
+/// `.rextto-part` file.
+///
+/// A partial copy must never be visible as a real episode: the scanner only
+/// looks at video extensions, so the expensive transfer happens under the
+/// ignored suffix and only the finished file is atomically renamed to its
+/// source name. If the destination already holds the same episode at an equal
+/// or better quality (a previous import that was then renamed), the existing
+/// file is returned instead of copying again.
+pub fn stage_pack_file(
+    file: &Path,
+    source: &Path,
+    destination: &Path,
+    cfg: &Config,
+) -> Result<Option<PathBuf>> {
+    let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let episode_pattern =
+        crate::utils::cached_regex(r"(?i)(?:s(?P<season>\d{1,2})e|(?P<nseason>\d{1,2})x)(?P<episode>\d{1,4})")?;
+    let Some(capture) = episode_pattern.captures(name) else {
+        return Ok(None);
+    };
+    let season = capture
+        .name("season")
+        .or_else(|| capture.name("nseason"))
+        .and_then(|value| value.as_str().parse::<i64>().ok());
+    let episode = capture
+        .name("episode")
+        .and_then(|value| value.as_str().parse::<i64>().ok());
+    let (Some(season), Some(episode)) = (season, episode) else {
+        return Ok(None);
+    };
+    if let Some(existing) = best_episode_file(destination, season, episode) {
+        let existing_score = existing
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(crate::parser::parse_quality)
+            .map(|quality| quality.score_with_settings(&cfg.settings))
+            .unwrap_or(0);
+        let incoming_score = crate::parser::parse_quality(name)
+            .score_with_settings(&cfg.settings);
+        if existing_score >= incoming_score {
+            return Ok(Some(existing));
+        }
+    }
+    let target = destination.join(name);
+    if target.exists() {
+        return Ok(Some(target));
+    }
+    validate_destination_from(source, destination)?;
+    let temp = destination.join(format!("{name}.rextto-part"));
+    let _ = fs::remove_file(&temp);
+    let mut input = fs::File::open(file)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    fs::rename(&temp, &target)?;
+    Ok(Some(target))
 }
 
 pub async fn process_pack_files(
@@ -301,8 +390,17 @@ pub async fn process_pack_files(
         episode_release.is_pack = false;
         episode_release.episode = Some(episode);
         episode_release.episode_range = vec![episode];
-        let renamed = rename_episode(file, &episode_release, cfg, tmdb).await?;
-        let final_path = renamed.unwrap_or_else(|| file.clone());
+        // A repair/rename pass may have moved the file between the copy and
+        // now: never trust a path that no longer exists, recover the current
+        // file for the episode from the destination directory instead.
+        let actual = if file.exists() {
+            file.clone()
+        } else {
+            let directory = file.parent().unwrap_or_else(|| Path::new("."));
+            best_episode_file(directory, season, episode).unwrap_or_else(|| file.clone())
+        };
+        let renamed = rename_episode(&actual, &episode_release, cfg, tmdb).await?;
+        let final_path = renamed.unwrap_or(actual);
         let archive = final_path.parent().unwrap_or_else(|| Path::new("."));
         let score = episode_release.quality.score_with_settings(&cfg.settings);
         let discarded = crate::cleaner::discard_if_inferior(
@@ -325,10 +423,20 @@ pub async fn process_pack_files(
                 archive,
             )?;
         }
+        // Score of the file actually kept, so an upgraded 2160p episode is not
+        // recorded with the stale 1080p quality of its old title.
+        let quality_score = final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(crate::parser::parse_quality)
+            .map(|quality| quality.score_with_settings(&cfg.settings))
+            .filter(|value| *value > 0)
+            .unwrap_or(score);
         results.push(PackFileResult {
             episode,
             size_bytes: size_of_path(&final_path).unwrap_or(0),
             path: final_path,
+            quality_score,
             discarded,
         });
     }
@@ -1836,5 +1944,28 @@ mod tests {
         let missing = completion_path(&event("not-here.mkv"));
         assert_eq!(missing, Path::new("/downloads/not-here.mkv"));
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn best_episode_file_prefers_higher_resolution_and_ignores_partials() {
+        let dir = std::env::temp_dir().join(format!(
+            "rextto-best-episode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Same episode, two qualities, plus a partially copied file that must
+        // never be considered (its suffix is not a video extension).
+        std::fs::write(dir.join("Show - S01E01 - T - [WEB-DL][1080p][h265].mkv"), b"a").unwrap();
+        std::fs::write(dir.join("Show.S01E01.2160p.WEB-DL.H265.mkv"), b"b").unwrap();
+        std::fs::write(
+            dir.join("Show.S01E01.2160p.WEB-DL.H265.mkv.rextto-part"),
+            b"c",
+        )
+        .unwrap();
+        let best = best_episode_file(&dir, 1, 1).expect("episode present");
+        assert_eq!(best.file_name().unwrap(), "Show.S01E01.2160p.WEB-DL.H265.mkv");
+        assert!(best_episode_file(&dir, 1, 2).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

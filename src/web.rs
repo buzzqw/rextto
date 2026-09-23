@@ -88,6 +88,45 @@ pub struct RenameProgress {
     pub errors: usize,
 }
 
+/// Series whose archive is currently being written by a torrent
+/// post-processing run (pack copy/rename).
+///
+/// The manual and periodic rename repair scans the archive and would otherwise
+/// rename or trash files while they are still being copied, leaving transient
+/// duplicates and half-written paths in the database. While a series is listed
+/// here the repair pass skips it.
+static ARCHIVE_IMPORT_BUSY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn archive_import_busy() -> &'static Mutex<HashSet<String>> {
+    ARCHIVE_IMPORT_BUSY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII marker for "this series is being imported right now".
+struct ArchiveImportGuard {
+    series: Option<String>,
+}
+
+impl ArchiveImportGuard {
+    fn acquire(series: Option<&str>) -> Self {
+        let series = series
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(name) = &series {
+            archive_import_busy().lock().unwrap().insert(name.clone());
+        }
+        Self { series }
+    }
+}
+
+impl Drop for ArchiveImportGuard {
+    fn drop(&mut self) {
+        if let Some(name) = &self.series {
+            archive_import_busy().lock().unwrap().remove(name);
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct LogLevel {
     pub level: String,
@@ -2200,6 +2239,19 @@ async fn series_rename_apply(
             Json(serde_json::json!({"ok":false,"error":"rename is disabled"})),
         );
     }
+    // Never rename a series whose archive is currently being written by a
+    // torrent import: the repair would move files that are still being copied.
+    if archive_import_busy().lock().unwrap().contains(&series.name) {
+        tracing::info!(series = %series.name, "rename skipped: archive import in progress");
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok":true,
+                "skipped":true,
+                "reason":"archive import in progress",
+            })),
+        );
+    }
     let episodes =
         s.db.lock()
             .unwrap()
@@ -2296,6 +2348,15 @@ async fn series_rename_apply(
             // sidecar spuri/doppi (operazione economica, senza TMDB/MediaInfo).
             if execute {
                 postprocess::apply_sidecars(&path, &path, &cfg);
+                // Riallinea score/dimensione al file reale: dopo un upgrade il
+                // DB può essere rimasto alla qualità precedente (es. titolo
+                // 1080p con file 2160p), così l'episodio non viene ri-scaricato.
+                let _ = s.db.lock().unwrap().refresh_episode_file_stats(
+                    &series.name,
+                    episode.season,
+                    episode.episode,
+                    &path.display().to_string(),
+                );
             }
             already_ok.push(archive_path);
             continue;
@@ -2310,7 +2371,16 @@ async fn series_rename_apply(
                 if postprocess::same_path(&path, &target) {
                     // No-op: the file already carries the target name (the cheap
                     // conform check can miss it). Never log or count this as a
-                    // rename.
+                    // rename, but still realign the stored score/size to the
+                    // file so an upgraded episode is not marked as the old one.
+                    if execute {
+                        let _ = s.db.lock().unwrap().refresh_episode_file_stats(
+                            &series.name,
+                            episode.season,
+                            episode.episode,
+                            &target.display().to_string(),
+                        );
+                    }
                     already_ok.push(archive_path);
                     continue;
                 }
@@ -4907,6 +4977,18 @@ async fn scan_series_archive(
             Json(serde_json::json!({"ok":false,"error":"series not found"})),
         );
     };
+    // Skip while a torrent import is writing this archive: a scan would record
+    // files that are still being copied/renamed.
+    if archive_import_busy().lock().unwrap().contains(&series.name) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok":true,
+                "skipped":true,
+                "reason":"archive import in progress",
+            })),
+        );
+    }
     let requested_path = input.and_then(|Json(input)| input.path);
     let path = requested_path
         .as_deref()
@@ -4935,6 +5017,7 @@ async fn scan_all_archives(State(s): State<AppState>) -> impl IntoResponse {
         .series
         .iter()
         .filter(|series| series.enabled && !series.archive_path.trim().is_empty())
+        .filter(|series| !archive_import_busy().lock().unwrap().contains(&series.name))
     {
         match scan_archive_path(&s.db, series, FsPath::new(&series.archive_path)) {
             Ok((_found, count)) => updated += count,
@@ -9733,15 +9816,36 @@ async fn handle_torrent_event(
                         discard_completed_source(cfg, db, torrents, &event);
                         return Ok(false);
                     }
-                    let copied = postprocess::copy_matching_pack_files(
-                        &source,
-                        &destination,
-                        &metadata.release,
-                    )?;
-                    let processed =
-                        postprocess::process_pack_files(&copied, &metadata.release, cfg, tmdb)
-                            .await?;
-                    if processed.iter().all(|item| item.discarded) {
+                    // Serialize against the periodic/manual rename repair for
+                    // this series: it scans the archive and would otherwise
+                    // rename/trash files while they are still being copied,
+                    // producing transient duplicates and stale DB paths.
+                    let _import_guard =
+                        ArchiveImportGuard::acquire(metadata.release.series.as_deref());
+                    // Copy and process one episode at a time so a partially
+                    // copied file is never visible and the old, inferior file
+                    // is removed as soon as its replacement is in place.
+                    let mut processed = Vec::new();
+                    for file in &matching {
+                        let Some(placed) = postprocess::stage_pack_file(
+                            file,
+                            &source,
+                            &destination,
+                            cfg,
+                        )?
+                        else {
+                            continue;
+                        };
+                        let mut partial = postprocess::process_pack_files(
+                            &[placed],
+                            &metadata.release,
+                            cfg,
+                            tmdb,
+                        )
+                        .await?;
+                        processed.append(&mut partial);
+                    }
+                    if !processed.is_empty() && processed.iter().all(|item| item.discarded) {
                         let restored = db.lock().unwrap().restore_upgrade(&event.hash)?;
                         if !restored {
                             db.lock().unwrap().rollback_release(&metadata.release)?;
@@ -9765,6 +9869,7 @@ async fn handle_torrent_event(
                                 item.episode,
                                 item.path.display().to_string(),
                                 item.size_bytes,
+                                item.quality_score,
                             )
                         })
                         .collect::<Vec<_>>();

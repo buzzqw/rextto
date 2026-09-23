@@ -10,6 +10,21 @@ pub struct Database {
     pub conn: Connection,
 }
 
+/// Real size and default quality score of a file on disk, derived from its
+/// name. Missing files yield zeros so callers can keep the stored values.
+fn file_stats(path: &str) -> (i64, i64) {
+    let size_bytes = std::fs::metadata(path)
+        .map(|value| value.len().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    let quality_score = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(parse_quality)
+        .map(|quality| quality.score())
+        .unwrap_or(0);
+    (size_bytes, quality_score)
+}
+
 /// Runs `VACUUM`/`ANALYZE` on an arbitrary connection (used for every Rextto
 /// database, not just the series one).
 pub fn optimize_connection(conn: &Connection, action: &str) -> Result<()> {
@@ -1321,11 +1336,15 @@ impl Database {
         // passato dal chiamante è il nome file completo, quindi `parse_quality`
         // vede risoluzione/sorgente/codec.
         let score = parse_quality(title).score();
-        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=excluded.title,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=CASE WHEN excluded.quality_score>0 THEN excluded.quality_score ELSE episodes.quality_score END", params![series_id, season, episode, title, score, path, size_bytes])?;
+        // Never let a scan downgrade an episode that already holds a better
+        // file: a stale 1080p file next to the kept 2160p one must not reset the
+        // stored quality (and make the episode look inferior).
+        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=CASE WHEN excluded.quality_score>=episodes.quality_score THEN excluded.title ELSE episodes.title END,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=MAX(excluded.quality_score, episodes.quality_score)", params![series_id, season, episode, title, score, path, size_bytes])?;
         Ok(())
     }
 
-    /// Updates the stored archive path of an episode (e.g. after a rename).
+    /// Updates the stored archive path of an episode (e.g. after a rename),
+    /// together with the real size and (monotonic) quality score of the file.
     pub fn set_episode_archive_path(
         &self,
         series_name: &str,
@@ -1333,9 +1352,28 @@ impl Database {
         episode: i64,
         path: &str,
     ) -> Result<()> {
+        let (size_bytes, quality_score) = file_stats(path);
         self.conn.execute(
-            "UPDATE episodes SET archive_path=?1, downloaded_at=COALESCE(downloaded_at, datetime('now')) WHERE series_id=(SELECT id FROM series WHERE name=?2) AND season=?3 AND episode=?4",
-            params![path, series_name, season, episode],
+            "UPDATE episodes SET archive_path=?1, downloaded_at=COALESCE(downloaded_at, datetime('now')), size_bytes=CASE WHEN ?2>0 THEN ?2 ELSE size_bytes END, quality_score=CASE WHEN ?3>quality_score THEN ?3 ELSE quality_score END WHERE series_id=(SELECT id FROM series WHERE name=?4) AND season=?5 AND episode=?6",
+            params![path, size_bytes, quality_score, series_name, season, episode],
+        )?;
+        Ok(())
+    }
+
+    /// Re-aligne size and quality score of an episode to the file it currently
+    /// points to, without touching its title (which keeps the original release
+    /// title needed by the "restore source" pass).
+    pub fn refresh_episode_file_stats(
+        &self,
+        series_name: &str,
+        season: i64,
+        episode: i64,
+        path: &str,
+    ) -> Result<()> {
+        let (size_bytes, quality_score) = file_stats(path);
+        self.conn.execute(
+            "UPDATE episodes SET size_bytes=CASE WHEN ?1>0 THEN ?1 ELSE size_bytes END, quality_score=CASE WHEN ?2>quality_score THEN ?2 ELSE quality_score END, downloaded_at=COALESCE(downloaded_at, datetime('now')) WHERE series_id=(SELECT id FROM series WHERE name=?3) AND season=?4 AND episode=?5",
+            params![size_bytes, quality_score, series_name, season, episode],
         )?;
         Ok(())
     }
@@ -1741,7 +1779,7 @@ impl Database {
     pub fn mark_pack_completed(
         &self,
         release: &Release,
-        episodes: &[(i64, String, i64)],
+        episodes: &[(i64, String, i64, i64)],
         path: &str,
         size_bytes: i64,
     ) -> Result<()> {
@@ -1758,8 +1796,11 @@ impl Database {
                 if release.episode_range.iter().any(|episode| *episode == 0) {
                     self.conn.execute("UPDATE episodes SET downloaded_at=?1,archive_path=?2,size_bytes=?3 WHERE series_id=?4 AND season=?5 AND episode=0", params![now, path, size_bytes, series_id, season])?;
                 }
-                for (episode, episode_path, episode_size) in episodes {
-                    self.conn.execute("UPDATE episodes SET downloaded_at=?1,archive_path=?2,size_bytes=?3 WHERE series_id=?4 AND season=?5 AND episode=?6", params![now, episode_path, episode_size, series_id, season, episode])?;
+                for (episode, episode_path, episode_size, episode_score) in episodes {
+                    // `quality_score` follows the file that was actually kept:
+                    // after an upgrade it must not stay at the old (lower) value
+                    // or the episode looks inferior and gets downloaded again.
+                    self.conn.execute("UPDATE episodes SET downloaded_at=?1,archive_path=?2,size_bytes=?3,quality_score=CASE WHEN ?4>quality_score THEN ?4 ELSE quality_score END WHERE series_id=?5 AND season=?6 AND episode=?7", params![now, episode_path, episode_size, episode_score, series_id, season, episode])?;
                 }
             }
         }
