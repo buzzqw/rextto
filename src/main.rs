@@ -161,10 +161,26 @@ async fn main() -> Result<()> {
             "active mode requested: make sure no legacy instance is using the same ports"
         );
     }
+    let workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let result = tokio::select! {
-        result = web::serve(state) => result,
+        result = web::serve(state, workers.clone()) => result,
         _ = shutdown_signal() => Ok(()),
     };
+    // Stop the background workers *before* touching the native session: a
+    // still-running event worker polls libtorrent alerts and would consume the
+    // `save_resume_data` alerts that `torrents.shutdown` is waiting for,
+    // losing fastresume data (and racing native calls during teardown).
+    {
+        let handles = std::mem::take(&mut *workers.lock().unwrap());
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+    tracing::info!("background workers stopped, saving libtorrent session");
     if let Err(error) = torrents.shutdown(&cfg) {
         tracing::error!(%error, "libtorrent shutdown did not save all fastresume data");
     }

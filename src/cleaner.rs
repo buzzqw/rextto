@@ -187,14 +187,16 @@ fn duplicate_target(trash: &Path, file: &Path) -> PathBuf {
 fn handle_duplicate(file: &Path, cfg: &Config) -> Result<()> {
     if cfg.cleanup_action == "delete" {
         fs::remove_file(file)?;
+        Ok(())
     } else {
         let Some(trash) = &cfg.trash_path else {
             anyhow::bail!("trash_path is required when cleanup_action is move");
         };
-        fs::create_dir_all(trash)?;
-        fs::rename(file, duplicate_target(trash, file))?;
+        // Reuse the cross-device-safe move: a plain `rename` fails with EXDEV
+        // when the trash lives on another filesystem (typical with a NAS).
+        move_to_trash(file, trash)?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Moves a file or directory to the trash with a unique name; falls back to a

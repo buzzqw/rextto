@@ -2217,6 +2217,8 @@ async fn series_rename_apply(
                     link_archive_file(&s.db, &series.name, season, episode_number, &file);
                 }
                 Err(error) => {
+                    // Never surface API keys embedded in URLs (e.g. TMDB) in logs.
+                    let error = crate::utils::redact_url_secrets(&error.to_string());
                     tracing::warn!(file=%file.display(), %error, "archive file rename failed")
                 }
             }
@@ -2792,8 +2794,7 @@ fn run_db_action(
     }
     comics.optimize(action)?;
     // rextto_config.db has no long-lived handle in AppState; open it here.
-    if let Ok(conn) = rusqlite::Connection::open(&config_path) {
-        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    if let Ok(conn) = crate::config::open_config_db(&config_path) {
         let _ = crate::database::optimize_connection(&conn, action);
     }
 
@@ -8477,7 +8478,6 @@ async fn torrent_event_worker(
         )
         .await;
         monitor_stalled(&cfg, &torrents, &db, &notifier, &mut stall_wait_start).await;
-        enforce_seed_policy(&cfg, &torrents, &db);
         let mut torrent_events = torrents.poll_events();
         let mut event_hashes = torrent_events
             .iter()
@@ -8660,6 +8660,10 @@ async fn torrent_event_worker(
                 events.drain(..overflow);
             }
         }
+        // Enforce the seed policy only after handling this tick's events: with a
+        // very low seed limit a just-finished torrent could otherwise be removed
+        // before its `torrent_finished` event is post-processed and archived.
+        enforce_seed_policy(&cfg, &torrents, &db);
     }
 }
 
@@ -9669,7 +9673,10 @@ async fn cycle_worker(state: AppState) {
     }
 }
 
-pub async fn serve(state: AppState) -> anyhow::Result<()> {
+pub async fn serve(
+    state: AppState,
+    workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+) -> anyhow::Result<()> {
     let web_addr: SocketAddr = state.cfg.listen.parse()?;
     let engine_addr: SocketAddr = state.cfg.engine_listen.parse()?;
     let web_listener = tokio::net::TcpListener::bind(web_addr).await?;
@@ -9692,14 +9699,21 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     ));
     let cycle = tokio::spawn(cycle_worker(state.clone()));
     let backups = tokio::spawn(backup_worker(state.clone()));
+    // Register the long-lived workers so `main` can stop them *before* it
+    // touches the native libtorrent session. They must never be running while
+    // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
+    // drain those alerts and the fastresume data would be lost.
+    {
+        let mut registry = workers.lock().unwrap();
+        registry.push(worker);
+        registry.push(cycle);
+        registry.push(backups);
+    }
     let app = router(state);
     let result = tokio::try_join!(
         axum::serve(web_listener, app.clone()),
         axum::serve(engine_listener, app)
     );
-    worker.abort();
-    cycle.abort();
-    backups.abort();
     result?;
     Ok(())
 }

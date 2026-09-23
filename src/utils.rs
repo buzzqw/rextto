@@ -100,9 +100,25 @@ pub static FLARESOLVERR_LIMITER: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(2));
 
 pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut file =
+            fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(content)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        // Flush to disk before the rename, otherwise a power loss can persist
+        // the rename while the data is still missing (truncated/empty file).
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    // Persist the directory entry too.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

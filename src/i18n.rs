@@ -21,7 +21,7 @@ pub struct Translation {
 
 impl I18nDb {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let conn = crate::config::open_config_db(path)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS translations (lang TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(lang,key)); CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

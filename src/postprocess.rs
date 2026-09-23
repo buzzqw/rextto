@@ -110,22 +110,37 @@ pub fn size_of_path(path: &Path) -> Result<i64> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
-        if child.is_dir() {
+        // Use the entry type without following symlinks: a torrent containing a
+        // symlink back into an ancestor would otherwise recurse forever.
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             total = total.saturating_add(size_of_path(&child)?);
-        } else if child.is_file() {
+        } else if file_type.is_file() {
             total = total.saturating_add(child.metadata()?.len().min(i64::MAX as u64) as i64);
         }
     }
     Ok(total)
 }
 
+/// Path of the completed download inside the torrent's `save_path`.
+///
+/// `event.name` comes from libtorrent and is not trusted: a crafted or
+/// absolute name must never escape `save_path`. We therefore keep only the
+/// final component, and — crucially — never fall back to the shared
+/// `save_path` root when the named entry is missing. The fallback used to make
+/// callers (trash/remove/rename) act on the whole download directory, deleting
+/// unrelated, still-active torrents' data.
 pub fn completion_path(event: &TorrentEvent) -> PathBuf {
     let root = PathBuf::from(&event.save_path);
-    let named = root.join(&event.name);
-    if named.exists() {
-        named
-    } else {
-        root
+    let name = Path::new(&event.name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty() && name != "." && name != "..");
+    match name {
+        Some(name) => root.join(name),
+        // No usable name: return a path that cannot collide with real data so
+        // callers see a missing path instead of the shared root.
+        None => root.join(format!(".rextto-missing-{}", event.hash)),
     }
 }
 
@@ -1732,5 +1747,43 @@ mod tests {
             discovered_at: chrono::Utc::now(),
         };
         assert!(download_dir_for(&release, &cfg).is_none());
+    }
+
+    fn event(name: &str) -> TorrentEvent {
+        TorrentEvent {
+            kind: "torrent_finished".into(),
+            hash: "abcdef".into(),
+            name: name.into(),
+            save_path: "/downloads".into(),
+        }
+    }
+
+    #[test]
+    fn completion_path_never_escapes_save_path() {
+        assert_eq!(completion_path(&event("Show.S01E01.mkv")), Path::new("/downloads/Show.S01E01.mkv"));
+        // Absolute and traversal names keep only the final component.
+        assert_eq!(completion_path(&event("/etc/passwd")), Path::new("/downloads/passwd"));
+        assert_eq!(completion_path(&event("../../etc/passwd")), Path::new("/downloads/passwd"));
+        assert_eq!(completion_path(&event("a/b/c.bin")), Path::new("/downloads/c.bin"));
+        // A name whose final component is `..` or empty must not resolve to the
+        // shared root; callers must see a missing path.
+        let root_fallback = completion_path(&event(".."));
+        assert_ne!(root_fallback, Path::new("/downloads"));
+        assert_eq!(root_fallback.parent(), Some(Path::new("/downloads")));
+        assert!(root_fallback
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".rextto-missing-"));
+        assert_ne!(completion_path(&event("")), Path::new("/downloads"));
+    }
+
+    #[test]
+    fn completion_path_returns_named_path_even_when_missing() {
+        // The old implementation returned the shared save_path when the named
+        // entry did not exist, which let callers delete the whole download dir.
+        let missing = completion_path(&event("not-here.mkv"));
+        assert_eq!(missing, Path::new("/downloads/not-here.mkv"));
+        assert!(!missing.exists());
     }
 }

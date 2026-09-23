@@ -513,13 +513,25 @@ pub fn sanitize_subtitle_requirements(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// Opens the shared `rextto_config.db` (used by the daemon, i18n and libtorrent)
+/// with the pragmas required for concurrent access: WAL journal mode and a busy
+/// timeout, so a concurrent writer waits instead of failing with `SQLITE_BUSY`
+/// and silently losing the update.
+pub fn open_config_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // WAL is persisted in the file header, but re-applying it is harmless.
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// One-time cleanup of legacy/imported dirty movie requirement rows.
 pub fn cleanup_movie_requirements(data_dir: &Path) -> Result<()> {
     let path = data_dir.join("rextto_config.db");
     if !path.is_file() {
         return Ok(());
     }
-    let conn = Connection::open(&path)?;
+    let conn = open_config_db(&path)?;
     let rows: Vec<(i64, String, String)> = conn
         .prepare("SELECT id,COALESCE(language_requirements,''),COALESCE(subtitle_requirements,'') FROM movies_config")?
         .query_map([], |row| {
@@ -1019,6 +1031,8 @@ impl Config {
             return Ok(());
         }
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // Wait for concurrent writers instead of failing with SQLITE_BUSY.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         let Ok(mut stmt) = conn.prepare("SELECT key,value FROM settings") else {
             return Ok(());
         };
@@ -1430,7 +1444,7 @@ impl Config {
         std::fs::create_dir_all(data_dir)?;
         let config_db = data_dir.join("rextto_config.db");
         if config_db.is_file() {
-            let conn = Connection::open(&config_db)?;
+            let conn = open_config_db(&config_db)?;
             let count = conn
                 .query_row("SELECT COUNT(*) FROM settings", [], |row| {
                     row.get::<_, i64>(0)
@@ -1581,7 +1595,7 @@ impl Config {
     }
 
     pub fn save_setting(data_dir: &Path, key: &str, value: &str) -> Result<()> {
-        let conn = Connection::open(data_dir.join("rextto_config.db"))?;
+        let conn = open_config_db(&data_dir.join("rextto_config.db"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
@@ -1590,7 +1604,7 @@ impl Config {
     }
 
     pub fn delete_setting(data_dir: &Path, key: &str) -> Result<bool> {
-        let conn = Connection::open(data_dir.join("rextto_config.db"))?;
+        let conn = open_config_db(&data_dir.join("rextto_config.db"))?;
         let removed = conn.execute("DELETE FROM settings WHERE key=?1", [key])?;
         Ok(removed > 0)
     }
@@ -1600,7 +1614,7 @@ impl Config {
         series: &[SeriesConfig],
         movies: &[MovieConfig],
     ) -> Result<()> {
-        let mut conn = Connection::open(data_dir.join("rextto_config.db"))?;
+        let mut conn = open_config_db(&data_dir.join("rextto_config.db"))?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT '');")?;
         let _ = conn.execute(
             "ALTER TABLE movies_config ADD COLUMN exclude TEXT NOT NULL DEFAULT ''",

@@ -4,7 +4,7 @@ use crate::{
     utils::{atomic_write, magnet_hash, sanitize_magnet},
 };
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -1263,7 +1263,7 @@ impl LibtorrentClient {
         if !self.config_db.exists() {
             return Ok(None);
         }
-        let conn = Connection::open(&self.config_db)?;
+        let conn = crate::config::open_config_db(&self.config_db)?;
         conn.query_row(
             "SELECT dl_bytes,ul_bytes FROM torrent_limits WHERE lower(info_hash)=?1",
             [hash.to_ascii_lowercase()],
@@ -1359,7 +1359,7 @@ impl LibtorrentClient {
         if ok == 0 {
             bail!("libtorrent set limits failed: {}", native_error(&error));
         }
-        let conn = Connection::open(&self.config_db)?;
+        let conn = crate::config::open_config_db(&self.config_db)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS torrent_limits (info_hash TEXT PRIMARY KEY, dl_bytes INTEGER NOT NULL DEFAULT -1, ul_bytes INTEGER NOT NULL DEFAULT -1, updated_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
         conn.execute("INSERT INTO torrent_limits(info_hash,dl_bytes,ul_bytes,updated_at) VALUES (?1,?2,?3,datetime('now')) ON CONFLICT(info_hash) DO UPDATE SET dl_bytes=excluded.dl_bytes,ul_bytes=excluded.ul_bytes,updated_at=excluded.updated_at", params![normalized, download_limit, upload_limit])?;
         if seed_ratio >= 0.0 || seed_days >= 0 {
@@ -1576,7 +1576,7 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let mut cfg = Config::default();
         cfg.data_dir = path.clone();
-        let conn = Connection::open(path.join("rextto_config.db")).unwrap();
+        let conn = rusqlite::Connection::open(path.join("rextto_config.db")).unwrap();
         conn.execute_batch("CREATE TABLE torrent_limits (info_hash TEXT PRIMARY KEY, dl_bytes INTEGER, ul_bytes INTEGER);").unwrap();
         conn.execute(
             "INSERT INTO torrent_limits VALUES (?1,?2,?3)",
