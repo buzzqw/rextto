@@ -10426,14 +10426,31 @@ fn reconcile_ramdisk(
 /// A completed download that cannot be imported must not keep occupying the
 /// RAM disk. Keep it recoverable in the configured trash, then remove the
 /// torrent handle because its storage path is no longer active.
+/// Scrive nella cartella del pack un file di nota quando la release viene
+/// rifiutata, così resta chiaro perché era presente.
+fn write_rejection_marker(source: &std::path::Path, reason: &str) {
+    if !source.is_dir() {
+        return;
+    }
+    let content = format!(
+        "Rifiutato per minore qualità.\nMotivo: {reason}\nData: {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M")
+    );
+    if let Err(error) = std::fs::write(source.join("RIFIUTATO.txt"), content) {
+        tracing::warn!(%error, source = %source.display(), "could not write rejection marker");
+    }
+}
+
 fn discard_completed_source(
     cfg: &Config,
     db: &Arc<Mutex<Database>>,
     torrents: &LibtorrentClient,
     event: &TorrentEvent,
+    reason: &str,
 ) {
     let source = postprocess::completion_path(event);
     if source.exists() {
+        write_rejection_marker(&source, reason);
         if let Some(trash) = cfg.trash_path.as_deref() {
             match crate::cleaner::move_to_trash(&source, trash) {
                 Ok(target) => tracing::info!(
@@ -10552,7 +10569,7 @@ async fn handle_torrent_event(
                             "season pack rejected"
                         );
                         db.lock().unwrap().mark_torrent_error(&event.hash, error)?;
-                        discard_completed_source(cfg, db, torrents, &event);
+                        discard_completed_source(cfg, db, torrents, &event, error);
                         return Ok(false);
                     }
                     // Serialize against the periodic/manual rename repair for
@@ -10598,7 +10615,13 @@ async fn handle_torrent_event(
                         // Esce dalla sessione (finisce nello Storico con il
                         // motivo) e la sorgente va nel cestino, così non resta
                         // a occupare spazio senza un badge NAS.
-                        discard_completed_source(cfg, db, torrents, &event);
+                        discard_completed_source(
+                            cfg,
+                            db,
+                            torrents,
+                            &event,
+                            "season pack inferior to existing files",
+                        );
                         return Ok(false);
                     }
                     let entries = processed
