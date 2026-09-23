@@ -107,6 +107,9 @@ pub struct LibtorrentSettings {
     pub dynamic_queue: bool,
     pub dynamic_queue_min: i64,
     pub dynamic_queue_max: i64,
+    /// Quando è true, i torrent che non trasferiscono payload non occupano uno
+    /// slot attivo: evita che gli swarm senza peer blocchino i download sani.
+    pub dont_count_slow_torrents: bool,
     pub auto_remove_completed: bool,
     // Extended session settings.
     pub connections_limit: i64,
@@ -162,6 +165,7 @@ impl Default for LibtorrentSettings {
             dynamic_queue: false,
             dynamic_queue_min: 1,
             dynamic_queue_max: 10,
+            dont_count_slow_torrents: true,
             auto_remove_completed: false,
             connections_limit: 200,
             upload_slots_limit: -1,
@@ -1399,6 +1403,11 @@ impl Config {
                 &self.settings,
                 "libtorrent_dynamic_queue_max",
                 10,
+            ),
+            dont_count_slow_torrents: Self::bool_setting_or(
+                &self.settings,
+                "libtorrent_dont_count_slow_torrents",
+                true,
             ),
             auto_remove_completed: Self::bool_setting(self.settings.get("auto_remove_completed")),
             connections_limit: Self::number_setting(

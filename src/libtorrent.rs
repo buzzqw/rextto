@@ -69,6 +69,7 @@ unsafe extern "C" {
         error_size: usize,
     ) -> i32;
     fn rextto_lt_promote_metadata(session: *mut c_void);
+    fn rextto_lt_ensure_auto_managed(session: *mut c_void) -> usize;
     fn rextto_lt_prioritize_queue(session: *mut c_void);
     fn rextto_lt_adjust_queue(
         session: *mut c_void,
@@ -728,6 +729,11 @@ impl LibtorrentClient {
             lt.allow_multiple_connections_per_ip,
         );
         boolean(&mut lines, "apply_ip_filter", lt.apply_ip_filter);
+        boolean(
+            &mut lines,
+            "dont_count_slow_torrents",
+            lt.dont_count_slow_torrents,
+        );
         let policy = lt.encryption.clamp(0, 2);
         int(&mut lines, "in_enc_policy", policy);
         int(&mut lines, "out_enc_policy", policy);
@@ -1026,6 +1032,17 @@ impl LibtorrentClient {
         if let Some(session) = &self.session {
             unsafe { rextto_lt_promote_metadata(session.0) };
         }
+    }
+
+    /// Riarma l'auto-gestione della coda sui torrent che hanno i metadati e non
+    /// sono in pausa. I torrent ripristinati da fastresume con
+    /// `auto_managed=false` altrimenti aggirano `active_downloads`/`active_limit`
+    /// per sempre. I torrent lasciati in pausa dall'utente restano intatti.
+    pub fn ensure_auto_managed(&self) -> usize {
+        if let Some(session) = &self.session {
+            return unsafe { rextto_lt_ensure_auto_managed(session.0) };
+        }
+        0
     }
 
     pub fn prioritize_queue(&self) {

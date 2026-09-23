@@ -1419,6 +1419,7 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
             "dynamic_queue": cfg.libtorrent.dynamic_queue,
             "dynamic_queue_min": cfg.libtorrent.dynamic_queue_min,
             "dynamic_queue_max": cfg.libtorrent.dynamic_queue_max,
+            "dont_count_slow_torrents": cfg.libtorrent.dont_count_slow_torrents,
             "auto_remove_completed": cfg.libtorrent.auto_remove_completed,
             "dht": cfg.libtorrent.dht,
             "pex": cfg.libtorrent.pex,
@@ -8968,6 +8969,9 @@ fn libtorrent_optimization(cfg: &Config) -> LibtorrentOptimization {
         ("libtorrent_dynamic_queue", "yes".to_string()),
         ("libtorrent_dynamic_queue_min", "1".to_string()),
         ("libtorrent_dynamic_queue_max", "10".to_string()),
+        // Sempre attivo: i torrent senza trasferimento non devono occupare uno
+        // slot attivo, altrimenti gli swarm senza peer bloccano i download sani.
+        ("libtorrent_dont_count_slow_torrents", "yes".to_string()),
         ("libtorrent_cache_size", cache_size.to_string()),
         ("libtorrent_cache_expiry", "300".to_string()),
         ("libtorrent_extra_settings", extra_settings.join("\n")),
@@ -9030,8 +9034,8 @@ async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoRes
             "ok": true,
             "applied": true,
             "hardware": {"memory_mb": optimization.memory_mb},
-            "settings": {"active_downloads": 3, "active_seeds": 3, "active_limit": 5, "dynamic_queue": true, "dynamic_queue_min": 1, "dynamic_queue_max": 10, "cache_blocks": optimization.cache_size, "cache_mb": optimization.cache_mb, "queue_mb": optimization.queue_mb, "send_buffer_kb": optimization.send_buffer_kb, "peer_list": optimization.peer_list},
-            "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. RAM rilevata: {} MB; cache: {} blocchi ({} MB), coda disco: {} MB, send-buffer: {} KiB, peer-list: {}. Connessioni e limiti globali di banda lasciati invariati.", optimization.memory_mb, optimization.cache_size, optimization.cache_mb, optimization.queue_mb, optimization.send_buffer_kb, optimization.peer_list),
+            "settings": {"active_downloads": 3, "active_seeds": 3, "active_limit": 5, "dynamic_queue": true, "dynamic_queue_min": 1, "dynamic_queue_max": 10, "dont_count_slow_torrents": true, "cache_blocks": optimization.cache_size, "cache_mb": optimization.cache_mb, "queue_mb": optimization.queue_mb, "send_buffer_kb": optimization.send_buffer_kb, "peer_list": optimization.peer_list},
+            "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. I torrent senza trasferimento non contano negli slot attivi. RAM rilevata: {} MB; cache: {} blocchi ({} MB), coda disco: {} MB, send-buffer: {} KiB, peer-list: {}. Connessioni e limiti globali di banda lasciati invariati.", optimization.memory_mb, optimization.cache_size, optimization.cache_mb, optimization.queue_mb, optimization.send_buffer_kb, optimization.peer_list),
             "bandwidth_limits_preserved": true,
             "connections_limit_preserved": true
         })),
@@ -9670,6 +9674,13 @@ async fn torrent_event_worker(
         }
         if now.duration_since(last_metadata_promotion) >= Duration::from_secs(30) {
             torrents.promote_metadata();
+            // I torrent senza metadati appena promossi perdono `auto_managed`;
+            // quando i metadati arrivano va riarmato, anche se l'alert è andato
+            // perso (es. ripristino da fastresume).
+            let rearmed = torrents.ensure_auto_managed();
+            if rearmed > 0 {
+                tracing::info!(rearmed, "auto-managed flag restored on running torrents");
+            }
             last_metadata_promotion = now;
         }
         if now.duration_since(last_queue_priority) >= Duration::from_secs(60) {

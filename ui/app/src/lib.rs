@@ -161,6 +161,16 @@ fn number(value: &Value, key: &str) -> String {
         .unwrap_or_else(|| "0".into())
 }
 
+/// Interpreta un valore di configurazione come booleano, accettando le stesse
+/// forme usate dal backend (`yes/no`, `true/false`, `1/0`, `on/off`).
+fn flag(value: &Value, key: &str, fallback: bool) -> bool {
+    let raw_value = raw(value, key, if fallback { "yes" } else { "no" });
+    matches!(
+        raw_value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn array(value: &Value, key: &str) -> Vec<Value> {
     value
         .get(key)
@@ -1738,12 +1748,13 @@ fn setting_tooltip(key: &str) -> &'static str {
         "libtorrent_dynamic_queue" => "Regola automaticamente quanti torrent sono attivi in base al carico.",
         "libtorrent_dynamic_queue_min" => "Numero minimo di download dinamici. La coda cambia al massimo di uno per volta.",
         "libtorrent_dynamic_queue_max" => "Numero massimo di download dinamici. Servono campioni consecutivi coerenti prima di aumentare la coda.",
+        "libtorrent_dont_count_slow_torrents" => "I torrent che non trasferiscono dati non consumano uno slot attivo: gli swarm senza peer non bloccano i download sani.",
         "libtorrent_auto_optimize" => "Applica periodicamente l'ottimizzazione di cache, buffer e coda in base alle risorse, senza dover premere Ottimizza.",
         "libtorrent_sequential" => "Scarica i file in ordine sequenziale invece che a pezzi sparsi.",
         "libtorrent_extra_settings" => "Impostazioni libtorrent avanzate, una per riga nel formato chiave=valore (es. max_peerlist_size=4000). Solo le chiavi riconosciute vengono applicate.",
-        "libtorrent_active_downloads" => "Numero massimo di download attivi contemporaneamente.",
-        "libtorrent_active_seeds" => "Numero massimo di torrent in seeding attivi contemporaneamente.",
-        "libtorrent_active_limit" => "Numero massimo totale di torrent attivi (download + seed).",
+        "libtorrent_active_downloads" => "Valore base dei download attivi. Con la coda dinamica Rextto lo adatta a runtime tra il minimo e il massimo configurati.",
+        "libtorrent_active_seeds" => "Valore base dei seed attivi. Con la coda dinamica scende a 1 quando ci sono download in coda.",
+        "libtorrent_active_limit" => "Valore base del limite di torrent attivi. Con la coda dinamica diventa max(base, download + seed + 2).",
         "libtorrent_seed_ratio" => "Rapporto upload/download dopo cui fermare il seeding (0 = infinito).",
         "libtorrent_seed_time" => "Limite di seeding in minuti, usato solo se Seed massimo (giorni) è 0; utile per limiti inferiori a 24 ore.",
         "libtorrent_seed_time_days" => "Limite principale di seeding in giorni; se maggiore di 0 prevale sul limite in minuti.",
@@ -5850,10 +5861,12 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                              <BooleanSetting label="Ottimizzazione continua (periodica)" setting_key="libtorrent_auto_optimize" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", "false")) />
                              <TextSetting label="Slot download dinamici minimi" setting_key="libtorrent_dynamic_queue_min" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dynamic_queue_min", "1")) placeholder="1" />
                              <TextSetting label="Slot download dinamici massimi" setting_key="libtorrent_dynamic_queue_max" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dynamic_queue_max", "10")) placeholder="10" />
+                             <p class="hint">{ctx_tr("Con l'ottimizzazione automatica attiva i campi che mostrano Auto sono di sola lettura: li gestisce Rextto. Disattivandola tornano modificabili: 3/3/5 sono il valore base, che la coda dinamica adatta comunque a runtime (download tra minimo e massimo, seed a 1 quando ci sono download in coda, limite = download + seed + 2).")}</p>
+                             <BooleanSetting label="Non contare i torrent fermi negli slot attivi" setting_key="libtorrent_dont_count_slow_torrents" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "dont_count_slow_torrents", "true")) />
                             <BooleanSetting label="Download sequenziale" setting_key="libtorrent_sequential" value=Signal::derive(move || raw(&data.get().config, "libtorrent_sequential", "false")) />
-                            <TextSetting label="Download attivi" setting_key="libtorrent_active_downloads" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_downloads", "3")) placeholder="3" />
-                            <TextSetting label="Seed attivi" setting_key="libtorrent_active_seeds" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_seeds", "3")) placeholder="3" />
-                            <TextSetting label="Limite torrent attivi" setting_key="libtorrent_active_limit" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_limit", "5")) placeholder="5" />
+                            <TextSetting label="Download attivi" setting_key="libtorrent_active_downloads" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_downloads", "3")) placeholder="3" managed=Signal::derive(move || flag(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", false)) />
+                            <TextSetting label="Seed attivi" setting_key="libtorrent_active_seeds" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_seeds", "3")) placeholder="3" managed=Signal::derive(move || flag(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", false)) />
+                            <TextSetting label="Limite torrent attivi" setting_key="libtorrent_active_limit" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "active_limit", "5")) placeholder="5" managed=Signal::derive(move || flag(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", false)) />
                             <TextSetting label="Seed ratio globale (0 = infinito)" setting_key="libtorrent_seed_ratio" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_ratio", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (minuti, fallback)" setting_key="libtorrent_seed_time" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_minutes", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (giorni)" setting_key="libtorrent_seed_time_days" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_days", "0")) placeholder="0" />
@@ -5993,9 +6006,13 @@ fn TextSetting(
     setting_key: &'static str,
     value: Signal<String>,
     placeholder: &'static str,
+    /// True quando il valore è gestito dall'ottimizzazione automatica: il campo
+    /// diventa di sola lettura e mostra "Auto" finché quella resta attiva.
+    #[prop(optional)] managed: Option<Signal<bool>>,
 ) -> impl IntoView {
     let draft = RwSignal::new(value.get());
     let message = RwSignal::new(String::new());
+    let is_managed = move || managed.map(|signal| signal.get()).unwrap_or(false);
     let dirty = use_context::<DirtySettings>();
     let saved = RwSignal::new(None::<String>);
     Effect::new(move |_| {
@@ -6034,14 +6051,24 @@ fn TextSetting(
             });
         }>
             <label>{ctx_tr(label)}</label>
-            <input prop:value=draft on:input=move |event| {
-                let next = event_target_value(&event);
-                draft.set(next.clone());
-                if let Some(dirty) = dirty {
-                    dirty.items.update(|items| { items.insert(setting_key.to_string(), next.clone()); });
-                }
-            } placeholder=ctx_tr(placeholder) />
-            <div class="form-actions"><button class="btn sm primary">{ctx_tr("Salva")}</button><small class="muted">{message}</small></div>
+            <input
+                prop:value=move || if is_managed() { "Auto".to_string() } else { draft.get() }
+                disabled=is_managed
+                on:input=move |event| {
+                    let next = event_target_value(&event);
+                    draft.set(next.clone());
+                    if let Some(dirty) = dirty {
+                        dirty.items.update(|items| { items.insert(setting_key.to_string(), next.clone()); });
+                    }
+                } placeholder=ctx_tr(placeholder) />
+            <div class="form-actions">
+                <Show
+                    when=move || !is_managed()
+                    fallback=move || view! { <small class="muted">{ctx_tr("Gestito dall'ottimizzazione automatica")}</small> }>
+                    <button class="btn sm primary">{ctx_tr("Salva")}</button>
+                    <small class="muted">{message}</small>
+                </Show>
+            </div>
         </form>
     }
 }

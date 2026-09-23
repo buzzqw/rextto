@@ -211,6 +211,8 @@ a { color: var(--accent-2); }
 .btn.ghost { background: transparent; border-color: var(--line); }
 .btn.sm { padding: 6px 10px; font-size: 0.8125rem; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+/* Campi gestiti dall'ottimizzazione automatica: mostrano "Auto" e non si editano. */
+.settings-row input:disabled { opacity: .8; cursor: not-allowed; font-style: italic; }
 .btn.dirty { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn-text) 45%, transparent); color: var(--warn-text); }
 .btn.dirty:hover { background: color-mix(in srgb, var(--warn-bg) 80%, var(--warn-text) 20%); }
 .remove-modal .modal-body { padding: 20px; }
@@ -451,6 +453,7 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 .setting-group { border: 1px solid var(--line-soft); border-radius: var(--radius); background: var(--panel-2); padding: 12px 14px; min-width: 0; }
 .setting-group h4 { margin: 0 0 10px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
 .setting-group-body { display: grid; gap: 10px; }
+.setting-group-body > .hint { color: var(--muted); font-size: 0.75rem; line-height: 1.4; margin: -2px 0 2px; }
 
 /* Torrent table: keep state badges and numbers aligned */
 .data-table .badge { white-space: nowrap; }

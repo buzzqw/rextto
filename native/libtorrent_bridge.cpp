@@ -88,6 +88,8 @@ struct rextto_lt_session {
 
     bool pex_enabled;
     bool sequential_enabled = false;
+    // Hash del torrent "pinned": volutamente fuori dall'auto-gestione.
+    std::string pinned_hash;
     lt::session session;
     std::deque<rextto_lt_event> events;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> active_since;
@@ -525,6 +527,27 @@ void rextto_lt_promote_metadata(rextto_lt_session* session) {
     }
 }
 
+// Riarma l'auto-gestione sui torrent con metadati che non sono in pausa.
+// Un torrent ripristinato da fastresume con `auto_managed` spento aggira per
+// sempre `active_downloads`/`active_limit`, lasciando decine di download in
+// parallelo. I torrent senza metadati sono esclusi di proposito: la fase di
+// metadata-fetch deve poter ignorare la coda (vedi rextto_lt_promote_metadata).
+// I torrent in pausa (scelta utente o politica) restano invariati.
+size_t rextto_lt_ensure_auto_managed(rextto_lt_session* session) {
+    if (session == nullptr) return 0;
+    size_t changed = 0;
+    for (auto const& handle : session->session.get_torrents()) {
+        auto status = handle.status();
+        if (!status.has_metadata) continue;
+        if (status.flags & lt::torrent_flags::paused) continue;
+        if (status.flags & lt::torrent_flags::auto_managed) continue;
+        if (!session->pinned_hash.empty() && hex_hash(handle) == session->pinned_hash) continue;
+        handle.set_flags(lt::torrent_flags::auto_managed);
+        ++changed;
+    }
+    return changed;
+}
+
 void rextto_lt_prioritize_queue(rextto_lt_session* session) {
     if (session == nullptr) return;
     struct candidate { lt::torrent_handle handle; std::string hash; double score; };
@@ -814,6 +837,7 @@ int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, 
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        session->pinned_hash = (pinned && hash != nullptr) ? std::string(hash) : std::string();
         if (pinned) {
             handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.resume();
