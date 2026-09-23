@@ -373,7 +373,14 @@ pub async fn run_cycle_domain(
             release.title = movie.name.clone();
             release.year = movie.year.parse::<i64>().ok().or(release.year);
         }
-        let score = release.quality.score_with_settings(&cfg.settings);
+        let score = release.quality.score_with_settings(&cfg.settings)
+            + if release.kind == "movie" {
+                cfg.find_movie_match(&release.title, release.year)
+                    .map(|movie| crate::config::Config::movie_subtitle_bonus(movie, &release.quality))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
         if release.kind == "series" {
             let series = release.series.as_deref().unwrap_or_default();
             let season = release.season.unwrap_or_default();

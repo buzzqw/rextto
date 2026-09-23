@@ -989,18 +989,20 @@ impl Config {
         if !Self::quality_allowed(quality, &movie.quality, &language, "") {
             return false;
         }
-        let subtitle_raw = if movie.subtitle_requirements.trim().is_empty() {
-            movie.subtitle.trim()
-        } else {
-            movie.subtitle_requirements.trim()
-        };
-        let subtitle_flag = matches!(
-            subtitle_raw.to_ascii_lowercase().as_str(),
-            "yes" | "true" | "1" | "sub" | "subs"
-        );
-        let required = parse_language_requirements(subtitle_raw);
+        // "Requisiti sottotitoli" è obbligatorio: una release senza quei
+        // sottotitoli viene scartata. Il campo "Sottotitoli" è invece facoltativo
+        // (solo una preferenza) e non blocca nulla qui.
+        let requirements = movie.subtitle_requirements.trim();
+        if requirements.is_empty() {
+            return true;
+        }
+        let required = parse_language_requirements(requirements);
         if required.is_empty() {
-            return !subtitle_flag || quality.has_subtitle;
+            let flag = matches!(
+                requirements.to_ascii_lowercase().as_str(),
+                "yes" | "true" | "1" | "sub" | "subs"
+            );
+            return !flag || quality.has_subtitle;
         }
         required.iter().any(|value| {
             (matches!(value.as_str(), "yes" | "true" | "1" | "sub" | "subs")
@@ -1011,6 +1013,38 @@ impl Config {
                     .map(|item| normalize_language_code(item))
                     .any(|item| &item == value)
         })
+    }
+
+    /// Bonus facoltativo quando la release contiene i sottotitoli preferiti dal
+    /// film (campo "Sottotitoli"). Non blocca il download: serve solo a
+    /// preferire, a parità di qualità, le release che li contengono.
+    pub fn movie_subtitle_bonus(movie: &MovieConfig, quality: &crate::models::Quality) -> i64 {
+        let preferred = movie.subtitle.trim();
+        if preferred.is_empty() {
+            return 0;
+        }
+        let wanted = parse_language_requirements(preferred);
+        let has_preferred = if wanted.is_empty() {
+            matches!(
+                preferred.to_ascii_lowercase().as_str(),
+                "yes" | "true" | "1" | "sub" | "subs"
+            ) && quality.has_subtitle
+        } else {
+            wanted.iter().any(|value| {
+                (matches!(value.as_str(), "yes" | "true" | "1" | "sub" | "subs")
+                    && quality.has_subtitle)
+                    || quality
+                        .subtitle_languages
+                        .iter()
+                        .map(|item| normalize_language_code(item))
+                        .any(|item| &item == value)
+            })
+        };
+        if has_preferred {
+            50
+        } else {
+            0
+        }
     }
 
     pub fn series_release_allowed(
@@ -1989,6 +2023,41 @@ mod tests {
         english.languages = vec!["eng".into()];
         english.language = "eng".into();
         assert!(Config::movie_release_allowed(&movie, &english));
+    }
+
+    #[test]
+    fn movie_subtitles_optional_but_requirements_mandatory() {
+        let mut base = crate::models::Quality::default();
+        base.language = "ita".into();
+        base.languages = vec!["ita".into()];
+
+        // "Sottotitoli" è solo una preferenza: una release senza sottotitoli
+        // resta valida, ma non riceve il bonus.
+        let preferred = MovieConfig {
+            name: "Example".into(),
+            quality: "any".into(),
+            language: "ita".into(),
+            subtitle: "ita".into(),
+            ..Default::default()
+        };
+        assert!(Config::movie_release_allowed(&preferred, &base));
+        assert_eq!(Config::movie_subtitle_bonus(&preferred, &base), 0);
+        let mut with_sub = base.clone();
+        with_sub.has_subtitle = true;
+        with_sub.subtitle_languages = vec!["ita".into()];
+        assert_eq!(Config::movie_subtitle_bonus(&preferred, &with_sub), 50);
+
+        // "Requisiti sottotitoli" è obbligatorio: senza quei sottotitoli la
+        // release viene scartata.
+        let strict = MovieConfig {
+            name: "Example".into(),
+            quality: "any".into(),
+            language: "ita".into(),
+            subtitle_requirements: "ita".into(),
+            ..Default::default()
+        };
+        assert!(!Config::movie_release_allowed(&strict, &base));
+        assert!(Config::movie_release_allowed(&strict, &with_sub));
     }
 
     #[test]

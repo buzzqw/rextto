@@ -3128,7 +3128,10 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
             && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
-        std::cmp::Reverse(release.quality.score_with_settings(&cfg.settings))
+        std::cmp::Reverse(
+            release.quality.score_with_settings(&cfg.settings)
+                + Config::movie_subtitle_bonus(movie, &release.quality),
+        )
     });
     (
         StatusCode::OK,
