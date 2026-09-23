@@ -192,6 +192,13 @@ Senza argomenti, su un terminale reale, apre la vista interattiva
 (**Status, Torrents, Activity, Logs, Health**; `c` ciclo, `p` pausa/riprendi,
 `1-5` schede, `q` esci). Si punta altrove con `REXTTO_URL` / `REXTTO_API_TOKEN`.
 
+È inclusa anche una versione **Python** della stessa TUI, senza dipendenze da
+installare:
+
+```bash
+python3 scripts/rextto_tui.py      # solo libreria standard (curses + urllib)
+```
+
 ### Dati e log
 
 - Data directory di default: `data/` (modificabile con `REXTTO_DATA_DIR`).

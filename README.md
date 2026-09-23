@@ -193,6 +193,12 @@ With no arguments on a real terminal it opens the interactive view
 `1-5` tabs, `q` quit). Point it elsewhere with `REXTTO_URL` /
 `REXTTO_API_TOKEN`.
 
+A dependency-free **Python** version of the same TUI is also included:
+
+```bash
+python3 scripts/rextto_tui.py      # stdlib curses + urllib, nothing to install
+```
+
 ### Data and logs
 
 - Default data directory: `data/` (override with `REXTTO_DATA_DIR`).
