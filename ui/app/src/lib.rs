@@ -3,7 +3,6 @@ use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Title};
 use serde_json::{json, Value};
-use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
@@ -8060,53 +8059,29 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
     let limit = RwSignal::new("400".to_string());
     let loading = RwSignal::new(true);
     let log_ref = NodeRef::<leptos::html::Pre>::new();
-    // Stream SSE: la connessione invia le ultime righe e poi segue il log.
-    // Il limite viene passato al server, così la prima schermata non deve
-    // attendere una serie di eventi oltre il numero richiesto.
-    if let Ok(source) = web_sys::EventSource::new("/api/logs/stream?limit=400") {
-        let source_for_cleanup = send_wrapper::SendWrapper::new(source.clone());
-        on_cleanup(move || source_for_cleanup.close());
-        let on_open = Closure::<dyn FnMut()>::new(move || {
+    // Caricamento semplice e affidabile: una GET iniziale e poi un refresh
+    // periodico. Evita di dipendere dall'evento iniziale di uno stream SSE,
+    // che può arrivare prima che il browser abbia installato il listener.
+    let polling = RwSignal::new(true);
+    on_cleanup(move || polling.set(false));
+    spawn_local(async move {
+        loop {
+            let requested = limit.get_untracked().parse::<usize>().unwrap_or(400).clamp(50, 2000);
+            if let Ok(value) = get(&format!("/api/logs?limit={requested}")).await {
+                lines.set(
+                    array(&value, "items")
+                        .into_iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect(),
+                );
+            }
             loading.set(false);
-        });
-        source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-        on_open.forget();
-        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-            move |event: web_sys::MessageEvent| {
-                let Some(data) = event.data().as_string() else {
-                    return;
-                };
-                let Ok(message) = serde_json::from_str::<Value>(&data) else {
-                    return;
-                };
-                if let Some(snapshot) = message.get("snapshot").and_then(Value::as_array) {
-                    lines.set(
-                        snapshot
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect(),
-                    );
-                    loading.set(false);
-                    return;
-                }
-                let Some(line) = message.get("line").and_then(Value::as_str) else {
-                    return;
-                };
-                loading.set(false);
-                let cap = limit.get().parse::<usize>().unwrap_or(400).clamp(50, 5000);
-                lines.update(|current| {
-                    current.push(line.to_owned());
-                    if current.len() > cap {
-                        let drop = current.len() - cap;
-                        current.drain(0..drop);
-                    }
-                });
-            },
-        );
-        source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        on_message.forget();
-    }
+            TimeoutFuture::new(5_000).await;
+            if !polling.get_untracked() {
+                break;
+            }
+        }
+    });
     let reload_limit = move |event: web_sys::Event| {
         let requested = event_target_value(&event)
             .parse::<usize>()

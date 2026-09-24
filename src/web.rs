@@ -1309,7 +1309,7 @@ async fn logs(State(s): State<AppState>, Query(query): Query<LogQuery>) -> Json<
 }
 
 /// Stream SSE del log: invia le ultime righe alla connessione e poi segue il
-/// file (`rextto.log`) con un polling interno di 1 secondo, ripartendo da zero
+/// file (`rextto.log`) con un polling interno di 5 secondi, ripartendo da zero
 /// se il file viene troncato dalla rotazione.
 async fn logs_stream(
     State(s): State<AppState>,
@@ -1337,7 +1337,7 @@ async fn logs_stream(
             sent = lines.len();
         }
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             let Ok(contents) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
