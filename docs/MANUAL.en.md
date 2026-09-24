@@ -131,7 +131,9 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
 - **Video duplicates** — *Preview duplicates* and *Clean duplicates* find video
   files clearly inferior (strictly lower resolution) left next to the best
   version in the same folder, e.g. an old 480p next to the new 1080p, and move
-  them to the trash. At the **same resolution** the version matching the
+  them to the trash. The check uses the filename and technical data declared in
+  the name; it does not compare file contents or calculate hashes. At the
+  **same resolution** the version matching the
   preferred language (*Configuration → Rename → default language*) is kept and a
   duplicate that explicitly declares a different language is moved to trash;
   files with no language tag are left untouched. Files of torrents still in the

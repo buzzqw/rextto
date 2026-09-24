@@ -136,7 +136,9 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
 - **Duplicati video** — *Anteprima duplicati* e *Pulisci duplicati* trovano i
   file video chiaramente inferiori (risoluzione strettamente più bassa) rimasti
   accanto alla versione migliore nella stessa cartella — es. il vecchio 480p
-  accanto al nuovo 1080p — e li spostano nel cestino. A **pari risoluzione**
+  accanto al nuovo 1080p — e li spostano nel cestino. Il controllo usa il nome
+  del file e i dati tecnici dichiarati nel nome: non confronta il contenuto e
+  non calcola hash. A **pari risoluzione**
   viene tenuta la versione nella lingua preferita (*Configurazione → Rinomina →
   lingua predefinita*) e il duplicato che dichiara esplicitamente un'altra lingua
   va nel cestino; i file senza tag lingua restano intatti. I file dei torrent

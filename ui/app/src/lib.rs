@@ -6990,8 +6990,8 @@ fn DbOptimizeTool(data: RwSignal<Data>) -> impl IntoView {
         });
     };
     view! {
-        <Panel title="Ottimizzazione database (SQLite)">
-            <p class="muted">{ctx_tr("VACUUM compatta il file e libera spazio; ANALYZE aggiorna le statistiche del query planner.")}</p>
+        <Panel title="Ottimizzazione database">
+            <p class="muted">{ctx_tr("VACUUM compatta i database; ANALYZE aggiorna le statistiche SQLite.")}</p>
             <div class="list" style="margin:10px 0">
                 {move || db_files.get().into_iter().map(|file| view! {
                     <div class="list-item"><span class="mono truncate">{text(&file, "name", "-")}</span><strong>{size(&file, "size_bytes")}</strong></div>
@@ -7780,7 +7780,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
             </Panel>
             <div class="grid-2">
             <Panel title="Duplicati video in libreria">
-                <p class="muted">{ctx_tr("Individua i file video chiaramente inferiori (risoluzione più bassa) rimasti accanto alla versione migliore. Conservativo: tocca solo le risoluzioni riconosciute e lascia intatte le versioni con la stessa risoluzione. La pulizia sposta i file nel trash.")}</p>
+                <p class="muted">{ctx_tr("Individua i file video chiaramente inferiori (risoluzione più bassa) rimasti accanto alla versione migliore. Il controllo usa il nome del file e i dati tecnici dichiarati nel nome, non confronta il contenuto né calcola hash. Conservativo: tocca solo le risoluzioni riconosciute e lascia intatte le versioni con la stessa risoluzione. La pulizia sposta i file nel trash.")}</p>
                 <div class="toolbar" style="margin-top:8px">
                     <button class="btn sm" disabled=move || duplicates_busy.get() on:click=move |_| {
                         duplicates_busy.set(true);
@@ -7855,8 +7855,8 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </Show>
             </Panel>
-            </div>
             <DbOptimizeTool data />
+            </div>
             <Panel title="Diagnostica sorgenti e servizi">
                 <p class="muted" title=ctx_tr("Questa sezione esegue una ricerca reale con query e include anche test porte e notifiche; la sezione Stato sorgenti in Salute mostra invece il controllo generale delle sorgenti.")>{ctx_tr("Test query sulle sorgenti, porte e notifiche")}</p>
                 <div class="toolbar">
