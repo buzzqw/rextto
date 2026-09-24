@@ -725,8 +725,11 @@ async fn fetch_detail_magnets(
     let mut misses: Vec<(String, url::Url)> = Vec::new();
     for (title, detail) in pending {
         match crate::cache::get(&title) {
-            Some(magnet) => push_release(output, &title, &magnet, label),
-            None => misses.push((title, detail)),
+            // Una civetta in cache non vale: la si risolve di nuovo dal dettaglio.
+            Some(magnet) if !is_placeholder_magnet(&magnet) => {
+                push_release(output, &title, &magnet, label)
+            }
+            _ => misses.push((title, detail)),
         }
     }
     if misses.is_empty() {
@@ -778,6 +781,10 @@ fn push_release_at(
     label: &str,
     discovered_at: DateTime<Utc>,
 ) {
+    // La civetta anti-bot di ext.to non è un magnet reale: non archiviarla.
+    if is_placeholder_magnet(magnet) {
+        return;
+    }
     let tagged = with_source_tag(title, label);
     if let Some(release) = parse_release_at(&tagged, magnet, label, discovered_at) {
         output.push(release);
@@ -834,18 +841,30 @@ fn decode_component(value: &str) -> String {
         .collect::<String>()
 }
 
+/// ext.to (e siti simili) usano un magnet civetta anti-bot al posto
+/// dell'infohash reale: `btih:areMouseMovesMostlyStraightLined`. Va ignorato,
+/// altrimenti il fallback di [`extract_magnet`] lo scambia per un infohash
+/// base32 e lo archivia come magnet "corrotto".
+fn is_placeholder_magnet(magnet: &str) -> bool {
+    magnet
+        .to_ascii_lowercase()
+        .contains("btih:aremousemovesmostlystraightlined")
+}
+
 fn extract_magnet(body: &str) -> Option<String> {
     let direct = crate::utils::cached_regex(r#"magnet:\?xt=urn:btih:[0-9a-fA-F]{40,64}[^\s\"'<>]*"#)
         .ok()?
         .find(body)
         .map(|value| value.as_str().to_owned());
-    direct.or_else(|| {
-        crate::utils::cached_regex(r#"(?i)\b([a-f0-9]{40}|[a-z2-7]{32})\b"#)
-            .ok()?
-            .captures(body)
-            .and_then(|capture| capture.get(1))
-            .map(|hash| format!("magnet:?xt=urn:btih:{}", hash.as_str()))
-    })
+    direct
+        .or_else(|| {
+            crate::utils::cached_regex(r#"(?i)\b([a-f0-9]{40}|[a-z2-7]{32})\b"#)
+                .ok()?
+                .captures(body)
+                .and_then(|capture| capture.get(1))
+                .map(|hash| format!("magnet:?xt=urn:btih:{}", hash.as_str()))
+        })
+        .filter(|magnet| !is_placeholder_magnet(magnet))
 }
 
 fn torznab_endpoint(indexer: &IndexerConfig) -> String {
