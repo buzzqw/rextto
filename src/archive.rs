@@ -104,29 +104,67 @@ impl Archive {
     pub fn browse_page(&self, query: &str, page: usize, limit: usize) -> Result<ArchivePage> {
         let limit = limit.clamp(1, 500);
         let page = page.max(1);
-        let term = fts_query(query);
-        // See `browse`: a filtered and an unfiltered query, never MATCH inside OR.
-        let total: i64 = if term.is_empty() {
-            self.conn
-                .query_row("SELECT COUNT(*) FROM archive", [], |row| row.get(0))?
-        } else {
-            self.conn.query_row(
+        let (includes, excludes) = parse_archive_filter(query);
+        let page_of = |total: i64| {
+            let pages = ((total as usize + limit - 1) / limit).max(1);
+            (pages, ((page - 1).min(pages - 1) * limit) as i64)
+        };
+
+        // Con termini positivi si usa l'indice FTS (con NOT per le esclusioni).
+        if !includes.is_empty() {
+            let term = fts_match_expression(&includes, &excludes);
+            let total: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM archive JOIN archive_fts ON archive_fts.rowid=archive.id WHERE archive_fts MATCH ?1",
                 [&term],
                 |row| row.get(0),
-            )?
-        };
-        let pages = ((total as usize + limit - 1) / limit).max(1);
-        let offset = ((page - 1).min(pages - 1) * limit) as i64;
-        let items = if term.is_empty() {
-            let mut statement = self.conn.prepare("SELECT id,title,magnet,COALESCE(source,'archive'),COALESCE(quality_score,0),added_at FROM archive ORDER BY added_at DESC LIMIT ?1 OFFSET ?2")?;
-            let rows = statement.query_map(params![limit as i64, offset], archive_entry_from_row)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
+            )?;
+            let (pages, offset) = page_of(total);
             let mut statement = self.conn.prepare("SELECT archive.id,archive.title,archive.magnet,COALESCE(archive.source,'archive'),COALESCE(archive.quality_score,0),archive.added_at FROM archive JOIN archive_fts ON archive_fts.rowid=archive.id WHERE archive_fts MATCH ?1 ORDER BY archive.added_at DESC LIMIT ?2 OFFSET ?3")?;
-            let rows = statement.query_map(params![term, limit as i64, offset], archive_entry_from_row)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
+            let items = statement
+                .query_map(params![term, limit as i64, offset], archive_entry_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(ArchivePage {
+                items,
+                total,
+                page,
+                pages,
+            });
+        }
+
+        // Solo esclusioni (o nessun filtro): FTS5 non può iniziare con NOT, si
+        // filtra la tabella con NOT LIKE.
+        let mut where_sql = String::new();
+        let mut filter_binds: Vec<rusqlite::types::Value> = Vec::new();
+        for word in &excludes {
+            if where_sql.is_empty() {
+                where_sql.push_str(" WHERE ");
+            } else {
+                where_sql.push_str(" AND ");
+            }
+            filter_binds.push(rusqlite::types::Value::Text(format!("%{word}%")));
+            where_sql.push_str(&format!("lower(title) NOT LIKE ?{}", filter_binds.len()));
+        }
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM archive{where_sql}"),
+            rusqlite::params_from_iter(filter_binds.iter().cloned()),
+            |row| row.get(0),
+        )?;
+        let (pages, offset) = page_of(total);
+        filter_binds.push(rusqlite::types::Value::Integer(limit as i64));
+        filter_binds.push(rusqlite::types::Value::Integer(offset));
+        let count = filter_binds.len();
+        let sql = format!(
+            "SELECT id,title,magnet,COALESCE(source,'archive'),COALESCE(quality_score,0),added_at FROM archive{where_sql} ORDER BY added_at DESC LIMIT ?{} OFFSET ?{}",
+            count - 1,
+            count
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let items = statement
+            .query_map(
+                rusqlite::params_from_iter(filter_binds.iter().cloned()),
+                archive_entry_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ArchivePage {
             items,
             total,
@@ -176,6 +214,51 @@ fn archive_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveEn
 
 /// Builds an FTS5 query where every whitespace-separated term is required.
 /// Prefix matching keeps searches useful for partial words (e.g. `ocea`).
+/// Scompone il filtro dell'archivio in termini positivi e negativi: `-parola`
+/// esclude, tutto il resto (anche con `+`) include. È un "regex facilitato"
+/// senza vere espressioni regolari.
+fn parse_archive_filter(query: &str) -> (Vec<String>, Vec<String>) {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for raw in query.split_whitespace() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(word) = raw.strip_prefix('-') {
+            if !word.is_empty() {
+                excludes.push(word.to_ascii_lowercase());
+            }
+        } else if let Some(word) = raw.strip_prefix('+') {
+            if !word.is_empty() {
+                includes.push(word.to_ascii_lowercase());
+            }
+        } else {
+            includes.push(raw.to_ascii_lowercase());
+        }
+    }
+    (includes, excludes)
+}
+
+/// Espressione FTS5: i termini positivi sono in AND, le esclusioni in NOT.
+/// Richiede almeno un termine positivo (FTS5 non accetta un NOT iniziale).
+fn fts_match_expression(includes: &[String], excludes: &[String]) -> String {
+    let quote = |word: &str| format!("\"{}\"*", word.replace('"', "\"\""));
+    let positive = includes
+        .iter()
+        .map(|word| quote(word))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    if excludes.is_empty() {
+        return positive;
+    }
+    let negative = excludes
+        .iter()
+        .map(|word| quote(word))
+        .collect::<Vec<_>>()
+        .join(" NOT ");
+    format!("({positive}) NOT {negative}")
+}
+
 fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
