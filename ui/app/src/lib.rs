@@ -8300,25 +8300,51 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                 </div>
             </Panel>
             <ServicesPanel data />
-            <Panel title="Permessi percorsi">
-                <div class="table-wrap">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Percorso")}</th><th>{ctx_tr("Path")}</th><th>{ctx_tr("Esiste")}</th><th>{ctx_tr("Scrivibile")}</th></tr></thead>
-                        <tbody>
-                            {move || data.get().health.get("paths").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|entry| {
-                                let exists = entry.get("exists").and_then(Value::as_bool).unwrap_or(false);
-                                let writable = entry.get("writable").and_then(Value::as_bool).unwrap_or(false);
+            <Panel title="Percorsi e dischi">
+                <div class="grid-2">
+                    <div class="setting-group">
+                        <h4>{ctx_tr("Permessi percorsi")}</h4>
+                        <div class="table-wrap">
+                            <table class="data-table">
+                                <thead><tr><th>{ctx_tr("Percorso")}</th><th>{ctx_tr("Path")}</th><th>{ctx_tr("Esiste")}</th><th>{ctx_tr("Scrivibile")}</th></tr></thead>
+                                <tbody>
+                                    {move || data.get().health.get("paths").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|entry| {
+                                        let exists = entry.get("exists").and_then(Value::as_bool).unwrap_or(false);
+                                        let writable = entry.get("writable").and_then(Value::as_bool).unwrap_or(false);
+                                        view! {
+                                            <tr>
+                                                <td>{text(&entry, "label", "-")}</td>
+                                                <td class="mono truncate muted">{text(&entry, "path", "-")}</td>
+                                                <td><span class="badge" class:ok=exists class:err=!exists>{if exists { "sì" } else { "no" }}</span></td>
+                                                <td><span class="badge" class:ok=writable class:err=!writable>{if writable { "sì" } else { "no" }}</span></td>
+                                            </tr>
+                                        }
+                                    }).collect_view()}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <h4>{ctx_tr("Dischi")}</h4>
+                        <div class="stack">
+                            <Show when=move || data.get().health.get("disks").and_then(Value::as_array).map(|items| items.is_empty()).unwrap_or(true)>
+                                <span class="muted">{ctx_tr("Nessun filesystem rilevato.")}</span>
+                            </Show>
+                            {move || data.get().health.get("disks").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|disk| {
+                                let mount = text(&disk, "mount", "-");
+                                let mount_hint = mount.clone();
+                                let total = disk.get("total_bytes").and_then(Value::as_f64).unwrap_or(0.0);
+                                let free = disk.get("free_bytes").and_then(Value::as_f64).unwrap_or(0.0);
+                                let used = if total > 0.0 { (total - free) / total * 100.0 } else { 0.0 };
                                 view! {
-                                    <tr>
-                                        <td>{text(&entry, "label", "-")}</td>
-                                        <td class="mono truncate muted">{text(&entry, "path", "-")}</td>
-                                        <td><span class="badge" class:ok=exists class:err=!exists>{if exists { "sì" } else { "no" }}</span></td>
-                                        <td><span class="badge" class:ok=writable class:err=!writable>{if writable { "sì" } else { "no" }}</span></td>
-                                    </tr>
+                                    <div class="disk-row" title=format!("{} · {}", text(&disk, "filesystem", "-"), mount_hint)>
+                                        <span class="mono truncate">{mount}</span>
+                                        <span class="muted">{format!("{} liberi / {} · {:.0}% usato", size_str(free), size_str(total), used)}</span>
+                                    </div>
                                 }
                             }).collect_view()}
-                        </tbody>
-                    </table>
+                        </div>
+                    </div>
                 </div>
             </Panel>
             <Panel title="Stato sorgenti">
@@ -8369,26 +8395,6 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Ultimi errori">
                 <Show when=move || array(&data.get().health, "last_errors").is_empty()><span class="muted">{ctx_tr("Nessun errore recente nel log.")}</span></Show>
                 <pre class="output">{move || array(&data.get().health, "last_errors").into_iter().filter_map(|item| item.as_str().map(str::to_owned)).collect::<Vec<_>>().join("\n")}</pre>
-            </Panel>
-            <Panel title="Dischi">
-                <div class="stack">
-                    <Show when=move || data.get().health.get("disks").and_then(Value::as_array).map(|items| items.is_empty()).unwrap_or(true)>
-                        <span class="muted">{ctx_tr("Nessun filesystem rilevato.")}</span>
-                    </Show>
-                    {move || data.get().health.get("disks").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|disk| {
-                        let mount = text(&disk, "mount", "-");
-                        let mount_hint = mount.clone();
-                        let total = disk.get("total_bytes").and_then(Value::as_f64).unwrap_or(0.0);
-                        let free = disk.get("free_bytes").and_then(Value::as_f64).unwrap_or(0.0);
-                        let used = if total > 0.0 { (total - free) / total * 100.0 } else { 0.0 };
-                        view! {
-                            <div class="disk-row" title=format!("{} · {}", text(&disk, "filesystem", "-"), mount_hint)>
-                                <span class="mono truncate">{mount}</span>
-                                <span class="muted">{format!("{} liberi / {} · {:.0}% usato", size_str(free), size_str(total), used)}</span>
-                            </div>
-                        }
-                    }).collect_view()}
-                </div>
             </Panel>
             <ChartsView data />
         </div>
