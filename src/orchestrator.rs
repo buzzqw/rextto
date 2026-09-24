@@ -115,6 +115,27 @@ pub async fn run_cycle_domain(
     if domain == Some("movies") {
         releases.retain(|release| release.kind == "movie");
     }
+    // Do not keep or reconsider releases whose infohash was permanently
+    // rejected (for example a season pack whose real files belong to another
+    // season). This also removes stale conflicting rows from the archive.
+    let blocked_hashes = {
+        let database = db.lock().unwrap();
+        releases
+            .iter()
+            .filter_map(|release| crate::utils::magnet_hash(&release.magnet))
+            .filter(|hash| database.is_blocklisted(hash).unwrap_or(false))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    for hash in &blocked_hashes {
+        archive.lock().unwrap().remove_hash(hash)?;
+    }
+    if !blocked_hashes.is_empty() {
+        tracing::info!(count = blocked_hashes.len(), "blocked releases removed from this cycle");
+        releases.retain(|release| {
+            crate::utils::magnet_hash(&release.magnet)
+                .is_none_or(|hash| !blocked_hashes.contains(&hash))
+        });
+    }
     archive.lock().unwrap().save_batch(&releases)?;
     // "Seen from feed": record every collected release, including unmonitored
     // titles, so it remains available for archive browsing.

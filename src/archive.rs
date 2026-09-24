@@ -61,6 +61,18 @@ impl Archive {
         Ok(())
     }
 
+    /// Removes every archived listing for a rejected infohash. Indexers can
+    /// publish the same torrent under conflicting season/title metadata, so
+    /// leaving the rows visible would make the bad release return on every
+    /// archive pass even after it has been blocklisted.
+    pub fn remove_hash(&self, hash: &str) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM archive WHERE lower(COALESCE(magnet_hash,''))=lower(?1)",
+            [hash],
+        )?;
+        Ok(removed)
+    }
+
     /// Replaces an ephemeral `.torrent` URL with its durable infohash magnet
     /// once the torrent has been downloaded successfully. If the same magnet
     /// is already archived, the obsolete URL row is simply removed.

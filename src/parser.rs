@@ -54,10 +54,13 @@ pub fn normalize_series_name(value: &str) -> String {
     {
         return hit.clone();
     }
+    // Release names use dots, underscores, hyphens, slashes and colons as
+    // separators while the configured name is usually human-readable. Keep
+    // parentheses intact because they carry useful year information.
     let normalized = value
         .to_ascii_lowercase()
-        .replace(['.', '_', '-', '/', '\\'], " ");
-    let normalized = normalized.replace("'s", "");
+        .replace(['.', '_', '-', '/', '\\', ':'], " ");
+    let normalized = normalized.replace("'s", "").replace("’s", "");
     let normalized = normalized
         .split_whitespace()
         .filter(|w| {
@@ -78,9 +81,12 @@ pub fn normalize_series_name(value: &str) -> String {
 }
 
 pub fn series_names_match(a: &str, b: &str) -> bool {
-    let left = strip_year_tokens(&normalize_series_name(a));
-    let right = strip_year_tokens(&normalize_series_name(b));
-    if tokens_match(&left, &right) {
+    let left = matching_name(&strip_year_tokens(&normalize_series_name(a)));
+    let right = matching_name(&strip_year_tokens(&normalize_series_name(b)));
+    if tokens_match(&left, &right)
+        || tokens_match_with_release_suffix(&left, &right)
+        || tokens_match_with_release_suffix(&right, &left)
+    {
         return true;
     }
     // Titoli "stilizzati" (es. `PLUR1BUS` per *Pluribus*): confronta una
@@ -90,11 +96,111 @@ pub fn series_names_match(a: &str, b: &str) -> bool {
     if has_ascii_digit(&left) != has_ascii_digit(&right) {
         let folded_left = leet_fold(&left);
         let folded_right = leet_fold(&right);
-        if tokens_match(&folded_left, &folded_right) {
+        if tokens_match(&folded_left, &folded_right)
+            || tokens_match_with_release_suffix(&folded_left, &folded_right)
+            || tokens_match_with_release_suffix(&folded_right, &folded_left)
+        {
             return true;
         }
     }
     false
+}
+
+/// Form used only for comparing names. `normalize_series_name` deliberately
+/// keeps some punctuation because it is also used to build torrent episode
+/// keys; matching needs the more permissive behaviour of the legacy parser.
+fn matching_name(value: &str) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        if character.is_alphanumeric() {
+            current.push(fold_latin_character(character));
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    // Torrent names occasionally spell acronyms as `F B I` or `S W A T`.
+    let mut compacted = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        if words[index].chars().count() == 1 {
+            let start = index;
+            while index < words.len() && words[index].chars().count() == 1 {
+                index += 1;
+            }
+            if index - start >= 2 {
+                compacted.push(words[start..index].concat());
+            } else {
+                compacted.extend_from_slice(&words[start..index]);
+            }
+        } else {
+            compacted.push(std::mem::take(&mut words[index]));
+            index += 1;
+        }
+    }
+    compacted.join(" ")
+}
+
+fn fold_latin_character(character: char) -> char {
+    match character {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ď' | 'đ' => 'd',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
+        'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+        'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'ť' | 'ţ' | 'ŧ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ž' | 'ź' | 'ż' => 'z',
+        'æ' => 'a',
+        'œ' => 'o',
+        'ß' => 's',
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// Allows harmless suffixes commonly left in the series prefix by indexers:
+/// bare years, season/episode markers and technical tags. It intentionally
+/// only accepts suffixes, so `New Tricks` does not match `Old Dog New Tricks`.
+fn tokens_match_with_release_suffix(configured: &str, candidate: &str) -> bool {
+    let configured = configured.split_whitespace().collect::<Vec<_>>();
+    let candidate = candidate.split_whitespace().collect::<Vec<_>>();
+    if candidate.len() <= configured.len() || !tokens_match_prefix(&configured, &candidate) {
+        return false;
+    }
+    candidate[configured.len()..]
+        .iter()
+        .all(|token| is_release_suffix_token(token))
+}
+
+fn tokens_match_prefix(configured: &[&str], candidate: &[&str]) -> bool {
+    configured.iter().zip(candidate).all(|(left, right)| {
+        *left == *right
+            || left.strip_suffix('s') == Some(*right)
+            || right.strip_suffix('s') == Some(*left)
+    })
+}
+
+fn is_release_suffix_token(token: &str) -> bool {
+    let is_digits = |value: &str| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+    let lower = token.to_ascii_lowercase();
+    is_digits(token) && token.len() == 4 && (token.starts_with("19") || token.starts_with("20"))
+        || matches!(
+            lower.as_str(),
+            "complete" | "completa" | "season" | "tv" | "web" | "webdl" | "webrip"
+                | "hdtv" | "bluray"
+        )
+        || crate::utils::cached_regex(r"(?i)^(?:s\d{1,2}|e\d{1,4}|\d{1,2}x\d{1,4}|\d{3,4}p)$")
+            .ok()
+            .is_some_and(|regex| regex.is_match(token))
 }
 
 /// Confronto di due nomi già normalizzati: uguaglianza oppure token a token
@@ -788,6 +894,24 @@ mod tests {
     #[test]
     fn matches_aliases_after_normalization() {
         assert!(series_names_match("Grey's Anatomy", "Greys.Anatomy"));
+    }
+
+    #[test]
+    fn matches_series_names_with_or_without_colon() {
+        assert!(series_names_match(
+            "Star Trek: Strange New Worlds",
+            "Star.Trek.Strange.New.Worlds"
+        ));
+    }
+
+    #[test]
+    fn matches_safe_year_and_accent_variants_without_substring_false_positives() {
+        assert!(series_names_match("Dark Matter", "Dark Matter 2024"));
+        assert!(series_names_match("Astrid Raphaëlle", "Astrid.Raphaelle"));
+        assert!(series_names_match("FBI: International", "FBI-International"));
+        assert!(!series_names_match("Invasion", "Secret Invasion"));
+        assert!(!series_names_match("New Tricks", "Old Dog New Tricks"));
+        assert!(!series_names_match("Strike", "Strike Back"));
     }
 
     #[test]

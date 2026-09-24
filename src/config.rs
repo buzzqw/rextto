@@ -792,7 +792,7 @@ impl Config {
 
     pub fn find_series_match(&self, name: &str, season: Option<i64>) -> Option<&SeriesConfig> {
         let normalized = crate::parser::normalize_series_name(name);
-        self.series.iter().find(|series| {
+        let eligible = |series: &SeriesConfig| {
             if !series.enabled
                 || season.is_some_and(|value| {
                     series.ignored_seasons.contains(&value)
@@ -801,11 +801,27 @@ impl Config {
             {
                 return false;
             }
-            crate::parser::series_names_match(&series.name, &normalized)
-                || series
-                    .aliases
-                    .iter()
-                    .any(|alias| crate::parser::series_names_match(alias, &normalized))
+            true
+        };
+        // Prefer an exact normalized name over a tolerant suffix match. This
+        // keeps similarly named monitored series distinct (for example
+        // `Scrubs` and `Scrubs 2026`) while still accepting release years and
+        // technical suffixes when no exact configuration exists.
+        if let Some(series) = self.series.iter().find(|series| {
+            eligible(series)
+                && std::iter::once(series.name.as_str())
+                    .chain(series.aliases.iter().map(String::as_str))
+                    .any(|candidate| crate::parser::normalize_series_name(candidate) == normalized)
+        }) {
+            return Some(series);
+        }
+        self.series.iter().find(|series| {
+            eligible(series)
+                && std::iter::once(series.name.as_str())
+                    .chain(series.aliases.iter().map(String::as_str))
+                    .any(|candidate| {
+                    crate::parser::series_names_match(candidate, &normalized)
+                })
         })
     }
 
@@ -2011,6 +2027,26 @@ mod tests {
         assert!(cfg.find_series_match("Example", Some(4)).is_some());
         assert!(cfg.find_series_match("Example", Some(8)).is_some());
         assert!(cfg.find_series_match("Example", Some(2)).is_none());
+    }
+
+    #[test]
+    fn prefers_exact_series_name_before_year_suffix_matching() {
+        let mut cfg = Config::default();
+        cfg.series.push(SeriesConfig {
+            name: "Scrubs".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        cfg.series.push(SeriesConfig {
+            name: "Scrubs 2026".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.find_series_match("Scrubs 2026", Some(1))
+                .map(|series| series.name.as_str()),
+            Some("Scrubs 2026")
+        );
     }
 
     #[test]

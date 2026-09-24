@@ -11474,6 +11474,39 @@ async fn handle_torrent_event(
         // legacy parity: at `add()` the size is unknown and the RAM disk is used
         // first; once metadata arrives the real size decides if it still fits.
         "metadata_received" => {
+            // The indexer title can disagree with the torrent's real name
+            // (for example S06 in Jackett while the payload is S05).  Reject
+            // this before pieces are downloaded; completion-time validation is
+            // still kept as a second line of defence.
+            if metadata.release.is_pack {
+                if let Some(corrected) =
+                    crate::parser::reconcile_pack_identity(&metadata.release, &event.name)
+                {
+                    if corrected.season != metadata.release.season {
+                        let error = "torrent metadata season does not match declared season";
+                        tracing::warn!(
+                            hash = %event.hash,
+                            declared_season = ?metadata.release.season,
+                            torrent_season = ?corrected.season,
+                            name = %event.name,
+                            "rejecting season pack before download: metadata identity mismatch"
+                        );
+                        let database = db.lock().unwrap();
+                        database.mark_torrent_error(&event.hash, error)?;
+                        database.blocklist(&metadata.release, "season_pack_identity_mismatch")?;
+                        drop(database);
+                        match torrents.remove(&event.hash, true) {
+                            Ok(_) => {}
+                            Err(remove_error) => tracing::warn!(
+                                hash = %event.hash,
+                                %remove_error,
+                                "failed to remove mismatched season pack"
+                            ),
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
             if let Some(torrent) = torrents
                 .list()
                 .into_iter()
@@ -11535,7 +11568,14 @@ async fn handle_torrent_event(
                             source = %source.display(),
                             "season pack rejected: files do not match the declared season"
                         );
-                        db.lock().unwrap().mark_torrent_error(&event.hash, error)?;
+                        let database = db.lock().unwrap();
+                        database.mark_torrent_error(&event.hash, error)?;
+                        // A completed pack whose files contradict its declared
+                        // season is a bad indexer identity, not a transient
+                        // download failure. Permanently block the infohash so
+                        // duplicate archive rows cannot requeue it every cycle.
+                        database.blocklist(&release, "season_pack_identity_mismatch")?;
+                        drop(database);
                         discard_completed_source(cfg, db, torrents, &event, error);
                         return Ok(false);
                     }

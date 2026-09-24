@@ -148,9 +148,27 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
             }
             Event::CData(text) if in_item => {
                 let value = String::from_utf8_lossy(&text).into_owned();
+                if current == "title" {
+                    title = value.clone();
+                }
                 if current == "description" {
                     description.push_str(&value);
                     description.push(' ');
+                }
+                if current == "size" {
+                    size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
+                }
+                if matches!(
+                    current.as_str(),
+                    "pubdate" | "published" | "updated" | "date"
+                ) {
+                    discovered_at = DateTime::parse_from_rfc2822(&value)
+                        .map(|value| value.with_timezone(&Utc))
+                        .or_else(|_| {
+                            DateTime::parse_from_rfc3339(&value)
+                                .map(|value| value.with_timezone(&Utc))
+                        })
+                        .unwrap_or(discovered_at);
                 }
                 if let Some(found) = magnet_in(&value) {
                     magnet = found;
@@ -1119,6 +1137,17 @@ mod tests {
             "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
         );
         let _ = reader.read_event().unwrap();
+    }
+
+    #[test]
+    fn parses_cdata_titles_before_a_truncated_item() {
+        let xml = r#"<rss><channel>
+            <item><title><![CDATA[Example.S01E01.1080p.ITA]]></title><link><![CDATA[magnet:?xt=urn:btih:0123456789012345678901234567890123456789]]></link></item>
+            <item><title><![CDATA[Truncated.S01E02]]></title><description><![CDATA[unfinished
+        </channel></rss>"#;
+        let releases = parse_feed_body(xml, "test").unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].title, "Example.S01E01.1080p.ITA");
     }
 
     #[test]
