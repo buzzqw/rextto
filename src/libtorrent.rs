@@ -623,7 +623,7 @@ impl LibtorrentClient {
             bail!("libtorrent ip filter not applied: {}", native_error(&error));
         }
         let rules = rules.max(0) as usize;
-        tracing::info!(rules, path = %path_display, "ip filter loaded");
+        tracing::info!(rules, path = %path_display, "IP filter loaded");
         Ok(rules)
     }
 
@@ -1005,6 +1005,7 @@ impl LibtorrentClient {
             .take(received)
             .map(|event| {
                 let hash = native_string(&event.hash).to_ascii_lowercase();
+                let name = native_string(&event.name);
                 let kind = match event.kind {
                     1 => "metadata_received",
                     2 => "torrent_finished",
@@ -1014,13 +1015,13 @@ impl LibtorrentClient {
                 };
                 if kind == "metadata_received" {
                     if let Err(error) = self.save_torrent_metadata(&hash) {
-                        tracing::warn!(hash=%hash, %error, "cannot persist torrent metadata");
+                        tracing::warn!(hash=%hash, name=%name, %error, "cannot persist torrent metadata");
                     }
                 }
                 TorrentEvent {
                     kind: kind.into(),
                     hash,
-                    name: native_string(&event.name),
+                    name,
                     save_path: native_string(&event.save_path),
                 }
             })
@@ -1501,12 +1502,20 @@ impl LibtorrentClient {
             self.control(hash, rextto_lt_remove, delete_files as i32)?;
         }
         let normalized = hash.to_ascii_lowercase();
-        // Il resume va rimosso: altrimenti al riavvio libtorrent ripristina il
-        // torrent e "riappare" in Scarico, annullando la rimozione.
+        let name = self
+            .torrents
+            .read()
+            .unwrap()
+            .get(&normalized)
+            .map(|torrent| torrent.name.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unnamed torrent".to_string());
+        // Remove resume data as well: otherwise libtorrent restores the torrent
+        // on restart and it reappears in Downloads, undoing the removal.
         let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.fastresume")));
         let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.torrent")));
         if let Err(error) = self.clear_seed_limit(&normalized) {
-            tracing::warn!(hash = %normalized, %error, "could not clear removed torrent seed limits");
+            tracing::warn!(hash = %normalized, name = %name, %error, "could not clear removed torrent seed limits");
         }
         Ok(self
             .torrents

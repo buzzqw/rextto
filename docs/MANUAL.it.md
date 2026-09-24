@@ -128,8 +128,11 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
 
 ## 9. Manutenzione
 
-- Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi,
-  importa dati legacy, riavvia il servizio.
+- Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi e
+  riavvia il servizio.
+- **Pulizia cestino** dalla toolbar **Manutenzione** — è forzata e rimuove subito
+  il contenuto selezionato. La pulizia avviata dal pannello **Trash** rispetta
+  invece il periodo di retention configurato.
 - **Duplicati video** — *Anteprima duplicati* e *Pulisci duplicati* trovano i
   file video chiaramente inferiori (risoluzione strettamente più bassa) rimasti
   accanto alla versione migliore nella stessa cartella — es. il vecchio 480p
@@ -152,7 +155,8 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
 - **Backup**: retention, schedulazione (manuale, ogni N ore o a un orario fisso
   giornaliero HH:MM), FTP (host/utente/percorso) con **Test FTP** (verifica
   connessione, percorso e upload di prova), copia su cartella cloud/sync, invio
-  Telegram, elenco backup.
+  Telegram, elenco backup. Lo snapshot contiene database e configurazione, non
+  i media né lo stato della sessione torrent.
 
 ## 10. Salute, Log, Grafici
 
@@ -164,7 +168,9 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   messaggio · campo: valore`, con parole chiave evidenziate (NAS, download,
   sorgenti, filtri, errori). Ogni ciclo stampa un **SOURCE REPORT** con l'esito
   di ogni sorgente, le decisioni dei filtri, e gli eventi di download (avvio,
-  metadati, spostamento su NAS, completamento).
+  metadati, spostamento su NAS, completamento). I messaggi torrent includono
+  sempre nome o titolo leggibile; l'hash è solo un campo tecnico per correlare
+  gli errori.
 - **Grafici** — sparkline CPU/RAM/download/upload/disco/RAM disk e consumo
   giornaliero.
 - **Attività** — eventi torrent recenti e download.
@@ -186,4 +192,6 @@ velocità media.
   tecnici); controlla le impostazioni *Rinomina* e la chiave TMDB.
 - **Il backup FTP fallisce** — usa *Test FTP*: indica il passo che fallisce
   (connessione, login, percorso remoto, upload, rimozione) e lo registra nel log.
+- **Import legacy** — è disponibile solo da CLI. Ferma prima la vecchia istanza e
+  usa `import-legacy.sh`: copia i database senza modificare la sorgente.
 - **Log** — vedi `data/rextto.log` (rotazione a 5 MB) o il viewer nella UI.

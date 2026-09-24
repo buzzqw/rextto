@@ -1,0 +1,51 @@
+name: Release Linux packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config libssl-dev \
+            libtorrent-rasterbar-dev curl
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-leptos
+        run: cargo install cargo-leptos --locked
+
+      - name: Build daemon and web UI
+        run: |
+          cargo build --release --locked
+          cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
+
+      - name: Package release
+        run: |
+          mkdir -p package/ui
+          cp target/release/rexttod package/rexttod
+          cp -a ui/target/site/. package/ui/
+          tar -C package -czf rextto-linux-x86_64.tar.gz rexttod ui
+          sha256sum rextto-linux-x86_64.tar.gz > rextto-linux-x86_64.tar.gz.sha256
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rextto-linux-x86_64.tar.gz
+            rextto-linux-x86_64.tar.gz.sha256

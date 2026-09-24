@@ -10,7 +10,7 @@ UI_BUNDLE="$ROOT/ui/target/site/pkg/ui.js"
 
 LEGACY_SERVICE="${REXTTO_LEGACY_SERVICE:-}"
 if [ -n "$LEGACY_SERVICE" ] && systemctl is-active --quiet "$LEGACY_SERVICE"; then
-    echo "Il servizio legacy '$LEGACY_SERVICE' e' attivo e occupa le stesse porte. Fermalo prima: sudo systemctl stop $LEGACY_SERVICE" >&2
+    echo "The legacy service '$LEGACY_SERVICE' is active and uses the same ports. Stop it first: sudo systemctl stop $LEGACY_SERVICE" >&2
     exit 1
 fi
 
@@ -25,7 +25,14 @@ fi
 
 # The repository unit uses __ROOT__ placeholders: materialise the real path.
 GENERATED_UNIT="$(mktemp)"
-sed -e "s#__ROOT__#$ROOT#g" -e "s#__USER__#$(id -un)#g" -e "s#__GROUP__#$(id -gn)#g" "$UNIT_SOURCE" > "$GENERATED_UNIT"
+sed \
+    -e "s#__ROOT__#$ROOT#g" \
+    -e "s#__BIN__#$BIN#g" \
+    -e "s#__DATA__#$ROOT/data#g" \
+    -e "s#__UI__#$ROOT/ui/target/site#g" \
+    -e "s#__USER__#$(id -un)#g" \
+    -e "s#__GROUP__#$(id -gn)#g" \
+    "$UNIT_SOURCE" > "$GENERATED_UNIT"
 sudo install -m 0644 "$GENERATED_UNIT" "$UNIT_TARGET"
 rm -f "$GENERATED_UNIT"
 sudo systemctl daemon-reload

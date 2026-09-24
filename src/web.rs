@@ -611,6 +611,21 @@ pub struct ComicCheckLinksInput {
 fn setup_marker(cfg: &Config) -> std::path::PathBuf {
     cfg.data_dir.join(".rextto-setup.json")
 }
+
+/// Returns the directory containing the built static UI.
+///
+/// Development keeps the historical `ui/target/site` default, while packaged
+/// installations point this at their immutable `/opt/rextto/ui` directory.
+fn ui_site_dir() -> PathBuf {
+    std::env::var_os("REXTTO_UI_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ui/target/site"))
+}
+
+fn ui_pkg_dir() -> PathBuf {
+    ui_site_dir().join("pkg")
+}
+
 fn setup_complete(cfg: &Config) -> bool {
     setup_marker(cfg).is_file()
 }
@@ -633,7 +648,7 @@ pub fn router(state: AppState) -> Router {
         .route("/magnet", get(magnet_handler))
         .route("/favicon.ico", get(favicon))
         .route("/pkg/ui_bg.wasm", get(wasm_alias))
-        .nest_service("/pkg", ServeDir::new("ui/target/site/pkg"))
+        .nest_service("/pkg", ServeDir::new(ui_pkg_dir()))
         .route("/api/auth", get(auth_status))
         .route("/api/i18n", get(i18n_list).post(i18n_set))
         .route("/api/i18n/language", post(i18n_language))
@@ -908,7 +923,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn index() -> Html<String> {
-    let bundle = FsPath::new("ui/target/site/pkg/ui.js");
+    let bundle = ui_pkg_dir().join("ui.js");
     if bundle.is_file() {
         return Html(
             r#"<!doctype html>
@@ -985,13 +1000,13 @@ const MAGNET_PAGE: &str = r#"<!doctype html>
 </body>
 </html>"#;
 async fn wasm_alias() -> Response {
-    match tokio::fs::read("ui/target/site/pkg/ui.wasm").await {
+    match tokio::fs::read(ui_pkg_dir().join("ui.wasm")).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/wasm")], bytes).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 async fn favicon() -> Response {
-    match tokio::fs::read("ui/target/site/favicon.ico").await {
+    match tokio::fs::read(ui_site_dir().join("favicon.ico")).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, "image/x-icon")], bytes).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -8550,7 +8565,12 @@ async fn remove_completed_torrents(
             }
             Ok(false) => skipped += 1,
             Err(error) => {
-                tracing::warn!(hash=%torrent.hash, %error, "completed torrent removal failed")
+                tracing::warn!(
+                    hash = %torrent.hash,
+                    name = %torrent.name,
+                    %error,
+                    "completed torrent removal failed"
+                )
             }
         }
     }
@@ -9848,14 +9868,16 @@ fn retry_storage_moves(
         let Some(retry) = retries.get(&hash).cloned() else {
             continue;
         };
+        let name = torrent_display_name(torrents, &hash);
         if retry.in_flight && now < retry.next_attempt {
             continue;
         }
         if retry.in_flight {
             tracing::warn!(
                 hash = %hash,
+                name = %name,
                 destination = %retry.destination.display(),
-                "storage move alert timed out; checking the move again"
+                "storage move wait timed out; checking the move again"
             );
             if let Some(retry) = retries.get_mut(&hash) {
                 retry.in_flight = false;
@@ -9871,6 +9893,7 @@ fn retry_storage_moves(
             }
             tracing::warn!(
                 hash = %hash,
+                name = %name,
                 destination = %retry.destination.display(),
                 "storage move retry limit reached; cooling down before another attempt"
             );
@@ -9935,7 +9958,13 @@ fn retry_storage_moves(
             }
             Err(error) => {
                 move_requests.remove(&hash);
-                tracing::warn!(hash = %hash, %error, "storage move retry failed synchronously");
+                tracing::warn!(
+                    hash = %hash,
+                    name = %torrent.name,
+                    destination = %destination.display(),
+                    %error,
+                    "storage move retry failed synchronously"
+                );
                 schedule_storage_move_retry(
                     retries,
                     &hash,
@@ -10219,14 +10248,23 @@ async fn torrent_event_worker(
                     match result {
                         Ok(()) => {
                             match notifier.notify_event("comic_completed", serde_json::json!({"hash": hash, "title": comic.title, "post_url": comic.post_url, "path": event.save_path})).await {
-                                Ok(()) => tracing::debug!(hash=%hash, "completion notification sent"),
-                                Err(error) => tracing::warn!(hash=%hash, %error, "completion notification failed"),
+                                Ok(()) => tracing::debug!(hash=%hash, title=%comic.title, "completion notification sent"),
+                                Err(error) => tracing::warn!(hash=%hash, title=%comic.title, %error, "completion notification failed"),
                             }
-                            tracing::info!("comic completed — «{}» · {}", comic.title, event.save_path);
+                            tracing::info!(
+                                "comic completed — «{}» · {}",
+                                comic.title,
+                                event.save_path
+                            );
                         }
                         Err(error) => {
                             let _ = notifier.notify_event("comic_error", serde_json::json!({"hash": hash, "title": comic.title, "error": error.to_string()})).await;
-                            tracing::error!(%error, hash=%event.hash, "comic torrent completion persistence failed");
+                            tracing::error!(
+                                %error,
+                                hash=%event.hash,
+                                title=%comic.title,
+                                "comic torrent completion persistence failed"
+                            );
                         }
                     }
                 }
@@ -10269,13 +10307,19 @@ async fn torrent_event_worker(
                             Ok(false) => {}
                             Err(remove_error) => tracing::warn!(
                                 hash = %hash,
+                                name = %event.name,
                                 %remove_error,
                                 "failed to detach torrent after completion error"
                             ),
                         }
                     }
                     let _ = notifier.notify_event("torrent_error", serde_json::json!({"hash": hash, "error": error.to_string(), "upgrade_restored": restored})).await;
-                    tracing::error!(%error, "torrent completion handling failed");
+                    tracing::error!(
+                        %error,
+                        hash=%hash,
+                        name=%event.name,
+                        "torrent completion handling failed"
+                    );
                     false
                 }
             };
@@ -10300,7 +10344,7 @@ async fn torrent_event_worker(
                     if let Ok(true) = torrents.remove(&event.hash, false) {
                         let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
                         tracing::info!(
-                            "completed torrent removed — file renamed into the archive: «{}»",
+                            "completed torrent removed: file renamed into the archive — «{}»",
                             event.name
                         );
                     }
@@ -10360,10 +10404,10 @@ async fn torrent_event_worker(
                     })).await;
                     match notification {
                         Ok(()) => {
-                            tracing::debug!(hash=%event.hash, event="torrent_completed", "completion notification sent")
+                            tracing::debug!(hash=%event.hash, event="torrent_completed", title=%title, "completion notification sent")
                         }
                         Err(error) => {
-                            tracing::warn!(hash=%event.hash, event="torrent_completed", %error, "completion notification failed")
+                            tracing::warn!(hash=%event.hash, event="torrent_completed", title=%title, %error, "completion notification failed")
                         }
                     }
                 }
@@ -10377,9 +10421,9 @@ async fn torrent_event_worker(
         }
         detach_error_torrents(&torrents, &db);
         detach_completed_archived_singles(&torrents, &db);
-        // Rimuove i completati che hanno terminato il seed (i pack archiviati
-        // sempre, gli altri con `auto_remove_completed`) prima che la seed
-        // policy li sposti su disco solo per cancellarli.
+        // Remove completed torrents that have finished seeding (archived packs
+        // always, other torrents with `auto_remove_completed`) before the seed
+        // policy moves them to disk only to delete them.
         remove_seeded_completed(&cfg, &torrents, &db, &post_seed_moves);
         // Enforce the seed policy only after handling this tick's events: with a
         // very low seed limit a just-finished torrent could otherwise be removed
@@ -10394,10 +10438,9 @@ async fn torrent_event_worker(
     }
 }
 
-/// Aggiorna il timer di stallo di un download. Come EXTTO: il timer si azzera
-/// appena arriva traffico o si vede anche un solo peer, perché un torrent con
-/// fonti non è "morto" anche se resta a 0 byte. Scade solo dopo `timeout` di
-/// assenza totale di peer e traffico.
+/// Updates a download's stall timer. As in EXTTO, reset it when traffic arrives
+/// or even one peer is visible: a torrent with sources is not "dead" at 0 bytes.
+/// It expires only after `timeout` with no peers and no traffic.
 fn stall_expired(
     entry: &mut (Instant, i64),
     now: Instant,
@@ -10415,11 +10458,22 @@ fn stall_expired(
     now.duration_since(entry.0) >= timeout
 }
 
-/// Rimuove un torrent fallito. I file parziali vengono cancellati solo se il
-/// download non era completato; per un torrent già completo/in seed non si tocca
-/// la libreria. Il resume viene comunque eliminato da `LibtorrentClient::remove`,
-/// così il torrent non risorge al riavvio.
+/// Removes a failed torrent. Partial files are deleted only when the download was
+/// incomplete; an already completed/seeding torrent's library is left untouched.
+/// `LibtorrentClient::remove` still deletes resume data so it cannot return after
+/// a restart.
+fn torrent_display_name(torrents: &LibtorrentClient, hash: &str) -> String {
+    torrents
+        .list()
+        .into_iter()
+        .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+        .map(|torrent| torrent.name)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "unnamed torrent".to_string())
+}
+
 fn remove_failed_torrent(torrents: &LibtorrentClient, hash: &str) -> bool {
+    let name = torrent_display_name(torrents, hash);
     let incomplete = torrents
         .list()
         .into_iter()
@@ -10429,15 +10483,15 @@ fn remove_failed_torrent(torrents: &LibtorrentClient, hash: &str) -> bool {
         });
     match torrents.remove(hash, incomplete) {
         Ok(true) => {
-            tracing::info!("failed download removed from the session");
+            tracing::info!(name = %name, "failed download removed from the session");
             true
         }
         Ok(false) => {
-            tracing::debug!(hash, "failed torrent already removed");
+            tracing::debug!(hash, name = %name, "failed torrent already removed");
             true
         }
         Err(error) => {
-            tracing::warn!(hash, %error, "failed torrent removal failed");
+            tracing::warn!(hash, name = %name, %error, "failed torrent removal failed");
             false
         }
     }
@@ -10465,11 +10519,12 @@ fn detach_error_torrents(torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>)
                 tracing::info!(
                     hash = %torrent.hash,
                     name = %torrent.name,
-                    "🧹 torrent fallito residuo dopo il riavvio rimosso dalla sessione (file conservati)"
+                    "🧹 leftover failed torrent removed after restart (files kept)"
                 );
             }
             Err(error) => tracing::warn!(
                 hash = %torrent.hash,
+                name = %torrent.name,
                 %error,
                 "failed to detach leftover error torrent"
             ),
@@ -10520,11 +10575,13 @@ fn detach_completed_archived_singles(torrents: &LibtorrentClient, db: &Arc<Mutex
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
                 tracing::info!(
                     hash = %torrent.hash,
+                    name = %torrent.name,
                     "detached completed single whose archived source is already gone"
                 );
             }
             Err(error) => tracing::warn!(
                 hash = %torrent.hash,
+                name = %torrent.name,
                 %error,
                 "failed to detach completed single after recovery"
             ),
@@ -10592,6 +10649,7 @@ async fn monitor_stalled(
             .mark_torrent_error(&torrent.hash, "stalled download");
         tracing::warn!(
             hash = %torrent.hash,
+            name = %torrent.name,
             title = %failed_title,
             progress = torrent.progress,
             stall_minutes,
@@ -10672,6 +10730,7 @@ async fn monitor_metadata(
                 .mark_torrent_error(&torrent.hash, "metadata timeout");
             tracing::warn!(
                 hash = %torrent.hash,
+                name = %torrent.name,
                 giveup_minutes,
                 "❌ DOWNLOAD FAILED — no metadata (dead magnet) within the give-up window"
             );
@@ -10684,13 +10743,13 @@ async fn monitor_metadata(
         } else if now.duration_since(retry_at) >= timeout {
             match torrents.reannounce(&torrent.hash) {
                 Ok(true) => {
-                    tracing::warn!(hash=%torrent.hash, "torrent metadata still unavailable; reannouncing")
+                    tracing::warn!(hash=%torrent.hash, name=%torrent.name, "torrent metadata still unavailable; reannouncing")
                 }
                 Ok(false) => {
-                    tracing::debug!(hash=%torrent.hash, "metadata reannounce unavailable in current mode")
+                    tracing::debug!(hash=%torrent.hash, name=%torrent.name, "metadata reannounce unavailable in current mode")
                 }
                 Err(error) => {
-                    tracing::debug!(hash=%torrent.hash, %error, "metadata reannounce failed")
+                    tracing::debug!(hash=%torrent.hash, name=%torrent.name, %error, "metadata reannounce failed")
                 }
             }
             wait_start.insert(torrent.hash, now);
@@ -10710,13 +10769,13 @@ fn needs_infinite_seed_resume(torrent: &crate::models::TorrentView) -> bool {
         && !torrent.auto_managed
 }
 
-/// I torrent completati non devono restare in sessione per sempre:
-/// - un season pack archiviato sul NAS esce appena il seeding è finito: la
-///   sorgente è ridondante (copia verificata via `processed_path`) e va rimossa;
-/// - con `auto_remove_completed` attivo, qualsiasi completato che ha raggiunto
-///   ratio/tempo esce dalla sessione.
-///   I file si cancellano solo se esiste una copia archiviata fuori dallo storage
-///   del torrent: nessun dato viene mai perso. Il seed infinito esplicito resta.
+/// Completed torrents must not remain in the session forever:
+/// - an archived season pack leaves when seeding ends because its source is
+///   redundant (the `processed_path` copy was verified);
+/// - with `auto_remove_completed`, any completed torrent leaves after its
+///   ratio/time limit is reached.
+///   Files are deleted only when an archived copy exists outside torrent storage,
+///   so no data is lost. An explicit infinite-seed override always remains.
 fn remove_seeded_completed(
     cfg: &Config,
     torrents: &LibtorrentClient,
@@ -10727,13 +10786,13 @@ fn remove_seeded_completed(
         if post_seed_moves.contains(&torrent.hash) {
             continue;
         }
-        // Seed infinito esplicito: il torrent deve restare in seed.
+        // Explicit infinite seeding: the torrent must remain seeding.
         if torrent.seed_ratio == 0.0 || torrent.seed_days == 0 {
             continue;
         }
-        // Deve essere davvero completo: un download in pausa a metà non va
-        // toccato, anche se ha già caricato qualcosa (ratio raggiunto) o è
-        // fermo da giorni. I pack archiviati al limite di seed sono a 100%.
+        // It must truly be complete: do not touch a half-finished paused download
+        // even if it has uploaded data (ratio reached) or has been idle for days.
+        // Packs archived at the seed limit are at 100%.
         let completed = torrent.progress >= 99.99
             || matches!(torrent.state.as_str(), "finished" | "seeding");
         if !completed {
@@ -10768,7 +10827,12 @@ fn remove_seeded_completed(
                 }
             }
             Ok(false) => {}
-            Err(error) => tracing::warn!(hash=%torrent.hash, %error, "seeded torrent removal failed"),
+            Err(error) => tracing::warn!(
+                hash=%torrent.hash,
+                name=%torrent.name,
+                %error,
+                "seeded torrent removal failed"
+            ),
         }
     }
 }
@@ -10903,7 +10967,7 @@ fn enforce_seed_policy(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::debug!(hash=%torrent.hash, %error, "resume for infinite seeding failed")
+                    tracing::debug!(hash=%torrent.hash, name=%torrent.name, %error, "resume for infinite seeding failed")
                 }
             }
         }
@@ -10954,10 +11018,10 @@ fn enforce_seed_policy(
                         tracing::info!("⏸️ Seeding done ({reason}) — pausing «{}»", torrent.name)
                     }
                     Ok(false) => {
-                        tracing::warn!(hash=%torrent.hash, "torrent seed limit could not be applied in current mode")
+                        tracing::warn!(hash=%torrent.hash, name=%torrent.name, "torrent seed limit could not be applied in current mode")
                     }
                     Err(error) => {
-                        tracing::warn!(hash=%torrent.hash, %error, "failed to stop torrent at seed limit")
+                        tracing::warn!(hash=%torrent.hash, name=%torrent.name, %error, "failed to stop torrent at seed limit")
                     }
                 }
             }
@@ -10979,6 +11043,7 @@ fn enforce_seed_policy(
                 if !completed_source_disposable(db, &torrent.hash, &torrent.save_path) {
                     tracing::warn!(
                         hash = %torrent.hash,
+                        name = %torrent.name,
                         "seed limit reached but archived copy is not verified; keeping torrent files"
                     );
                     continue;
@@ -10989,7 +11054,7 @@ fn enforce_seed_policy(
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        tracing::warn!(hash=%torrent.hash, %error, "failed to remove torrent at seed limit")
+                        tracing::warn!(hash=%torrent.hash, name=%torrent.name, %error, "failed to remove torrent at seed limit")
                     }
                 }
             }
@@ -11028,7 +11093,7 @@ fn post_seed_relocate(
         return false;
     }
     if let Err(error) = postprocess::validate_destination_from(current, &destination) {
-        tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation refused");
+        tracing::warn!(hash=%torrent.hash, name=%torrent.name, %error, "post-seeding relocation refused");
         return false;
     }
     clear_empty_destination(&destination, &torrent.name);
@@ -11036,6 +11101,7 @@ fn post_seed_relocate(
         Ok(true) => {
             tracing::debug!(
                 hash = %torrent.hash,
+                name = %torrent.name,
                 from = %current.display(),
                 to = %destination.display(),
                 size = %crate::logging::human_bytes_i64(torrent.total_size),
@@ -11055,11 +11121,11 @@ fn post_seed_relocate(
             true
         }
         Ok(false) => {
-            tracing::debug!(hash=%torrent.hash, "post-seeding relocation was not applied");
+            tracing::debug!(hash=%torrent.hash, name=%torrent.name, "post-seeding relocation was not applied");
             false
         }
         Err(error) => {
-            tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation failed");
+            tracing::warn!(hash=%torrent.hash, name=%torrent.name, %error, "post-seeding relocation failed");
             schedule_storage_move_retry(
                 storage_move_retries,
                 &torrent.hash,
@@ -11162,9 +11228,9 @@ fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &T
             destination.display()
         ),
         Ok(false) => {
-            tracing::warn!(hash=%event.hash, %reason, "RAM disk relocation was not applied")
+            tracing::warn!(hash=%event.hash, name=%event.name, %reason, "RAM disk relocation was not applied")
         }
-        Err(error) => tracing::warn!(hash=%event.hash, %error, "RAM disk relocation failed"),
+        Err(error) => tracing::warn!(hash=%event.hash, name=%event.name, %error, "RAM disk relocation failed"),
     }
 }
 
@@ -11216,16 +11282,18 @@ fn reconcile_ramdisk(
         moved += 1;
         match torrents.move_storage(&hash, &destination) {
             Ok(true) => tracing::info!(
+                name = %torrent.name,
                 "🔁 RAM disk reconciliation: moving a torrent to disk ({reason}) → {}",
                 destination.display()
             ),
             Ok(false) => tracing::warn!(
                 hash = %hash,
+                name = %torrent.name,
                 %reason,
                 "RAM disk reconciliation: relocation not applied"
             ),
             Err(error) => {
-                tracing::warn!(hash = %hash, %error, "RAM disk reconciliation failed")
+                tracing::warn!(hash = %hash, name = %torrent.name, %error, "RAM disk reconciliation failed")
             }
         }
     }
@@ -11265,13 +11333,13 @@ fn discard_completed_source(
     // a daemon restart.
     match torrents.remove(&event.hash, false) {
         Ok(true) => {
-            tracing::info!(hash = %event.hash, "rejected completed torrent removed from the session");
+            tracing::info!(hash = %event.hash, name = %event.name, "rejected completed torrent removed from the session");
         }
         Ok(false) => {
-            tracing::debug!(hash = %event.hash, "rejected torrent was already removed");
+            tracing::debug!(hash = %event.hash, name = %event.name, "rejected torrent was already removed");
         }
         Err(error) => {
-            tracing::warn!(hash = %event.hash, %error, "rejected torrent removal failed");
+            tracing::warn!(hash = %event.hash, name = %event.name, %error, "rejected torrent removal failed");
             // Never move/delete files while libtorrent may still be writing
             // them. The recovery pass will retry detaching this error row.
             return;
@@ -11294,6 +11362,7 @@ fn discard_completed_source(
                 ),
                 Err(error) => tracing::error!(
                     hash = %event.hash,
+                    name = %event.name,
                     source = %source.display(),
                     %error,
                     "could not move rejected completed download to trash"
@@ -11308,6 +11377,7 @@ fn discard_completed_source(
             if let Err(error) = result {
                 tracing::error!(
                     hash = %event.hash,
+                    name = %event.name,
                     source = %source.display(),
                     %error,
                     "could not remove rejected completed download"
@@ -11344,7 +11414,12 @@ async fn handle_torrent_event(
     );
     let metadata = { db.lock().unwrap().torrent_meta(&event.hash)? };
     let Some(metadata) = metadata else {
-        tracing::warn!(hash=%event.hash, kind=%event.kind, "torrent alert has no registered release metadata");
+        tracing::warn!(
+            hash=%event.hash,
+            kind=%event.kind,
+            name=%event.name,
+            "torrent alert has no registered release metadata"
+        );
         return Ok(false);
     };
     Ok(match event.kind.as_str() {
@@ -11372,7 +11447,7 @@ async fn handle_torrent_event(
             // completed release again, or the renamed file is looked up under
             // its original name and fails.
             if db.lock().unwrap().torrent_status(&event.hash)?.as_deref() == Some("completed") {
-                tracing::debug!(hash=%event.hash, "ignoring completion for already completed torrent");
+                tracing::debug!(hash=%event.hash, name=%event.name, "ignoring completion for already completed torrent");
                 return Ok(false);
             }
             let destination = postprocess::destination_for(&metadata.release, cfg);
@@ -11386,13 +11461,15 @@ async fn handle_torrent_event(
                         let error = "season pack filenames do not match declared season";
                         tracing::warn!(
                             hash = %event.hash,
+                            name = %event.name,
+                            title = %metadata.release.title,
                             declared_season = %metadata
                                 .release
                                 .season
                                 .map(|season| season.to_string())
                                 .unwrap_or_else(|| "unknown".into()),
                             source = %source.display(),
-                            "season pack rejected"
+                            "season pack rejected: files do not match the declared season"
                         );
                         db.lock().unwrap().mark_torrent_error(&event.hash, error)?;
                         discard_completed_source(cfg, db, torrents, &event, error);
@@ -11492,10 +11569,10 @@ async fn handle_torrent_event(
                     })).await;
                     match notification {
                         Ok(()) => {
-                            tracing::debug!(hash=%event.hash, event="season_pack_completed", "completion notification sent")
+                            tracing::debug!(hash=%event.hash, name=%event.name, event="season_pack_completed", "completion notification sent")
                         }
                         Err(error) => {
-                            tracing::warn!(hash=%event.hash, event="season_pack_completed", %error, "completion notification failed")
+                            tracing::warn!(hash=%event.hash, name=%event.name, event="season_pack_completed", %error, "completion notification failed")
                         }
                     }
                     // A pack is copied into the library, never moved out of its
@@ -11519,6 +11596,7 @@ async fn handle_torrent_event(
                     postprocess::validate_destination_from(current, &destination)?;
                     tracing::debug!(
                         hash = %event.hash,
+                        name = %event.name,
                         title = %metadata.release.title,
                         from = %current.display(),
                         to = %destination.display(),
@@ -11555,6 +11633,7 @@ async fn handle_torrent_event(
                             }
                             tracing::warn!(
                                 hash = %event.hash,
+                                name = %event.name,
                                 %error,
                                 "completed torrent storage move failed synchronously"
                             );
@@ -11627,7 +11706,7 @@ async fn handle_torrent_event(
             // committed. Do not run rename/copy/pack processing a second time.
             if db.lock().unwrap().torrent_status(&event.hash)?.as_deref() == Some("completed") {
                 move_requests.remove(&event.hash);
-                tracing::debug!(hash=%event.hash, "ignoring storage move for already completed torrent");
+                tracing::debug!(hash=%event.hash, name=%event.name, "ignoring storage move for already completed torrent");
                 return Ok(false);
             }
             let done = torrents
@@ -11639,7 +11718,7 @@ async fn handle_torrent_event(
                         || matches!(torrent.state.as_str(), "finished" | "seeding")
                 });
             if !done {
-                tracing::debug!(hash=%event.hash, "ignoring storage move before torrent completion");
+                tracing::debug!(hash=%event.hash, name=%event.name, "ignoring storage move before torrent completion");
                 return Ok(false);
             }
             move_requests.remove(&event.hash);
@@ -11696,8 +11775,10 @@ async fn complete_torrent(
         match resolved {
             Some(found) => {
                 tracing::info!(
-                    "completed file already renamed — using the archived file: {}",
-                    found.display()
+                    name = %event.name,
+                    title = %release.title,
+                    path = %found.display(),
+                    "completed file already renamed — using the archived file"
                 );
                 path = found;
                 recovered_existing = true;
@@ -11705,6 +11786,7 @@ async fn complete_torrent(
             None => {
                 tracing::warn!(
                     hash = %event.hash,
+                    name = %event.name,
                     path = %path.display(),
                     "completed torrent file not found (already moved or renamed); marking completion as failed"
                 );
@@ -11722,7 +11804,12 @@ async fn complete_torrent(
         .torrent_no_rename(&event.hash)
         .unwrap_or(false);
     let renamed = if no_rename {
-        tracing::info!("rename skipped — torrent marked no-rename: «{}»", event.name);
+        tracing::info!(
+            name = %event.name,
+            title = %release.title,
+            "rename skipped — torrent marked no-rename: «{}»",
+            event.name
+        );
         None
     } else if release.kind == "movie" {
         postprocess::rename_movie(&path, release, cfg, tmdb).await?
@@ -11806,7 +11893,12 @@ async fn complete_torrent(
             event,
             "release inferior to existing file",
         );
-        tracing::warn!(hash=%event.hash, "completed release discarded as inferior");
+        tracing::warn!(
+            hash=%event.hash,
+            name=%event.name,
+            title=%release.title,
+            "completed release discarded as inferior"
+        );
         return Ok(false);
     }
     db.lock().unwrap().mark_release_completed(
@@ -11841,11 +11933,11 @@ async fn complete_torrent(
         processed_path.display(),
         if renamed.is_some() { "" } else { " (kept original name)" }
     );
-    // Se il file è stato rinominato o collegato a un file già esistente, i dati
-    // del torrent non sono più al nome atteso (o sono un doppione) e libtorrent
-    // ripartirebbe da 0: banda sprecata su contenuto già archiviato. Il torrent
-    // va tolto. Vale per episodi singoli e film; i pack sono gestiti a parte
-    // (copia con sorgente conservata per il seeding).
+    // If the file was renamed or linked to an existing file, torrent data is no
+    // longer at the expected name (or is a duplicate), so libtorrent would start
+    // again from zero and waste bandwidth on archived content. Remove the torrent.
+    // This applies to single episodes and movies; packs are handled separately
+    // because their source copy is retained for seeding.
     if recovered_existing
         || (renamed.is_some() && !postprocess::same_path(processed_path, &path))
     {
@@ -11855,12 +11947,13 @@ async fn complete_torrent(
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
                 tracing::debug!(
                     hash = %event.hash,
+                    name = %event.name,
                     "torrent removed after rename: archived under a different path"
                 )
             }
-            Ok(false) => tracing::debug!(hash=%event.hash, "renamed torrent already removed"),
+            Ok(false) => tracing::debug!(hash=%event.hash, name=%event.name, "renamed torrent already removed"),
             Err(error) => {
-                tracing::warn!(hash=%event.hash, %error, "renamed torrent removal failed")
+                tracing::warn!(hash=%event.hash, name=%event.name, %error, "renamed torrent removal failed")
             }
         }
     }

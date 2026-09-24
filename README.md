@@ -34,7 +34,8 @@ disk).
 - **Series & movies** — TMDB metadata, posters, per-season monitoring, missing
   episode search, calendar, manual search.
 - **Torrents** — embedded libtorrent: queue, limits, tags, peers, trackers,
-  files, storage moves, seed policy, fastresume, VPN killswitch.
+  files, storage moves, seed policy, fastresume, VPN killswitch and restart
+  recovery.
 - **Comics** — GetComics monitoring and weekly packs.
 - **Integrations** — Trakt, Simkl, Jellyfin, Plex, Telegram/e-mail/webhook
   notifications.
@@ -43,32 +44,51 @@ disk).
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
+  They include databases and configuration, not media files or torrent state.
 
 ## Installation
 
-### Requirements
+### Install on a Linux server
 
-- Linux, Rust stable (`rustc`/`cargo`).
-- `libtorrent-rasterbar` development headers and a C++17 compiler (the bridge is
-  built by `build.rs`), plus OpenSSL headers.
-- Optional: `mediainfo` (technical tags for renaming), `mold` (faster linking),
-  FlareSolverr (Cloudflare-protected sources).
-- For the UI: `cargo-leptos` and the `wasm32-unknown-unknown` target.
+The official installer supports Debian, Ubuntu, Fedora, openSUSE and Arch Linux.
+It installs the compiler dependencies, builds and installs **libtorrent** from
+source, then downloads the latest Rextto release when one is available. Until a
+release asset exists it automatically builds the current GitHub source instead.
+It also creates the service account, systemd service, runtime directories and
+the empty databases on the first start. It never imports legacy data.
 
 ```bash
-sudo apt-get install -y build-essential libtorrent-rasterbar-dev libssl-dev mediainfo
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bash
 ```
 
-### 1. Build the daemon
+Run the same command again to check for updates and restart Rextto with the new
+version. Existing databases, configuration, downloads, archive paths and logs
+are kept in `/var/lib/rextto`; the program and web UI live in `/opt/rextto`.
+
+Useful overrides (optional):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | \
+  REXTTO_DATA_DIR=/srv/rextto REXTTO_PORT=5000 bash
+```
+
+The service is `rextto.service`:
+
+```bash
+sudo systemctl status rextto.service
+sudo journalctl -u rextto.service -f
+```
+
+### Build from a checkout (development)
+
+For contributors, install the build dependencies and build the daemon:
 
 ```bash
 cargo build --release
 # binary: target/release/rexttod
 ```
 
-### 2. Build the web UI
-
-The UI is a static bundle served by the daemon.
+The UI is a static bundle served by the daemon:
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -76,25 +96,20 @@ cargo install cargo-leptos
 cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
 ```
 
-### 3. First try in dry-run
-
-No real downloads start and nothing outside its own directory is touched.
+To run locally in dry-run mode, without real downloads:
 
 ```bash
 ./run-safe.sh          # serves http://127.0.0.1:5000 with REXTTO_ACTIVE=0
 ```
 
-### 4. Install as a service
-
-The script builds if needed, installs/refreshes the systemd unit and restarts it.
+The checkout service helper builds if needed, installs/refreshes the systemd
+unit and restarts it:
 
 ```bash
 ./start-rextto-service.sh
-sudo systemctl status rextto.service
-sudo journalctl -u rextto.service -f
 ```
 
-### 5. Check it
+### Check it
 
 ```bash
 curl --fail http://127.0.0.1:5000/api/status
@@ -146,6 +161,30 @@ Rextto works in cycles: search, evaluate, download, rename, archive.
 - **Download history** lists torrents that **left the session**, with the outcome
   (NAS path or the reason they were rejected).
 
+### Reading the logs
+
+The log follows the operation instead of using an info hash as the only readable
+identity:
+
+1. **CYCLE STARTED** identifies the mode and domain (`full`, Series, Movies or
+   Comics).
+2. **Step 1/2** and **Step 2/2** show how many sources and titles are being
+   analysed; unreachable sources include their name and reason.
+3. **Gap fill** separates archive hits from episodes that require an
+   online search.
+4. **Download started / Gap filled** shows title, episodes, source and
+   score. A skipped candidate includes the decision reason.
+5. **CYCLE REPORT** and **CYCLE DOWNLOADS** summarise duration, releases,
+   downloads, upgrades, gaps and errors.
+6. Torrent events explain metadata, NAS/RAM-disk moves, completion, renaming,
+   seeding, recovery and removal.
+
+Each line uses `date time LEVEL [component] message · key: value`. Torrent lines
+always include a readable name or title; the hash is only a technical correlation
+field for errors. `INFO` describes the normal path, `WARN`/`ERROR` explain the
+failed operation and affected resource, and `DEBUG` adds diagnostic detail when
+enabled.
+
 ### UI sections
 
 | Section | Purpose |
@@ -160,7 +199,7 @@ Rextto works in cycles: search, evaluate, download, rename, archive.
 | **Comics** | GetComics and weekly packs |
 | **Configuration** | Sources, libtorrent, scoring, renaming, paths, notifications |
 | **Integrations** | Trakt, Simkl, Jellyfin, Plex |
-| **Maintenance** | Backups, duplicates, scoring, legacy import, restart |
+| **Maintenance** | Backups, duplicates, scoring, restart |
 | **Health, Logs, Charts** | Diagnostics and monitoring |
 
 A detailed walkthrough of every screen is in the
@@ -200,7 +239,7 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 
 - Default data directory: `data/` (override with `REXTTO_DATA_DIR`).
 - Logs in `data/rextto.log`, with 5 MB rotation (active file + 3 backups),
-  streamed live in the UI.
+  streamed live in the UI. The viewer supports filtering and follow/pause.
 
 ### Environment variables
 
@@ -241,9 +280,9 @@ scripts/install-dev-clean-timer.sh
 
 ## Migrating from a legacy instance
 
-An optional importer reads a stopped legacy data directory (series, archive,
-comics databases) into Rextto's own `rextto_*.db` files. It never writes to the
-source directory.
+Legacy import is not a UI feature: use the CLI script with a **stopped** legacy
+data directory (series, archive and comics databases). It copies data into
+Rextto's `rextto_*.db` files and never writes to the source directory.
 
 ```bash
 ./import-legacy.sh /path/to/legacy /home/user/rextto/data

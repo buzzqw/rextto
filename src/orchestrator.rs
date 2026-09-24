@@ -60,9 +60,9 @@ pub async fn run_cycle_domain(
         .parse::<i64>()
         .unwrap_or(0);
     let now = Utc::now().timestamp();
-    // Un ciclo richiesto esplicitamente per i fumetti deve partire subito,
-    // senza attendere la scadenza dell'intervallo automatico: altrimenti il
-    // pulsante "Fumetti" non fa nulla quando il controllo non è ancora dovuto.
+    // An explicitly requested comics cycle must start immediately instead of
+    // waiting for the automatic interval; otherwise the Comics button appears
+    // to do nothing when the next scheduled check is not due yet.
     let comics_requested = domain == Some("comics");
     if domain != Some("series")
         && domain != Some("movies")
@@ -92,8 +92,8 @@ pub async fn run_cycle_domain(
         db.lock().unwrap().save_cycle(&stats)?;
         return Ok(stats);
     }
-    // Torrent tracciati ma non più presenti nella sessione: senza riconciliazione
-    // restano "in corso" e bloccano per sempre il ri-scaricamento.
+    // Tracked torrents that are no longer in the session would remain "active"
+    // without reconciliation and block re-downloads forever.
     {
         let live = torrents
             .list()
@@ -116,8 +116,8 @@ pub async fn run_cycle_domain(
         releases.retain(|release| release.kind == "movie");
     }
     archive.lock().unwrap().save_batch(&releases)?;
-    // "Visti nei feed": memorizza ogni release raccolta (anche quelle non
-    // monitorate) per la consultazione nell'archivio.
+    // "Seen from feed": record every collected release, including unmonitored
+    // titles, so it remains available for archive browsing.
     if let Err(error) = db.lock().unwrap().record_seen_batch(&releases) {
         tracing::debug!(%error, "feed seen recording failed");
     }
@@ -186,10 +186,10 @@ pub async fn run_cycle_domain(
         db.lock()
             .unwrap()
             .archive_gaps()?
-            // Rispetta la configurazione corrente: solo serie ancora presenti e
-            // attive, e stagioni monitorate (né disattivate né fuori `seasons`).
-            // Senza questo filtro il gap-fill cercava serie cancellate e stagioni
-            // che l'utente aveva disattivato.
+            // Respect the current configuration: only existing, enabled series
+            // and monitored seasons (neither disabled nor outside `seasons`).
+            // Without this filter gap fill would search deleted series and seasons
+            // that the user explicitly disabled.
             .into_iter()
             .filter(|(series, season, _)| cfg.find_series_match(series, Some(*season)).is_some())
             .collect::<Vec<_>>()
@@ -427,8 +427,8 @@ pub async fn run_cycle_domain(
                             && incumbent_wins(&release, score, old, &cfg.settings)
                     }
             }) {
-                // Scartato perché nella selezione c'è già una release uguale o
-                // migliore: è una deduplica routine, non un evento da INFO.
+                // Rejected because the selection already contains an equal or
+                // better release: routine deduplication, not an INFO event.
                 tracing::debug!(
                     target = %release_target(&release),
                     score,
@@ -512,8 +512,8 @@ pub async fn run_cycle_domain(
     }
     let empty_archive_index = crate::models::ArchiveQualityIndex::default();
     let mut archive_index_cache = std::collections::HashMap::new();
-    // Download attualmente nella sessione libtorrent: non riproporre un hash o
-    // un episodio già in corso, anche se il DB non lo sa.
+    // Downloads currently in the libtorrent session: do not propose an existing
+    // hash or episode again, even when the database has not recorded it yet.
     let live_downloads = {
         let mut live = crate::models::LiveDownloads::default();
         for torrent in torrents.list() {
@@ -528,9 +528,9 @@ pub async fn run_cycle_domain(
     let mut new_items = 0usize;
     let mut started_details = Vec::new();
     for mut release in best {
-        // I feed RSS che espongono solo il link `.torrent` (es. TorrentLeech)
-        // non hanno un magnet: scarica il file, ricava l'infohash e conserva il
-        // file per l'aggiunta (ai tracker privati serve per l'announce).
+        // RSS feeds that expose only a `.torrent` link (for example TorrentLeech)
+        // have no magnet: download the file, derive its infohash, and retain the
+        // file for adding it (private trackers require it for announcing).
         let mut torrent_file: Option<std::path::PathBuf> = None;
         if release.magnet.trim().is_empty() {
             if let Some(url) = release.torrent_url.clone() {
@@ -587,8 +587,8 @@ pub async fn run_cycle_domain(
                 }
             }
         }
-        // Indice dell'archivio (per serie, calcolato una volta per ciclo): la
-        // decisione considera anche i file reali su disco, non solo il DB.
+        // Archive index (per series, computed once per cycle): decisions also
+        // consider real files on disk, not only database rows.
         let archive_index = if release.kind == "series" {
             let key = release.series.clone().unwrap_or_default();
             let season = release.season;
@@ -741,9 +741,9 @@ pub async fn run_cycle_domain(
                 }
             }
         } else {
-            // Gli scarti "già presente / già in corso" (duplicato o episodio
-            // attivo nella sessione) sono routine: restano a debug per tenere
-            // leggibile il log del ciclo.
+            // "Already present / already active" rejections (duplicate or episode
+            // active in the session) are routine, so keep them at debug level to
+            // keep the cycle log readable.
             if matches!(approval_reason.as_str(), "duplicate" | "active_episode") {
                 tracing::debug!(
                     target = %release_target(&release),
@@ -770,7 +770,7 @@ pub async fn run_cycle_domain(
     let started = stats.last_started_at.unwrap_or_else(Utc::now);
     let elapsed = (Utc::now() - started).num_seconds().max(0);
     tracing::info!(
-        "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} (upgrade: {} · nuovi: {}) | gaps filled: {} | errors: {}",
+        "📊 CYCLE REPORT — duration {} — scraped: {} | candidates: {} | downloads started: {} (upgrade: {} · new: {}) | gaps filled: {} | errors: {}",
         human_duration(elapsed),
         stats.scraped,
         stats.candidates,
@@ -781,7 +781,7 @@ pub async fn run_cycle_domain(
         stats.errors
     );
     if started_details.is_empty() {
-        tracing::info!("📦 CYCLE DOWNLOADS — nessun download avviato");
+        tracing::info!("📦 CYCLE DOWNLOADS — no downloads started");
     } else {
         tracing::info!(
             "📦 CYCLE DOWNLOADS — {}",
@@ -860,8 +860,8 @@ fn human_duration(seconds: i64) -> String {
     }
 }
 
-/// Scarica un `.torrent`, ne ricava l'infohash v1 e lo salva nella state dir.
-/// Ritorna il magnet equivalente e il percorso del file (per l'aggiunta).
+/// Downloads a `.torrent`, derives its v1 infohash, and saves it in the state dir.
+/// Returns the equivalent magnet and the file path used when adding it.
 async fn resolve_torrent_url(
     engine: &Engine,
     cfg: &Config,
@@ -877,9 +877,9 @@ async fn resolve_torrent_url(
     Ok((format!("magnet:?xt=urn:btih:{hash}"), path))
 }
 
-/// True quando `incumbent` non deve essere sostituito da `candidate`: a parità
-/// di punteggio vince il REMUX (versione a risoluzione piena), in particolare
-/// quando è il remux dell'episodio già selezionato/scaricato.
+/// True when `incumbent` must not be replaced by `candidate`: at equal scores a
+/// REMUX (full-resolution version) wins, especially when it is the remux of an
+/// episode that was already selected or downloaded.
 fn incumbent_wins(
     candidate: &Release,
     candidate_score: i64,
@@ -928,8 +928,8 @@ async fn refresh_series_metadata(cfg: &Config, db: &Arc<Mutex<Database>>) {
             .unwrap()
             .series_metadata_stale(&series.name, 24)
             .unwrap_or(true);
-        // Lo stato TMDB va recuperato anche se i metadati stagionali sono
-        // recenti ma lo stato non è mai stato salvato (prima volta).
+        // Fetch the TMDB status even when season metadata is recent if the status
+        // has never been persisted (the first refresh).
         let needs_status = !known_statuses.contains_key(&series.name);
         if !stale && !needs_status {
             continue;
@@ -959,7 +959,7 @@ async fn refresh_series_metadata(cfg: &Config, db: &Arc<Mutex<Database>>) {
                 }
             }
         }
-        // Stato TMDB ("Ended"/"Returning Series") per il badge nell'elenco serie.
+        // Persist TMDB status ("Ended"/"Returning Series") for the series-list badge.
         if let Ok(Some(info)) = tmdb.series_info(&series.name, Some(&tmdb_id)).await {
             let status = info
                 .get("status")

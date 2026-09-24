@@ -15,7 +15,7 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-/// Formatter che scrive i timestamp in ora locale (non UTC).
+/// Formatter that writes timestamps in local time (not UTC).
 pub struct LocalTime;
 
 /// Human-readable byte size, e.g. `1.4 GB` / `742.3 MB` / `12.0 KB`.
@@ -77,7 +77,8 @@ pub fn human_rate(bytes_per_second: i64) -> String {
 /// Per-source outcome accumulated during a scrape cycle. Sources are RSS/HTML
 /// feeds, Torznab indexers and web search engines; the engine drains these at
 /// the end of a cycle to print a single "source report" instead of flooding the
-/// log with one line per attempt.
+/// log with one line per attempt. Torrent lifecycle messages separately carry a
+/// readable name/title; hashes remain technical correlation fields only.
 #[derive(Default, Clone)]
 pub struct SourceStat {
     pub ok: usize,
@@ -139,7 +140,7 @@ pub fn take_source_stats() -> Vec<(String, String, SourceStat)> {
         .collect()
 }
 
-/// Event formatter that produces one aligned, explicit line per log record:
+/// Event formatter that produces one aligned, explicit English line per record:
 ///
 /// ```text
 /// 2026-09-23 12:00:00  INFO [engine] 🔎 Step 1/2: scanning 3 sources (HTML/RSS feeds)

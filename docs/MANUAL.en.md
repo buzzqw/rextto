@@ -124,8 +124,10 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
 
 ## 9. Maintenance
 
-- Backup now, clean trash, rescore, scan archives, import legacy data, restart
-  the service.
+- Backup now, clean trash, rescore, scan archives and restart the service.
+- **Trash cleanup** from the **Maintenance** toolbar is forced: it removes the
+  selected trash content immediately. Cleanup started from the **Trash** panel
+  respects the configured retention period.
 - **Video duplicates** — *Preview duplicates* and *Clean duplicates* find video
   files clearly inferior (strictly lower resolution) left next to the best
   version in the same folder, e.g. an old 480p next to the new 1080p, and move
@@ -146,6 +148,8 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
 - **Backups**: retention, schedule (manual, every N hours or a fixed daily
   HH:MM), FTP host/user/path + **Test FTP** (checks connection, path and a probe
   upload), cloud/sync folder copy, Telegram delivery, list of available backups.
+  A snapshot contains the databases and configuration; media files and torrent
+  session state are not included.
 
 ## 10. Health, Logs, Charts
 
@@ -157,7 +161,8 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
   message · key: value`, with highlighted keywords (NAS, download, sources,
   filters, errors). Every cycle prints a **SOURCE REPORT** with each source's
   outcome, the filter decisions, and the download events (start, metadata,
-  NAS move, completion).
+  NAS move, completion). Torrent messages always include the readable name or
+  title; the hash is only a technical correlation field for errors.
 - **Charts** — CPU/RAM/download/upload/disk/ram-disk sparklines and daily
   consumption.
 - **Activity** — recent torrent events and downloads.
@@ -177,4 +182,6 @@ test. Completion notifications include size, download time and average speed.
   check *Rename* settings and the TMDB key.
 - **FTP backup fails** — use *Test FTP*: it reports the failing step (connection,
   login, remote path, upload, delete) and logs it.
+- **Legacy import** — this is a CLI-only operation. Stop the old instance first
+  and run `import-legacy.sh`; it copies databases without modifying the source.
 - **Logs** — see `data/rextto.log` (rotated at 5 MB) or the in-app log viewer.

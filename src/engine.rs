@@ -104,7 +104,7 @@ impl Engine {
                     match &result {
                         Ok(items) => {
                             crate::logging::source_ok("feed", &feed, items.len());
-                            tracing::debug!(feed = %feed, items = items.len(), "rss feed analyzed")
+                            tracing::debug!(feed = %feed, items = items.len(), "RSS feed analyzed")
                         }
                         Err(error) => {
                             let message = crate::utils::redact_url_secrets(&error.to_string());
@@ -130,7 +130,7 @@ impl Engine {
             match joined {
                 Ok(Ok(items)) => all.extend(items),
                 Ok(Err(_)) => {}
-                Err(error) => tracing::warn!(%error, "rss feed task failed"),
+                Err(error) => tracing::warn!(%error, "RSS feed task failed"),
             }
             schedule_feed(&mut feed_set, &mut feed_iter);
         }
@@ -271,9 +271,9 @@ impl Engine {
                 if compatible > 0 {
                     targets_with_hits += 1;
                     step2_usable += compatible;
-                    // Per-target detail: utile solo in diagnosi. Il ciclo riporta
-                    // già il totale in "Step 2/2 completato".
-                    tracing::debug!(query = %query, compatible, "🔎 release compatibili");
+                    // Per-target detail is diagnostic only. The cycle already
+                    // reports the total in "Step 2/2 complete".
+                    tracing::debug!(query = %query, compatible, "🔎 compatible releases");
                 } else {
                     tracing::debug!(query = %query, found = items.len(), "🔎 search: no matching releases");
                 }
@@ -282,7 +282,7 @@ impl Engine {
             schedule(&mut set, &mut iter);
         }
         tracing::info!(
-            "🔎 Step 2/2 completato: {targets_done} target analizzati · {targets_with_hits} con release compatibili · {step2_usable} release compatibili"
+            "🔎 Step 2/2 complete: {targets_done} targets analyzed · {targets_with_hits} with compatible releases · {step2_usable} compatible releases"
         );
         let engine_failures = websearch::take_engine_failures();
         if !engine_failures.is_empty() {
@@ -291,7 +291,7 @@ impl Engine {
                 .map(|(engine, count)| format!("{engine} ({count})"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            tracing::warn!("⚠️ Unreachable web engines this cycle: {detail}");
+            tracing::warn!("⚠️ Web engines unreachable in this cycle: {detail}");
         }
         let mut seen = std::collections::HashSet::new();
         let mut kept = Vec::with_capacity(all.len());
@@ -510,9 +510,9 @@ fn print_source_report() {
     if stats.is_empty() {
         return;
     }
-    // Report dettagliato per sorgente: utile in diagnosi, ma sono decine di
-    // righe per ciclo. Il riepilogo ("Sources: ..." e i warning sugli engine
-    // irraggiungibili) resta a INFO/WARN.
+    // Detailed per-source reporting is useful for diagnostics, but can produce
+    // dozens of lines per cycle. The summary ("Sources: ..." and unreachable
+    // engine warnings) remains at INFO/WARN level.
     tracing::debug!("📡 SOURCE REPORT — outcomes of every source in this cycle");
     for (kind, name, stat) in stats {
         if stat.fail == 0 {

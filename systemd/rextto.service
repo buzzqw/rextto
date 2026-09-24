@@ -8,13 +8,13 @@ Type=simple
 User=__USER__
 Group=__GROUP__
 WorkingDirectory=__ROOT__
-ExecStart=__ROOT__/target/release/rexttod
+ExecStart=__BIN__ --config __DATA__/rextto.json
 Restart=on-failure
 RestartSec=10
-Environment=REXTTO_DATA_DIR=__ROOT__/data
+Environment=REXTTO_DATA_DIR=__DATA__
+Environment=REXTTO_UI_DIR=__UI__
 Environment=REXTTO_LISTEN=0.0.0.0:5000
 Environment=REXTTO_ENGINE_LISTEN=127.0.0.1:8889
-Environment=REXTTO_IMPORT_SOURCE=/path/to/legacy
 Environment=REXTTO_ACTIVE=1
 Environment=REXTTO_DRY_RUN=0
 Environment=REXTTO_LIBTORRENT=1

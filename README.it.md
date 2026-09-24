@@ -33,7 +33,8 @@ o disco locale).
 - **Serie e film** — metadati TMDB, locandine, monitoraggio per stagione, ricerca
   episodi mancanti, calendario, ricerca manuale.
 - **Torrent** — libtorrent embedded: coda, limiti, tag, peer, tracker, file,
-  spostamento storage, politica di seeding, fastresume, killswitch VPN.
+  spostamento storage, politica di seeding, fastresume, killswitch VPN e recupero
+  dopo riavvio.
 - **Fumetti** — monitoraggio GetComics e weekly pack.
 - **Integrazioni** — Trakt, Simkl, Jellyfin, Plex, notifiche Telegram/e-mail/webhook.
 - **UI web** — single-page responsive, tema chiaro/scuro, **italiano e inglese**,
@@ -41,32 +42,51 @@ o disco locale).
 - **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo,
   consultabile anche per ciò che non è monitorato.
 - **Backup** — manuali o programmati (locale, FTP, cartella cloud, Telegram).
+  Salvano database e configurazione, non i media né lo stato torrent.
 
 ## Installazione
 
-### Requisiti
+### Installa su un server Linux
 
-- Linux, Rust stable (`rustc`/`cargo`).
-- Header di sviluppo di `libtorrent-rasterbar` e compilatore C++17 (il bridge è
-  compilato da `build.rs`), più gli header OpenSSL.
-- Opzionali: `mediainfo` (tag tecnici per la rinomina), `mold` (link più rapido),
-  FlareSolverr (sorgenti protette da Cloudflare).
-- Per la UI: `cargo-leptos` e il target `wasm32-unknown-unknown`.
+L'installer ufficiale supporta Debian, Ubuntu, Fedora, openSUSE e Arch Linux.
+Installa le dipendenze, compila e installa **libtorrent** dai sorgenti, poi
+scarica l'ultima build di Rextto quando disponibile. Finché non esiste una
+release precompilata, compila automaticamente il sorgente corrente da GitHub.
+Crea anche l'utente di servizio, il servizio systemd, le directory runtime e i
+database vuoti al primo avvio. Non importa dati legacy.
 
 ```bash
-sudo apt-get install -y build-essential libtorrent-rasterbar-dev libssl-dev mediainfo
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bash
 ```
 
-### 1. Compila il demone
+Esegui lo stesso comando una seconda volta per cercare aggiornamenti e riavviare
+Rextto con la nuova versione. Database, configurazione, download, archivi e log
+restano in `/var/lib/rextto`; programma e UI sono in `/opt/rextto`.
+
+Variabili opzionali:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | \
+  REXTTO_DATA_DIR=/srv/rextto REXTTO_PORT=5000 bash
+```
+
+Il servizio si chiama `rextto.service`:
+
+```bash
+sudo systemctl status rextto.service
+sudo journalctl -u rextto.service -f
+```
+
+### Compila da un checkout (sviluppo)
+
+Per gli sviluppatori, installa le dipendenze di compilazione e compila il demone:
 
 ```bash
 cargo build --release
 # binario: target/release/rexttod
 ```
 
-### 2. Compila la UI web
-
-La UI è un bundle statico servito dal demone.
+La UI è un bundle statico servito dal demone:
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -74,25 +94,20 @@ cargo install cargo-leptos
 cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
 ```
 
-### 3. Prima prova in dry-run
-
-Non parte nessun download reale e non tocca file fuori dalla propria directory.
+Per una prova locale in modalità dry-run, senza download reali:
 
 ```bash
 ./run-safe.sh          # avvia su http://127.0.0.1:5000 con REXTTO_ACTIVE=0
 ```
 
-### 4. Installa come servizio
-
-Lo script compila se serve, installa/aggiorna l'unità systemd e riavvia.
+L'helper del checkout compila se serve, installa/aggiorna l'unità systemd e
+riavvia il servizio:
 
 ```bash
 ./start-rextto-service.sh
-sudo systemctl status rextto.service
-sudo journalctl -u rextto.service -f
 ```
 
-### 5. Verifica
+### Verifica
 
 ```bash
 curl --fail http://127.0.0.1:5000/api/status
@@ -146,6 +161,30 @@ Rextto lavora a cicli: cerca, valuta, scarica, rinomina e archivia.
 - In **Storico download** finiscono i torrent **usciti dalla sessione**, con esito
   (NAS o motivo dell'eventuale scarto).
 
+### Leggere i log
+
+Il log segue sempre il percorso dell'operazione, non mostra l'hash come unica
+identità leggibile:
+
+1. **CYCLE STARTED** — indica la modalità e il dominio (`full`, Serie, Film o
+   Fumetti).
+2. **Step 1/2** e **Step 2/2** — indicano quante sorgenti e quanti titoli vengono
+   analizzati; eventuali sorgenti irraggiungibili riportano nome e motivo.
+3. **Gap fill** — distingue ciò che è stato trovato nell'archivio da ciò
+   che deve essere cercato online.
+4. **Download started / Gap filled** — mostra titolo, episodi, sorgente e
+   punteggio. Se un candidato viene saltato, il log indica motivo e decisione.
+5. **CYCLE REPORT** e **CYCLE DOWNLOADS** — riassumono durata, release raccolte,
+   download, upgrade, lacune ed errori.
+6. Gli eventi torrent spiegano metadati ricevuti, spostamenti su NAS o dal RAM
+   disk, completamento, rinomina, seeding, recovery e rimozione.
+
+Le righe hanno formato `data ora LIVELLO [componente] messaggio · campo: valore`.
+Nome o titolo sono sempre presenti nei messaggi torrent; l'hash resta soltanto un
+campo tecnico per correlare un errore. `INFO` mostra il percorso normale, `WARN`/
+`ERROR` spiegano cosa non è riuscito e quale risorsa è coinvolta, `DEBUG` aggiunge
+i dettagli diagnostici quando è abilitato.
+
 ### Le sezioni della UI
 
 | Sezione | A cosa serve |
@@ -160,7 +199,7 @@ Rextto lavora a cicli: cerca, valuta, scarica, rinomina e archivia.
 | **Fumetti** | GetComics e weekly pack |
 | **Configurazione** | Sorgenti, libtorrent, punteggi, rinomina, percorsi, notifiche |
 | **Integrazioni** | Trakt, Simkl, Jellyfin, Plex |
-| **Manutenzione** | Backup, duplicati, scoring, import legacy, riavvio |
+| **Manutenzione** | Backup, duplicati, scoring, riavvio |
 | **Salute / Log / Grafici** | Diagnostica e monitoraggio |
 
 La guida dettagliata di ogni schermata è nel
@@ -200,7 +239,7 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 
 - Data directory di default: `data/` (modificabile con `REXTTO_DATA_DIR`).
 - Log in `data/rextto.log`, con rotazione a 5 MB (file attivo + 3 backup),
-  consultabili in streaming dalla UI.
+  consultabili in streaming dalla UI. Il viewer permette filtro e follow/pause.
 
 ### Variabili d'ambiente
 
@@ -240,9 +279,9 @@ scripts/install-dev-clean-timer.sh
 
 ## Migrazione da un'istanza precedente
 
-Un importer opzionale legge una data directory storica ferma (database serie,
-archivio, fumetti) e la copia nei file `rextto_*.db`. Non scrive mai nella
-directory sorgente.
+L'importazione di dati legacy non è una funzione della UI: usa lo script CLI su
+una data directory storica **ferma** (database serie, archivio, fumetti). Lo script
+copia i dati nei file `rextto_*.db` e non scrive mai nella directory sorgente.
 
 ```bash
 ./import-legacy.sh /percorso/legacy /home/user/rextto/data
