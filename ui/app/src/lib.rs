@@ -8073,13 +8073,30 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
         on_open.forget();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
-                let Some(line) = event.data().as_string() else {
+                let Some(data) = event.data().as_string() else {
+                    return;
+                };
+                let Ok(message) = serde_json::from_str::<Value>(&data) else {
+                    return;
+                };
+                if let Some(snapshot) = message.get("snapshot").and_then(Value::as_array) {
+                    lines.set(
+                        snapshot
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect(),
+                    );
+                    loading.set(false);
+                    return;
+                }
+                let Some(line) = message.get("line").and_then(Value::as_str) else {
                     return;
                 };
                 loading.set(false);
                 let cap = limit.get().parse::<usize>().unwrap_or(400).clamp(50, 5000);
                 lines.update(|current| {
-                    current.push(line);
+                    current.push(line.to_owned());
                     if current.len() > cap {
                         let drop = current.len() - cap;
                         current.drain(0..drop);

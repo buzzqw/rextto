@@ -1322,11 +1322,18 @@ async fn logs_stream(
         if let Ok(contents) = tokio::fs::read_to_string(&path).await {
             let lines: Vec<&str> = contents.lines().collect();
             let start = lines.len().saturating_sub(limit);
-            for (offset, line) in lines[start..].iter().enumerate() {
-                yield Ok::<Event, Infallible>(
-                    Event::default().id((start + offset).to_string()).data(*line),
-                );
-            }
+            // Invia lo snapshot iniziale come un singolo evento: un evento per
+            // riga costringe il frontend a rifiltrare e ridisegnare tutto il log
+            // centinaia di volte prima che la schermata sia pronta.
+            let snapshot = lines[start..]
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>();
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .id(lines.len().to_string())
+                    .data(serde_json::json!({"snapshot": snapshot}).to_string()),
+            );
             sent = lines.len();
         }
         loop {
@@ -1340,7 +1347,9 @@ async fn logs_stream(
             }
             for (offset, line) in lines.iter().enumerate().skip(sent) {
                 yield Ok::<Event, Infallible>(
-                    Event::default().id(offset.to_string()).data(*line),
+                    Event::default()
+                        .id(offset.to_string())
+                        .data(serde_json::json!({"line": line}).to_string()),
                 );
             }
             sent = lines.len();
