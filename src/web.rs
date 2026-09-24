@@ -7095,12 +7095,10 @@ async fn add_archive_entry(
             &input.source
         },
     ) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":"release non riconosciuta"})),
-        );
+        // Titolo che il parser non riconosce: l'utente vuole comunque scaricarlo.
+        return add_raw_magnet(&s, &input.magnet).await;
     };
-    add_release(&s, release)
+    add_release(&s, release).await
 }
 async fn delete_archive_entry(
     State(s): State<AppState>,
@@ -7164,11 +7162,15 @@ async fn batch_archive_download(
                 &item.source
             },
         ) else {
-            rejected
-                .push(serde_json::json!({"title":item.title,"reason":"release non riconosciuta"}));
+            let (status, _) = add_raw_magnet(&s, &item.magnet).await;
+            if status.is_success() || status == StatusCode::ACCEPTED {
+                accepted += 1;
+            } else {
+                rejected.push(serde_json::json!({"title":item.title,"status":status.as_u16()}));
+            }
             continue;
         };
-        let (status, _) = add_release(&s, release);
+        let (status, _) = add_release(&s, release).await;
         if status.is_success() || status == StatusCode::ACCEPTED {
             accepted += 1;
         } else {
@@ -8005,111 +8007,49 @@ async fn add_search_result(
     State(s): State<AppState>,
     Json(input): Json<SearchAddInput>,
 ) -> impl IntoResponse {
-    add_release(&s, input.release)
+    add_release(&s, input.release).await
 }
-fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_json::Value>) {
+/// Accoda manualmente una release (Archivio, ricerca). Nessun controllo di
+/// monitoraggio, qualità o lingua: l'utente ha chiesto esplicitamente quel
+/// contenuto. Supporta sia magnet sia URL `.torrent` (Jackett/Prowlarr).
+async fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_json::Value>) {
     if !setup_complete(&s.cfg) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"ok":false,"error":"complete the initial setup first"})),
         );
     }
-    if !s.cfg.release_allowed(&release) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"ok":false,"error":"release esclusa dai filtri globali"})),
-        );
-    }
-    let approved = if release.kind == "series" {
-        let Some(series) = release
-            .series
-            .as_deref()
-            .and_then(|name| s.cfg.find_series_match(name, release.season))
-        else {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"ok":false,"error":"serie non monitorata"})),
-            );
-        };
-        if !Config::series_release_allowed(series, &release.quality, &release.title) {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(
-                    serde_json::json!({"ok":false,"error":"release non compatibile con la configurazione"}),
-                ),
-            );
-        }
-        release.series = Some(series.name.clone());
-        let resolved_archive = s.cfg.resolve_archive_path(series);
-        let archive_index = crate::cleaner::index_archive(
-            &series.name,
-            resolved_archive.as_deref().unwrap_or(FsPath::new("")),
-            &s.cfg.settings,
-        );
-        let mut live = crate::models::LiveDownloads::default();
-        for torrent in s.torrents.list() {
-            live.hashes.insert(torrent.hash.to_ascii_lowercase());
-            if let Some(key) = crate::parser::parse_episode_key(&torrent.name) {
-                live.episodes.insert(key);
+    let source = release.magnet.trim().to_string();
+    if is_torrent_url(&source) {
+        return match download_and_add(s, &source).await {
+            Ok(Some(hash)) => {
+                // Registra sotto l'hash reale così il post-processing ha i metadati.
+                release.magnet = format!("magnet:?xt=urn:btih:{hash}");
+                match s.db.lock().unwrap().register_torrent(&release) {
+                    Ok(()) => {
+                        let _ = s.db.lock().unwrap().set_torrent_reason(&hash, "manual");
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({"ok":true,"title":release.title})),
+                        )
+                    }
+                    Err(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+                    ),
+                }
             }
-        }
-        let context = crate::models::ApprovalContext {
-            archive: archive_index,
-            live,
+            Ok(None) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
+            ),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok":false,"error":error})),
+            ),
         };
-        s.db.lock().unwrap().check_series_manual_scored(
-            &release,
-            release.quality.score_with_settings(&s.cfg.settings),
-            s.cfg.upgrade_min_score_diff,
-            &context,
-        )
-    } else {
-        let Some(movie) = s
-            .cfg
-            .find_movie_match_manual(&release.title, release.year)
-        else {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("film non monitorato: nessun film in libreria corrisponde a «{}»", release.title)
-                })),
-            );
-        };
-        if !Config::quality_allowed(
-            &release.quality,
-            &movie.quality,
-            &movie.language,
-            &movie.subtitle,
-        ) {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(
-                    serde_json::json!({"ok":false,"error":"release non compatibile con la configurazione"}),
-                ),
-            );
-        }
-        release.title = movie.name.clone();
-        release.year = movie.year.parse::<i64>().ok().or(release.year);
-        s.db.lock().unwrap().check_movie_scored(
-            &release,
-            release.quality.score_with_settings(&s.cfg.settings),
-            s.cfg.upgrade_min_score_diff,
-        )
-    };
-    let Ok((approved, reason)) = approved else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":"database check failed"})),
-        );
-    };
-    if !approved {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"ok":false,"error":reason})),
-        );
     }
-    match s.torrents.add(&release.magnet, &s.cfg) {
+    match s.torrents.add(&source, &s.cfg) {
         Ok(true) => match s.db.lock().unwrap().register_torrent(&release) {
             Ok(()) => {
                 if let Some(hash) = crate::utils::magnet_hash(&release.magnet) {
@@ -8129,22 +8069,85 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
                 Json(serde_json::json!({"ok":false,"error":error.to_string()})),
             ),
         },
-        Ok(false) => {
-            let _ = s.db.lock().unwrap().rollback_release(&release);
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
-            )
-        }
-        Err(error) => {
-            let _ = s.db.lock().unwrap().rollback_release(&release);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-            )
-        }
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
     }
 }
+
+fn is_torrent_url(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// Scarica un `.torrent` da un URL e lo aggiunge a libtorrent, restituendo
+/// l'infohash (o `None` se era un duplicato). Un file temporaneo evita di
+/// passare i byte al bridge nativo.
+async fn download_and_add(s: &AppState, url: &str) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("rextto/0.1")
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    let path = s
+        .cfg
+        .state_dir
+        .join(format!(".manual-{}.torrent", uuid::Uuid::new_v4()));
+    std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    let result = s.torrents.add_torrent_file_with_path(&path, &s.cfg, None);
+    let _ = std::fs::remove_file(&path);
+    result.map_err(|error| error.to_string())
+}
+
+/// Aggiunge una sorgente grezza (magnet o URL `.torrent`) senza interpretare il
+/// titolo: usata quando il parser non riconosce una release scelta a mano.
+async fn add_raw_magnet(s: &AppState, source: &str) -> (StatusCode, Json<serde_json::Value>) {
+    if !setup_complete(&s.cfg) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"complete the initial setup first"})),
+        );
+    }
+    let source = source.trim();
+    if is_torrent_url(source) {
+        return match download_and_add(s, source).await {
+            Ok(Some(_)) => (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true}))),
+            Ok(None) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
+            ),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok":false,"error":error})),
+            ),
+        };
+    }
+    match s.torrents.add(source, &s.cfg) {
+        Ok(true) => (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true}))),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
 async fn pause_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
     torrent_action(s.torrents.pause(&hash))
 }

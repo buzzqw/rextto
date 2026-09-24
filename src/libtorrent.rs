@@ -924,6 +924,23 @@ impl LibtorrentClient {
         }
     }
 
+    /// Come [`Self::add_file_with_path`], ma restituisce l'infohash del torrent
+    /// aggiunto: serve all'accoda manuale di un URL `.torrent` (Jackett/Prowlarr)
+    /// per registrare i metadati sotto l'hash reale.
+    pub fn add_torrent_file_with_path(
+        &self,
+        torrent_path: &std::path::Path,
+        cfg: &Config,
+        preferred_path: Option<&std::path::Path>,
+    ) -> Result<Option<String>> {
+        let save_path = preferred_path
+            .filter(|path| path.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| Self::preferred_download_path(cfg));
+        fs::create_dir_all(&save_path)?;
+        self.add_torrent_file(torrent_path, &save_path)
+    }
+
     pub fn list(&self) -> Vec<TorrentView> {
         let Some(session) = &self.session else {
             return self.torrents.read().unwrap().values().cloned().collect();
