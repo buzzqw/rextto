@@ -9873,11 +9873,11 @@ fn retry_storage_moves(
             continue;
         }
         if retry.in_flight {
-            tracing::warn!(
+            tracing::debug!(
                 hash = %hash,
                 name = %name,
                 destination = %retry.destination.display(),
-                "storage move wait timed out; checking the move again"
+                "storage move still in flight after wait; checking the move again"
             );
             if let Some(retry) = retries.get_mut(&hash) {
                 retry.in_flight = false;
@@ -9977,6 +9977,24 @@ fn retry_storage_moves(
     }
 }
 
+/// Avoid flooding the log while an asynchronous post-seeding move is still
+/// being verified. The safety gate remains active on every tick; only the
+/// repeated warning is rate-limited.
+fn seed_copy_warning_due(warnings: &mut HashMap<String, Instant>, hash: &str) -> bool {
+    const WARNING_INTERVAL: Duration = Duration::from_secs(600);
+    const ENTRY_RETENTION: Duration = Duration::from_secs(3600);
+    let now = Instant::now();
+    warnings.retain(|_, last| now.duration_since(*last) < ENTRY_RETENTION);
+    let key = hash.to_ascii_lowercase();
+    let due = warnings
+        .get(&key)
+        .is_none_or(|last| now.duration_since(*last) >= WARNING_INTERVAL);
+    if due {
+        warnings.insert(key, now);
+    }
+    due
+}
+
 /// Resident set size of the current process in KiB (Linux `/proc/self/statm`).
 fn resident_kb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
@@ -10000,6 +10018,7 @@ async fn torrent_event_worker(
 ) {
     let mut move_requests = HashSet::new();
     let mut storage_move_retries = HashMap::new();
+    let mut seed_copy_warnings = HashMap::new();
     // Storage moves are asynchronous. Keep post-seeding moves protected until
     // their success/failure alert arrives, otherwise the seed cleanup can
     // remove the source while libtorrent is still copying it.
@@ -10434,6 +10453,7 @@ async fn torrent_event_worker(
             &db,
             &mut post_seed_moves,
             &mut storage_move_retries,
+            &mut seed_copy_warnings,
         );
     }
 }
@@ -10936,6 +10956,7 @@ fn enforce_seed_policy(
     db: &Arc<Mutex<Database>>,
     post_seed_moves: &mut HashSet<String>,
     storage_move_retries: &mut HashMap<String, StorageMoveRetry>,
+    seed_copy_warnings: &mut HashMap<String, Instant>,
 ) {
     let ratio_limit = cfg
         .libtorrent
@@ -11041,11 +11062,13 @@ fn enforce_seed_policy(
                 // Delete storage only after verifying the archived copy. This
                 // also protects packs with stale or invalid processed_path data.
                 if !completed_source_disposable(db, &torrent.hash, &torrent.save_path) {
-                    tracing::warn!(
-                        hash = %torrent.hash,
-                        name = %torrent.name,
-                        "seed limit reached but archived copy is not verified; keeping torrent files"
-                    );
+                    if seed_copy_warning_due(seed_copy_warnings, &torrent.hash) {
+                        tracing::warn!(
+                            hash = %torrent.hash,
+                            name = %torrent.name,
+                            "seed limit reached but archived copy is not verified; keeping torrent files"
+                        );
+                    }
                     continue;
                 }
                 match torrents.remove(&torrent.hash, true) {
