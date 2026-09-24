@@ -1311,13 +1311,17 @@ async fn logs(State(s): State<AppState>, Query(query): Query<LogQuery>) -> Json<
 /// Stream SSE del log: invia le ultime righe alla connessione e poi segue il
 /// file (`rextto.log`) con un polling interno di 1 secondo, ripartendo da zero
 /// se il file viene troncato dalla rotazione.
-async fn logs_stream(State(s): State<AppState>) -> impl IntoResponse {
+async fn logs_stream(
+    State(s): State<AppState>,
+    Query(query): Query<LogQuery>,
+) -> impl IntoResponse {
     let path = s.cfg.data_dir.join("rextto.log");
+    let limit = query.limit.unwrap_or(200).clamp(1, 5000);
     let stream = async_stream::stream! {
         let mut sent = 0usize;
         if let Ok(contents) = tokio::fs::read_to_string(&path).await {
             let lines: Vec<&str> = contents.lines().collect();
-            let start = lines.len().saturating_sub(200);
+            let start = lines.len().saturating_sub(limit);
             for (offset, line) in lines[start..].iter().enumerate() {
                 yield Ok::<Event, Infallible>(
                     Event::default().id((start + offset).to_string()).data(*line),

@@ -69,6 +69,7 @@ dependencies = [
  "leptos",
  "leptos_meta",
  "leptos_router",
+ "send_wrapper",
  "serde",
  "serde_json",
  "urlencoding",

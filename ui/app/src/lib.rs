@@ -114,7 +114,6 @@ struct Data {
     setup: Value,
     language: String,
     i18n: std::collections::BTreeMap<String, String>,
-    logs: Vec<String>,
     net_history: Vec<f64>,
     net_history_up: Vec<f64>,
     torrent_history: std::collections::BTreeMap<String, Vec<f64>>,
@@ -642,14 +641,6 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
                         .collect()
                 })
         };
-        let logs = get("/api/logs?limit=200")
-            .await
-            .ok()
-            .and_then(|value| value.get("items").and_then(Value::as_array).cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
         data.update(|current| {
             current.status = status;
             current.stats = stats;
@@ -691,7 +682,6 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
             if let Some(i18n) = i18n {
                 current.i18n = i18n;
             }
-            current.logs = logs;
             current.error.clear();
         });
         Ok::<(), String>(())
@@ -8068,16 +8058,16 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
     let lines = RwSignal::new(Vec::<String>::new());
     let follow = RwSignal::new(true);
     let limit = RwSignal::new("400".to_string());
+    let loading = RwSignal::new(true);
     let log_ref = NodeRef::<leptos::html::Pre>::new();
     // Stream SSE: la connessione invia le ultime righe e poi segue il log.
-    // Il browser riconnette da solo; a ogni (ri)apertura il buffer viene svuotato
-    // così non si duplicano le righe iniziali.
-    spawn_local(async move {
-        let Ok(source) = web_sys::EventSource::new("/api/logs/stream") else {
-            return;
-        };
+    // Il limite viene passato al server, così la prima schermata non deve
+    // attendere una serie di eventi oltre il numero richiesto.
+    if let Ok(source) = web_sys::EventSource::new("/api/logs/stream?limit=400") {
+        let source_for_cleanup = send_wrapper::SendWrapper::new(source.clone());
+        on_cleanup(move || source_for_cleanup.close());
         let on_open = Closure::<dyn FnMut()>::new(move || {
-            lines.set(Vec::new());
+            loading.set(false);
         });
         source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         on_open.forget();
@@ -8086,6 +8076,7 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
                 let Some(line) = event.data().as_string() else {
                     return;
                 };
+                loading.set(false);
                 let cap = limit.get().parse::<usize>().unwrap_or(400).clamp(50, 5000);
                 lines.update(|current| {
                     current.push(line);
@@ -8098,9 +8089,30 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
         );
         source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         on_message.forget();
-        // Mantiene viva la connessione per tutta la durata della vista.
-        std::mem::forget(source);
-    });
+    }
+    let reload_limit = move |event: web_sys::Event| {
+        let requested = event_target_value(&event)
+            .parse::<usize>()
+            .unwrap_or(400)
+            .clamp(50, 5000);
+        limit.set(requested.to_string());
+        lines.set(Vec::new());
+        loading.set(true);
+        spawn_local(async move {
+            let result = get(&format!("/api/logs?limit={requested}")).await;
+            if limit.get() == requested.to_string() {
+                if let Ok(value) = result {
+                    lines.set(
+                        array(&value, "items")
+                            .into_iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect(),
+                    );
+                }
+                loading.set(false);
+            }
+        });
+    };
     let filtered = Signal::derive(move || {
         let term = filter.get().to_ascii_lowercase();
         lines
@@ -8123,11 +8135,11 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Log daemon">
                 <div class="toolbar" style="margin-bottom:10px">
                     <input style="flex:1" prop:value=filter on:input=move |event| filter.set(event_target_value(&event)) placeholder=ctx_tr("Filtra…") />
-                    <label class="check" title=ctx_tr("Numero di righe di log da caricare (50–5000)")><span>{ctx_tr("Righe")}</span><input style="width:80px" prop:value=limit on:input=move |event| limit.set(event_target_value(&event)) /></label>
+                    <label class="check" title=ctx_tr("Numero di righe di log da caricare (50–5000)")><span>{ctx_tr("Righe")}</span><input style="width:80px" prop:value=limit on:change=reload_limit /></label>
                     <button class="btn sm" class:primary=move || follow.get() on:click=move |_| follow.update(|value| *value = !*value)>
                         {move || if follow.get() { "⏸ Ferma scorrimento" } else { "▶ Riprendi" }}
                     </button>
-                    <small class="muted">{move || format!("{} righe", filtered.get().len())}</small>
+                    <small class="muted">{move || if loading.get() { "Caricamento…".to_string() } else { format!("{} righe", filtered.get().len()) }}</small>
                 </div>
                 <pre class="log-view" node_ref=log_ref inner_html=move || filtered.get().join("\n")></pre>
             </Panel>
