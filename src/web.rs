@@ -8009,16 +8009,33 @@ async fn add_search_result(
 ) -> impl IntoResponse {
     add_release(&s, input.release).await
 }
-/// Accoda manualmente una release (Archivio, ricerca). Nessun controllo di
-/// monitoraggio, qualità o lingua: l'utente ha chiesto esplicitamente quel
-/// contenuto. Supporta sia magnet sia URL `.torrent` (Jackett/Prowlarr).
-async fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_json::Value>) {
+/// Accoda manualmente una release (Archivio, ricerca): nessun controllo, si
+/// aggiunge e basta. Supporta magnet e URL `.torrent`; se il link è scaduto
+/// (404) ritenta ritrovando la release con una ricerca sugli indexer.
+async fn add_release(s: &AppState, release: Release) -> (StatusCode, Json<serde_json::Value>) {
     if !setup_complete(&s.cfg) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"ok":false,"error":"complete the initial setup first"})),
         );
     }
+    let is_url = is_torrent_url(&release.magnet);
+    let result = add_parsed_release(s, release.clone()).await;
+    if is_url && result.0 == StatusCode::BAD_REQUEST {
+        if let Some(found) = resolve_by_search(s, &release.title).await {
+            let retry = add_parsed_release(s, found).await;
+            if retry.0 != StatusCode::BAD_REQUEST {
+                return retry;
+            }
+        }
+    }
+    result
+}
+
+async fn add_parsed_release(
+    s: &AppState,
+    mut release: Release,
+) -> (StatusCode, Json<serde_json::Value>) {
     let source = release.magnet.trim().to_string();
     if is_torrent_url(&source) {
         return match download_and_add(s, &source).await {
@@ -8146,6 +8163,108 @@ async fn add_raw_magnet(s: &AppState, source: &str) -> (StatusCode, Json<serde_j
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
         ),
     }
+}
+
+/// Riprova a trovare una release per titolo quando un link `.torrent` è scaduto
+/// (404). Usa la ricerca interattiva (indexer Torznab/Jackett + motori web) e
+/// accetta solo risultati che condividono la radice del titolo.
+async fn resolve_by_search(s: &AppState, title: &str) -> Option<Release> {
+    let query = search_query_from_title(title);
+    let normalized_query = normalize_search(&query);
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let results = s.engine.search_query_manual(&s.cfg, &query).await;
+    results.into_iter().find(|release| {
+        source_is_usable(&release.magnet)
+            && normalize_search(&release.title).starts_with(&normalized_query)
+    })
+}
+
+/// Prime parole del titolo fino a qualità/codice/anno: è la query di ricerca.
+/// Es. "Signal One 2026 1080p AMZN ... -BYNDR [x]" -> "Signal One 2026".
+fn search_query_from_title(title: &str) -> String {
+    let cleaned: String = title
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let mut words: Vec<String> = Vec::new();
+    for word in cleaned.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        let is_year = word.len() == 4 && word.chars().all(|character| character.is_ascii_digit());
+        let is_marker = lower.contains("1080p")
+            || lower.contains("720p")
+            || lower.contains("2160p")
+            || lower.contains("480p")
+            || matches!(
+                lower.as_str(),
+                "4k" | "uhd"
+                    | "bluray"
+                    | "bdrip"
+                    | "web"
+                    | "webdl"
+                    | "webrip"
+                    | "hdtv"
+                    | "dvdrip"
+                    | "h264"
+                    | "h265"
+                    | "x264"
+                    | "x265"
+                    | "hevc"
+                    | "avc"
+                    | "aac"
+                    | "ac3"
+                    | "eac3"
+                    | "ddp"
+                    | "dts"
+                    | "proper"
+                    | "repack"
+            );
+        if is_marker {
+            break;
+        }
+        words.push(word.to_string());
+        if is_year || words.len() >= 6 {
+            break;
+        }
+    }
+    words.join(" ")
+}
+
+fn normalize_search(value: &str) -> String {
+    let cleaned: String = value
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Sorgente aggiungibile: URL `.torrent` oppure magnet con infohash plausibile.
+fn source_is_usable(source: &str) -> bool {
+    let source = source.trim();
+    if is_torrent_url(source) {
+        return true;
+    }
+    source.starts_with("magnet:") && crate::utils::magnet_hash(source).is_some()
 }
 
 async fn pause_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
