@@ -10464,7 +10464,8 @@ fn detach_error_torrents(torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>)
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
                 tracing::info!(
                     hash = %torrent.hash,
-                    "detached leftover error torrent after recovery"
+                    name = %torrent.name,
+                    "🧹 torrent fallito residuo dopo il riavvio rimosso dalla sessione (file conservati)"
                 );
             }
             Err(error) => tracing::warn!(
