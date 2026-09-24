@@ -1887,7 +1887,9 @@ impl Database {
         path: &str,
         size_bytes: i64,
     ) -> Result<()> {
-        let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         let now = Utc::now().to_rfc3339();
         if release.kind == "series" {
             if let (Some(series), Some(season)) = (release.series.as_deref(), release.season) {
@@ -1933,7 +1935,21 @@ impl Database {
             )?;
         }
         self.conn.execute("UPDATE torrent_meta SET status='completed',completed_at=?1,processed_path=?2,error='',updated_at=?1 WHERE hash=?3", params![now, path, hash])?;
-        Ok(())
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn mark_pack_completed(
@@ -1943,7 +1959,9 @@ impl Database {
         path: &str,
         size_bytes: i64,
     ) -> Result<()> {
-        let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         let now = Utc::now().to_rfc3339();
         if let (Some(series), Some(season)) = (release.series.as_deref(), release.season) {
             if let Some(series_id) = self
@@ -1965,7 +1983,21 @@ impl Database {
             }
         }
         self.conn.execute("UPDATE torrent_meta SET status='completed',completed_at=?1,processed_path=?2,error='',updated_at=?1 WHERE hash=?3", params![now, path, hash])?;
-        Ok(())
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Elimina i placeholder (non scaricati) di una release. Usato quando un
