@@ -144,9 +144,12 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
   HDTV, BluRay…) in archived names that lost it, recovering it from the original
   release title in the database. It never invents a source: unknown stays
   untouched. Preview first, then execute; no re-download is involved.
-- **Database**: prune by cycles/error age, **seen-from-feed retention** (days; 0
-  keeps everything), keyword prune with a list of the matching rows, and
-  **VACUUM / ANALYZE** across all databases.
+ - **Database**: prune by cycles/error age, **seen-from-feed retention** (days; 0
+   keeps everything), keyword prune with a list of the matching rows, and
+   **VACUUM / ANALYZE** across all databases.
+   Seen-from-feed cleanup removes only historical feed rows, not files or
+   downloads; it also applies the standard cleanup of the last 50 cycles and
+   torrent errors older than 7 days.
 - **Backups**: retention, schedule (manual, every N hours or a fixed daily
   HH:MM), FTP host/user/path + **Test FTP** (checks connection, path and a probe
   upload), cloud/sync folder copy, Telegram delivery, list of available backups.

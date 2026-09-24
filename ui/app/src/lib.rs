@@ -6926,13 +6926,13 @@ fn DbPruneTool(data: RwSignal<Data>) -> impl IntoView {
             </div>
             <p class="muted">{ctx_tr("Le parole vengono combinate in OR. Premi sempre prima Anteprima per vedere quanti elementi verrebbero rimossi. La pulizia copre anche le release 'viste nei feed'.")}</p>
             <div class="toolbar" style="margin-top:12px">
-                <span class="muted">{ctx_tr("Release 'viste nei feed' più vecchie di (giorni):")}</span>
-                <input style="width:90px" prop:value=seen_days on:input=move |event| seen_days.set(event_target_value(&event)) placeholder="0" title=ctx_tr("Età in giorni oltre la quale eliminare le release viste nei feed (0 = conserva tutto)") />
-                <button class="btn sm danger" on:click=move |_| {
+                <span class="muted" title=ctx_tr("Elimina dal database le release rilevate nei feed di film e serie con found_at più vecchio del numero di giorni indicato. Non elimina file, torrent, serie o film monitorati. Il pulsante esegue anche la pulizia standard: conserva gli ultimi 50 cicli e rimuove gli errori torrent più vecchi di 7 giorni.")>{ctx_tr("Release 'viste nei feed' più vecchie di (giorni):")}</span>
+                <input style="width:90px" prop:value=seen_days on:input=move |event| seen_days.set(event_target_value(&event)) placeholder="0" title=ctx_tr("Età in giorni oltre la quale eliminare le release viste nei feed; 0 disabilita questa parte della pulizia") />
+                <button class="btn sm danger" title=ctx_tr("Elimina le release viste nei feed oltre l'età indicata e applica anche la pulizia standard di cicli ed errori") on:click=move |_| {
                     let days = seen_days.get().trim().parse::<i64>().unwrap_or(0);
                     run_post(data, "/api/db/prune", Some(json!({"retain_cycles": 50, "error_age_days": 7, "seen_retention_days": days})), "Pulizia visti completata");
                 }>{ctx_tr("Pulisci visti")}</button>
-                <small class="muted">{ctx_tr("0 = conserva tutto. Utile per non far crescere all'infinito lo storico dei feed.")}</small>
+                <small class="muted">{ctx_tr("0 = conserva tutte le release viste. Non vengono toccati file o download; la pulizia standard conserva 50 cicli e 7 giorni di errori.")}</small>
             </div>
             <Show when=move || !preview_items.get().is_empty()>
                 <div class="table-wrap" style="margin-top:10px">

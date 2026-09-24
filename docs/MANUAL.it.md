@@ -151,9 +151,12 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   recuperandolo dal titolo originale della release nel database. Non inventa la
   sorgente: se è sconosciuta il file resta invariato. Prima l'anteprima, poi
   l'esecuzione; nessun riscaricamento.
-- **Database**: prune per cicli/età errori, **retention dei "visti dai feed"**
-  (giorni; 0 conserva tutto), prune per keyword con elenco delle righe
-  corrispondenti e **VACUUM / ANALYZE** su tutti i database.
+ - **Database**: prune per cicli/età errori, **retention dei "visti dai feed"**
+   (giorni; 0 conserva tutto), prune per keyword con elenco delle righe
+   corrispondenti e **VACUUM / ANALYZE** su tutti i database.
+   La pulizia dei "visti" rimuove solo righe storiche dei feed, non file o
+   download; applica anche la pulizia standard degli ultimi 50 cicli e degli
+   errori torrent più vecchi di 7 giorni.
 - **Backup**: retention, schedulazione (manuale, ogni N ore o a un orario fisso
   giornaliero HH:MM), FTP (host/utente/percorso) con **Test FTP** (verifica
   connessione, percorso e upload di prova), copia su cartella cloud/sync, invio
