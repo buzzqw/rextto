@@ -242,10 +242,13 @@ pub async fn run_cycle_domain(
         );
     }
     tracing::info!(
-        is_deep,
-        gaps = archive_gaps.len(),
-        deep_max_per_cycle,
-        "cycle: gap-fill starting"
+        "🔎 Gap fill: {} missing episode(s) to check · {}",
+        archive_gaps.len(),
+        if is_deep {
+            format!("deep pass, up to {deep_max_per_cycle} online searches")
+        } else {
+            "archive pass".to_string()
+        }
     );
 
     // Phase 1 (every cycle, free): local archive search only.
@@ -305,9 +308,9 @@ pub async fn run_cycle_domain(
         live_candidates.push((series, season, episode, live_query));
     }
     tracing::info!(
+        "🔎 Gap fill: {} found in the archive, {} to look up online",
         archive_hits,
-        live = live_candidates.len(),
-        "cycle: gap-fill archive pass done"
+        live_candidates.len()
     );
 
     if !live_candidates.is_empty() {
@@ -626,21 +629,19 @@ pub async fn run_cycle_domain(
                 Ok(true) => {
                     if gap_episodes.is_empty() {
                         tracing::info!(
-                            "📥 Download started [{}]: {} · {} · score {} · hash: {}",
+                            "📥 Download started [{}]: {} · {} · score {}",
                             release.source,
                             release_target(&release),
                             release.kind,
-                            score,
-                            hash_label(&release)
+                            score
                         );
                     } else {
                         tracing::info!(
-                            "✅ Gap filled: {} · episodes {} · downloading [{}]: {} · hash: {}",
+                            "✅ Gap filled: {} · episodes {} · downloading [{}]: {}",
                             release_target(&release),
                             episodes_label(&gap_episodes),
                             release.source,
-                            release.title,
-                            hash_label(&release)
+                            release.title
                         );
                     }
                     db.lock().unwrap().register_torrent(&release)?;
@@ -786,10 +787,6 @@ fn episodes_label(episodes: &[i64]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     }
-}
-
-fn hash_label(release: &Release) -> String {
-    magnet_hash(&release.magnet).unwrap_or_else(|| "unknown".into())
 }
 
 /// A release for a monitored title that does not meet the quality/language/

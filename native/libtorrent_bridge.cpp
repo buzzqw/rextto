@@ -93,6 +93,10 @@ struct rextto_lt_session {
     lt::session session;
     std::deque<rextto_lt_event> events;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> active_since;
+    // Da quanto un download attivo è a 0 B/s: serve a declassare i "lenti"
+    // (priorità bassa) quando c'è coda, senza affamarli: la priorità conta solo
+    // in contesa, quindi senza coda restano attivi e riprovano.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> download_stalled_since;
     std::deque<std::pair<std::chrono::steady_clock::time_point, std::int64_t>> dynamic_rate_samples;
     std::chrono::steady_clock::time_point dynamic_last_change =
         std::chrono::steady_clock::now() - std::chrono::seconds(600);
@@ -595,21 +599,40 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
     std::int64_t aggregate_rate = 0;
     int queued_count = 0;
     bool priority_download = false;
-    struct active_torrent { lt::torrent_handle handle; int tier; };
+    struct active_torrent { lt::torrent_handle handle; int tier; bool demoted; };
     std::vector<active_torrent> active;
+    const auto stalled_limit = std::chrono::seconds(300);
     for (auto const& handle : session->session.get_torrents()) {
         auto status = handle.status();
         if (!status.has_metadata || status.is_seeding || status.is_finished) continue;
         const bool paused = static_cast<bool>(status.flags & lt::torrent_flags::paused);
         const int sources = status.num_peers + status.num_seeds;
+        const auto hash = hex_hash(handle);
         if (paused) {
             ++queued_count;
+            // Priorità media: può scalzare un attivo declassato quando c'è coda,
+            // ma non un download che sta appena partendo.
+            handle.set_priority(4);
+            session->download_stalled_since.erase(hash);
             continue;
         }
         const int tier = status.download_rate > 0 ? 0 : (sources > 0 ? 1 : 2);
         aggregate_rate += std::max(0, status.download_rate);
         priority_download = priority_download || tier == 0;
-        active.push_back({handle, tier});
+        // Un download attivo ma fermo da troppo tempo viene "declassato": se
+        // c'è coda l'auto-manager lo sospende in favore di un torrent con fonti.
+        bool demoted = false;
+        if (tier == 0) {
+            session->download_stalled_since.erase(hash);
+        } else {
+            auto it = session->download_stalled_since.find(hash);
+            if (it == session->download_stalled_since.end()) {
+                session->download_stalled_since.emplace(hash, now);
+            } else if (now - it->second >= stalled_limit) {
+                demoted = true;
+            }
+        }
+        active.push_back({handle, tier, demoted});
     }
 
     // Moving-window hysteresis per la discesa: campioni coerenti e cooldown di
@@ -689,6 +712,12 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
             const int weight = item.tier == 0 ? 3 : (item.tier == 1 ? 2 : 1);
             item.handle.set_max_connections(std::max(10, available_connections * weight / std::max(1, total_weight)));
             item.handle.set_max_uploads(std::max(2, available_uploads * weight / std::max(1, total_weight)));
+            // Politica "lenti": chi trasferisce ha priorità alta, chi ha fonti ma
+            // è appena partito sta in mezzo, chi è fermo da troppo tempo viene
+            // declassato. La priorità conta solo in contesa (c'è coda): senza
+            // coda anche un declassato resta attivo e può ripartire.
+            const int priority = item.tier == 0 ? 8 : (item.demoted ? 0 : (item.tier == 1 ? 6 : 3));
+            item.handle.set_priority(priority);
             // Non imporre un tetto per-torrent basato sul numero di download
             // attivi: con molti torrent che scambiano pochi KB/s il pool globale
             // veniva diviso fra tutti, strozzando i torrent veloci e lasciando
@@ -701,6 +730,20 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
         for (auto const& handle : session->session.get_torrents()) {
             auto status = handle.status();
             if (status.is_seeding || status.is_finished) handle.set_max_uploads(priority_download ? 2 : -1);
+        }
+    }
+
+    // Tracking dei "lenti": dimentica i torrent usciti o finiti, così la mappa
+    // non cresce nel tempo.
+    for (auto it = session->download_stalled_since.begin();
+         it != session->download_stalled_since.end();) {
+        const bool live = std::any_of(active.begin(), active.end(), [&](const active_torrent& item) {
+            return hex_hash(item.handle) == it->first;
+        });
+        if (live) {
+            ++it;
+        } else {
+            it = session->download_stalled_since.erase(it);
         }
     }
 }

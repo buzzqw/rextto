@@ -3144,7 +3144,7 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
         // solo ENG o sotto la qualità minima, per poi rifiutarla al clic.
         release.kind == "movie"
             && cfg
-                .find_movie_match(&release.title, release.year)
+                .find_movie_match_manual(&release.title, release.year)
                 .is_some_and(|matched| {
                     matched.id == movie.id && Config::movie_release_allowed(movie, &release.quality)
                 })
@@ -8064,10 +8064,16 @@ fn add_release(s: &AppState, mut release: Release) -> (StatusCode, Json<serde_js
             &context,
         )
     } else {
-        let Some(movie) = s.cfg.find_movie_match(&release.title, release.year) else {
+        let Some(movie) = s
+            .cfg
+            .find_movie_match_manual(&release.title, release.year)
+        else {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"ok":false,"error":"film non monitorato"})),
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("film non monitorato: nessun film in libreria corrisponde a «{}»", release.title)
+                })),
             );
         };
         if !Config::quality_allowed(
@@ -9700,7 +9706,8 @@ async fn torrent_event_worker(
             last_metadata_promotion = now;
         }
         if now.duration_since(last_dynamic_adjustment) >= Duration::from_secs(90) {
-            torrents.adjust_queue(&cfg);
+            let (effective_download_kib, _) = current_speed_limits(&cfg);
+            torrents.adjust_queue(&cfg, effective_download_kib);
             // Visibilità sulla coda, come il legacy extto ("📊 Coda: ..."):
             // si logga quando cambia il numero di download attivi, non ad ogni giro.
             let snapshot = torrents.list();
@@ -9718,7 +9725,7 @@ async fn torrent_event_worker(
                     .map(|torrent| torrent.download_rate)
                     .sum::<u64>()
                     / 1024;
-                let (limit_kib, _) = current_speed_limits(&cfg);
+                let limit_kib = effective_download_kib;
                 tracing::info!(
                     "📊 Queue: {} active downloads, {} queued · {} KB/s of {} KB/s available",
                     active,
@@ -9865,7 +9872,7 @@ async fn torrent_event_worker(
                                 Ok(()) => tracing::debug!(hash=%hash, "completion notification sent"),
                                 Err(error) => tracing::warn!(hash=%hash, %error, "completion notification failed"),
                             }
-                            tracing::info!(hash=%event.hash, title=%comic.title, path=%event.save_path, "comic torrent completed");
+                            tracing::info!("comic completed — «{}» · {}", comic.title, event.save_path);
                         }
                         Err(error) => {
                             let _ = notifier.notify_event("comic_error", serde_json::json!({"hash": hash, "title": comic.title, "error": error.to_string()})).await;
@@ -9907,19 +9914,6 @@ async fn torrent_event_worker(
             if processed && matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
                 refresh_media_libraries(&cfg).await;
             }
-            if processed && cfg.libtorrent.auto_remove_completed {
-                let is_pack = db
-                    .lock()
-                    .unwrap()
-                    .torrent_meta(&event.hash)
-                    .ok()
-                    .flatten()
-                    .map(|meta| meta.release.is_pack)
-                    .unwrap_or(false);
-                if let Ok(true) = torrents.remove(&event.hash, is_pack) {
-                    let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
-                }
-            }
             // A completed single episode/movie is moved into the archive and
             // renamed, so the file is no longer at the path libtorrent tracks.
             // It can no longer seed and would re-download the release on the
@@ -9938,8 +9932,8 @@ async fn torrent_event_worker(
                     if let Ok(true) = torrents.remove(&event.hash, false) {
                         let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
                         tracing::info!(
-                            hash = %event.hash,
-                            "completed torrent removed: file renamed into the archive"
+                            "completed torrent removed — file renamed into the archive: «{}»",
+                            event.name
                         );
                     }
                 }
@@ -10013,10 +10007,10 @@ async fn torrent_event_worker(
                 events.drain(..overflow);
             }
         }
-        // Un pack archiviato che ha già seedato abbastanza non deve restare in
-        // trasferimento: la sorgente è ridondante (copia sul NAS) e va rimossa
-        // prima che la seed policy la sposti su disco solo per cancellarla.
-        remove_seeded_archived_packs(&cfg, &torrents, &db);
+        // Rimuove i completati che hanno terminato il seed (i pack archiviati
+        // sempre, gli altri con `auto_remove_completed`) prima che la seed
+        // policy li sposti su disco solo per cancellarli.
+        remove_seeded_completed(&cfg, &torrents, &db);
         // Enforce the seed policy only after handling this tick's events: with a
         // very low seed limit a just-finished torrent could otherwise be removed
         // before its `torrent_finished` event is post-processed and archived.
@@ -10058,7 +10052,7 @@ fn remove_failed_torrent(torrents: &LibtorrentClient, hash: &str) {
             torrent.progress < 99.99 && !matches!(torrent.state.as_str(), "seeding" | "finished")
         });
     match torrents.remove(hash, incomplete) {
-        Ok(true) => tracing::info!(hash, delete_files = incomplete, "failed torrent removed"),
+        Ok(true) => tracing::info!("failed download removed from the session"),
         Ok(false) => tracing::debug!(hash, "failed torrent already removed"),
         Err(error) => tracing::warn!(hash, %error, "failed torrent removal failed"),
     }
@@ -10238,18 +10232,16 @@ fn needs_infinite_seed_resume(torrent: &crate::models::TorrentView) -> bool {
         && !torrent.auto_managed
 }
 
-/// Un season pack archiviato sul NAS non deve restare per sempre in
-/// trasferimento: la sorgente serve solo a seedare, quindi appena raggiunge il
-/// limite di ratio/tempo va rimossa come qualsiasi altro download concluso.
-/// Si agisce solo se esiste davvero una copia in libreria (`processed_path`
-/// fuori dallo storage del torrent), così non si cancella mai l'unica copia.
-fn remove_seeded_archived_packs(
-    cfg: &Config,
-    torrents: &LibtorrentClient,
-    db: &Arc<Mutex<Database>>,
-) {
+/// I torrent completati non devono restare in sessione per sempre:
+/// - un season pack archiviato sul NAS esce appena il seeding è finito: la
+///   sorgente è ridondante (copia verificata via `processed_path`) e va rimossa;
+/// - con `auto_remove_completed` attivo, qualsiasi completato che ha raggiunto
+///   ratio/tempo esce dalla sessione.
+/// I file si cancellano solo se esiste una copia archiviata fuori dallo storage
+/// del torrent: nessun dato viene mai perso. Il seed infinito esplicito resta.
+fn remove_seeded_completed(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>) {
     for torrent in torrents.list() {
-        // Seed infinito esplicito: il pack deve restare in seed.
+        // Seed infinito esplicito: il torrent deve restare in seed.
         if torrent.seed_ratio == 0.0 || torrent.seed_days == 0 {
             continue;
         }
@@ -10262,22 +10254,27 @@ fn remove_seeded_archived_packs(
         if !ratio_reached && !time_reached {
             continue;
         }
-        if !archived_pack_source_disposable(db, &torrent.hash, &torrent.save_path) {
+        let archived_pack = archived_pack_source_disposable(db, &torrent.hash, &torrent.save_path);
+        if !archived_pack && !cfg.libtorrent.auto_remove_completed {
             continue;
         }
-        match torrents.remove(&torrent.hash, true) {
+        match torrents.remove(&torrent.hash, archived_pack) {
             Ok(true) => {
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
-                tracing::info!(
-                    hash = %torrent.hash,
-                    name = %torrent.name,
-                    "🗑️ SEASON PACK SEEDED — source removed (copy kept on NAS)"
-                );
+                if archived_pack {
+                    tracing::info!(
+                        "🗑️ Season pack seeded — source removed, copy kept on NAS: «{}»",
+                        torrent.name
+                    );
+                } else {
+                    tracing::info!(
+                        "🗑️ Seeding done — removed from the session: «{}»",
+                        torrent.name
+                    );
+                }
             }
             Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(hash=%torrent.hash, %error, "archived pack removal failed")
-            }
+            Err(error) => tracing::warn!(hash=%torrent.hash, %error, "seeded torrent removal failed"),
         }
     }
 }
@@ -10373,7 +10370,7 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
         if needs_infinite_seed_resume(&torrent) {
             match torrents.resume(&torrent.hash) {
                 Ok(true) => {
-                    tracing::info!(hash=%torrent.hash, "torrent resumed for infinite seeding")
+                    tracing::info!("seeding resumed (infinite) — «{}»", torrent.name)
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -10415,15 +10412,11 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
             match torrents.pause(&torrent.hash) {
                 Ok(true) => {
                     let reason = match (ratio_reached, time_reached) {
-                        (true, true) => "ratio and time",
-                        (true, false) => "ratio",
-                        _ => "time",
+                        (true, true) => "ratio and time reached",
+                        (true, false) => "ratio reached",
+                        _ => "seed time reached",
                     };
-                    tracing::info!(
-                        "⏸️ Torrent paused: seed limit reached ({}) · {}",
-                        reason,
-                        torrent.hash
-                    )
+                    tracing::info!("⏸️ Seeding done ({reason}) — pausing «{}»", torrent.name)
                 }
                 Ok(false) => {
                     tracing::warn!(hash=%torrent.hash, "torrent seed limit could not be applied in current mode")
@@ -10582,10 +10575,9 @@ fn enforce_ramdisk_capacity(cfg: &Config, torrents: &LibtorrentClient, event: &T
     };
     match torrents.move_storage(&event.hash, &destination) {
         Ok(true) => tracing::info!(
-            hash=%event.hash,
-            %reason,
-            destination=%destination.display(),
-            "torrent does not fit on the RAM disk, moving to disk"
+            "«{}» does not fit on the RAM disk, moving to disk ({reason}) → {}",
+            event.name,
+            destination.display()
         ),
         Ok(false) => {
             tracing::warn!(hash=%event.hash, %reason, "RAM disk relocation was not applied")
@@ -10642,10 +10634,8 @@ fn reconcile_ramdisk(
         moved += 1;
         match torrents.move_storage(&hash, &destination) {
             Ok(true) => tracing::info!(
-                hash = %hash,
-                %reason,
-                destination = %destination.display(),
-                "🔁 RAM disk reconciliation: moving torrent to disk"
+                "🔁 RAM disk reconciliation: moving a torrent to disk ({reason}) → {}",
+                destination.display()
             ),
             Ok(false) => tracing::warn!(
                 hash = %hash,
@@ -10690,10 +10680,10 @@ fn discard_completed_source(
         if let Some(trash) = cfg.trash_path.as_deref() {
             match crate::cleaner::move_to_trash(&source, trash) {
                 Ok(target) => tracing::info!(
-                    hash = %event.hash,
-                    source = %source.display(),
-                    trash = %target.display(),
-                    "rejected completed download moved to trash"
+                    "rejected completed download moved to trash — «{}» · {} → {}",
+                    event.name,
+                    source.display(),
+                    target.display()
                 ),
                 Err(error) => tracing::error!(
                     hash = %event.hash,
@@ -10717,9 +10707,9 @@ fn discard_completed_source(
                 );
             } else {
                 tracing::info!(
-                    hash = %event.hash,
-                    source = %source.display(),
-                    "rejected completed download removed"
+                    "rejected completed download removed — «{}» · {}",
+                    event.name,
+                    source.display()
                 );
             }
         }
@@ -10728,7 +10718,7 @@ fn discard_completed_source(
         Ok(true) => {
             // Il torrent ha lasciato la sessione: entra nello Storico con l'esito.
             let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
-            tracing::info!(hash = %event.hash, "rejected completed torrent removed")
+            tracing::info!("rejected completed torrent removed from the session")
         }
         Ok(false) => tracing::debug!(hash = %event.hash, "rejected torrent was already removed"),
         Err(error) => tracing::warn!(hash = %event.hash, %error, "rejected torrent removal failed"),
@@ -10766,11 +10756,10 @@ async fn handle_torrent_event(
                 .find(|torrent| torrent.hash.eq_ignore_ascii_case(&event.hash))
             {
                 tracing::info!(
-                    hash = %event.hash,
-                    title = %metadata.release.title,
-                    torrent_name = %torrent.name,
-                    size = %crate::logging::human_bytes_i64(torrent.total_size),
-                    "📦 DOWNLOAD METADATA RECEIVED"
+                    "📦 Download metadata received — «{}» · {} (torrent: {})",
+                    metadata.release.title,
+                    crate::logging::human_bytes_i64(torrent.total_size),
+                    torrent.name
                 );
             }
             enforce_ramdisk_capacity(cfg, torrents, &event);
@@ -10884,12 +10873,11 @@ async fn handle_torrent_event(
                         .map(|item| serde_json::json!({"series": &metadata.release.series, "season": metadata.release.season, "episode": item.episode, "path": &item.path}))
                         .collect::<Vec<_>>();
                     tracing::info!(
-                        hash = %event.hash,
-                        title = %metadata.release.title,
-                        destination = %destination.display(),
-                        size = %crate::logging::human_bytes_i64(size),
-                        episode_count = episodes.len(),
-                        "🎉 SEASON PACK COMPLETE — archived to NAS"
+                        "🎉 Season pack complete — «{}» · {} episodes · {} · archived to {}",
+                        metadata.release.title,
+                        episodes.len(),
+                        crate::logging::human_bytes_i64(size),
+                        destination.display()
                     );
                     let notification = notifier.notify_event("season_pack_completed", serde_json::json!({
                         "series": &metadata.release.series,
@@ -10915,10 +10903,9 @@ async fn handle_torrent_event(
                     // and the normal ratio/time cleanup are the only code paths
                     // allowed to discard this now-redundant source tree.
                     tracing::info!(
-                        hash=%event.hash,
-                        destination=%destination.display(),
-                        size=%crate::logging::human_bytes_i64(size),
-                        "📁 SEASON PACK COPIED TO NAS (source kept for seeding)"
+                        "📁 Season pack copied to NAS, source kept for seeding · {} · {}",
+                        crate::logging::human_bytes_i64(size),
+                        destination.display()
                     );
                     true
                 } else {
@@ -11023,9 +11010,8 @@ async fn complete_torrent(
         match resolved {
             Some(found) => {
                 tracing::info!(
-                    hash = %event.hash,
-                    path = %found.display(),
-                    "completed file already renamed; using the archived file"
+                    "completed file already renamed — using the archived file: {}",
+                    found.display()
                 );
                 path = found;
             }
@@ -11046,7 +11032,7 @@ async fn complete_torrent(
         .torrent_no_rename(&event.hash)
         .unwrap_or(false);
     let renamed = if no_rename {
-        tracing::info!(hash=%event.hash, "rename skipped: torrent marked no-rename");
+        tracing::info!("rename skipped — torrent marked no-rename: «{}»", event.name);
         None
     } else if release.kind == "movie" {
         postprocess::rename_movie(&path, release, cfg, tmdb).await?
@@ -11150,14 +11136,13 @@ async fn complete_torrent(
         })
         .unwrap_or((0, 0));
     tracing::info!(
-        hash = %event.hash,
-        title = %release.title,
-        path = %processed_path.display(),
-        size = %crate::logging::human_bytes_i64(size),
-        duration = %crate::logging::human_duration(duration_seconds),
-        average_speed = %crate::logging::human_rate(average_speed),
-        renamed = renamed.is_some(),
-        "🎉 DOWNLOAD COMPLETE — file processed and saved"
+        "🎉 Download complete — «{}» · {} · downloaded in {} at {} · saved to {}{}",
+        release.title,
+        crate::logging::human_bytes_i64(size),
+        crate::logging::human_duration(duration_seconds),
+        crate::logging::human_rate(average_speed),
+        processed_path.display(),
+        if renamed.is_some() { "" } else { " (kept original name)" }
     );
     // Se il file è stato rinominato o collegato a un file già esistente, i dati
     // del torrent non sono più al nome atteso (o sono un doppione) e libtorrent
@@ -11337,23 +11322,44 @@ async fn cycle_worker(state: AppState) {
                             .collect::<Vec<_>>();
                         let flag = rename_repair_running.clone();
                         std::thread::spawn(move || {
+                            let mut renamed = 0_i64;
+                            let mut discarded = 0_i64;
+                            let mut duplicates = 0_i64;
+                            let mut errors = 0_i64;
                             if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
                                 .build()
                             {
                                 runtime.block_on(async {
                                     for name in &names {
-                                        let _ = series_rename_apply(
+                                        let (_, Json(value)) = series_rename_apply(
                                             &state, name, true, false, false,
                                         )
                                         .await;
+                                        let count = |key: &str| {
+                                            value
+                                                .get(key)
+                                                .and_then(serde_json::Value::as_i64)
+                                                .unwrap_or(0)
+                                        };
+                                        renamed += count("renamed_count");
+                                        discarded += count("discarded_count");
+                                        duplicates += count("duplicates_removed");
+                                        errors += count("error_count");
                                     }
                                 });
                             }
-                            tracing::info!(
-                                series = names.len(),
-                                "periodic archive rename repair completed"
-                            );
+                            if renamed + discarded + duplicates + errors > 0 {
+                                tracing::info!(
+                                    "🗂 Archive rename repair: {} series checked · {} renamed · {} discarded · {} duplicates removed · {} errors",
+                                    names.len(), renamed, discarded, duplicates, errors
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "🗂 Archive rename repair: {} series checked, nothing to change",
+                                    names.len()
+                                );
+                            }
                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                         });
                     }

@@ -829,7 +829,7 @@ impl LibtorrentClient {
             }
             self.apply_stored_limits(session, &hash)?;
         } else if self.dry_run {
-            tracing::info!(%hash, "dry-run: torrent accepted, not started");
+            tracing::info!("dry-run: torrent accepted, not started");
         } else {
             bail!("libtorrent session is unavailable");
         }
@@ -1057,7 +1057,11 @@ impl LibtorrentClient {
         0
     }
 
-    pub fn adjust_queue(&self, cfg: &Config) {
+    /// `effective_download_kib` è il limite globale **in vigore** (fascia oraria
+    /// o limite temporaneo), non la base: la coda dinamica misura la saturazione
+    /// contro il tetto reale. Con la base (es. 3000) mentre la sessione può
+    /// scaricare a 8000, la linea risultava "satura" e la coda restava bassa.
+    pub fn adjust_queue(&self, cfg: &Config, effective_download_kib: i64) {
         let Some(session) = &self.session else {
             return;
         };
@@ -1071,7 +1075,7 @@ impl LibtorrentClient {
                 cfg.libtorrent.dynamic_queue_max.clamp(1, i32::MAX as i64) as i32,
                 cfg.libtorrent.active_seeds.clamp(1, i32::MAX as i64) as i32,
                 cfg.libtorrent.active_limit.clamp(1, i32::MAX as i64) as i32,
-                to_bytes(cfg.libtorrent.download_limit_kib),
+                to_bytes(effective_download_kib),
             )
         };
     }
@@ -1605,7 +1609,7 @@ mod tests {
         assert!(client.list().is_empty());
         assert!(client.poll_events().is_empty());
         client.promote_metadata();
-        client.adjust_queue(&cfg);
+        client.adjust_queue(&cfg, 0);
         assert!(!client
             .pause("0123456789012345678901234567890123456789")
             .unwrap());
