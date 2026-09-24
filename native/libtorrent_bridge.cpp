@@ -637,11 +637,12 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
                 session->dynamic_saturation = 0;
                 session->dynamic_last_change = now;
             }
-        } else if (queued_count > 0 && ratio <= 0.5 && downloads < maximum && increase_ready) {
+        } else if (queued_count > 0 && ratio <= 0.7 && downloads < maximum && increase_ready) {
             session->dynamic_underused = 0;
             session->dynamic_saturation = 0;
-            // Salita più decisa quando la linea è quasi ferma.
-            downloads = std::min(maximum, downloads + (ratio <= 0.2 ? 2 : 1));
+            // Salita più decisa quando la linea è quasi ferma. La fascia di
+            // stabilità (0.7–0.9) lascia comunque margine prima della discesa.
+            downloads = std::min(maximum, downloads + (ratio <= 0.4 ? 2 : 1));
             session->dynamic_last_increase = now;
         } else {
             session->dynamic_saturation = 0;
