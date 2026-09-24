@@ -202,13 +202,12 @@ pub async fn run_cycle_domain(
     }
     for ((series, season), mut episodes) in gap_summary {
         episodes.sort_unstable();
-        // Dettaglio per serie/stagione: decine di righe per ciclo, utile solo
-        // in diagnosi. Resta il riepilogo "gap-fill starting · gaps: N".
-        tracing::debug!(
-            series = %series,
+        // Come il legacy extto: una riga discorsiva per serie/stagione.
+        tracing::info!(
+            "→ {} S{:02} gap: {}",
+            series,
             season,
-            gaps = %episodes_label(&episodes),
-            "gap-fill target identified"
+            episodes_label(&episodes)
         );
     }
     let gap_limit = cfg
@@ -624,16 +623,19 @@ pub async fn run_cycle_domain(
             };
             match added {
                 Ok(true) => {
+                    let gap_note = if gap_episodes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · episodi mancanti: {}", episodes_label(&gap_episodes))
+                    };
                     tracing::info!(
-                        target = %release_target(&release),
-                        kind = %release.kind,
-                        source = %release.source,
+                        "📥 Download avviato [{}]: {} · {} · punteggio {}{} · hash: {}",
+                        release.source,
+                        release_target(&release),
+                        release.kind,
                         score,
-                        reason = %decision_reason,
-                        approval_reason = %approval_reason,
-                        gap_episodes = %episodes_label(&gap_episodes),
-                        hash = %hash_label(&release),
-                        "📥 DOWNLOAD STARTED"
+                        gap_note,
+                        hash_label(&release)
                     );
                     db.lock().unwrap().register_torrent(&release)?;
                     if let Some(hash) = magnet_hash(&release.magnet) {

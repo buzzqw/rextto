@@ -17,7 +17,7 @@ use crate::{
 };
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -901,6 +901,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/run_now", get(run_now).post(run_now))
         .route("/api/run-now", post(run_now))
         .layer(middleware::from_fn_with_state(state.clone(), api_auth))
+        .layer(middleware::from_fn(ui_no_cache))
         .with_state(state)
 }
 
@@ -1184,6 +1185,21 @@ async fn api_auth(
         Json(serde_json::json!({"ok":false,"error":"API token required"})),
     )
         .into_response()
+}
+
+/// La UI viene servita con nomi file stabili (`ui.js`, `ui_bg.wasm`): senza
+/// questo header un browser, soprattutto mobile, può continuare a usare la
+/// copia in cache dopo un aggiornamento. `no-cache` forza la rivalidazione,
+/// mantenendo ETag/Last-Modified serviti da `ServeDir`.
+async fn ui_no_cache(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    if path == "/" || path.starts_with("/pkg/") {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    response
 }
 async fn health_api(State(s): State<AppState>) -> Json<health::Health> {
     let trash = s
@@ -9634,6 +9650,7 @@ async fn torrent_event_worker(
     let mut last_ramdisk_check = Instant::now() - Duration::from_secs(120);
     let mut last_metadata_promotion = Instant::now() - Duration::from_secs(30);
     let mut last_dynamic_adjustment = Instant::now() - Duration::from_secs(90);
+    let mut last_queue_active: Option<usize> = None;
     let mut last_speed_policy = Instant::now() - Duration::from_secs(60);
     let mut last_speed: Option<(i64, i64)> = None;
     let mut last_debug_log = Instant::now() - Duration::from_secs(300);
@@ -9684,6 +9701,33 @@ async fn torrent_event_worker(
         }
         if now.duration_since(last_dynamic_adjustment) >= Duration::from_secs(90) {
             torrents.adjust_queue(&cfg);
+            // Visibilità sulla coda, come il legacy extto ("📊 Coda: ..."):
+            // si logga quando cambia il numero di download attivi, non ad ogni giro.
+            let snapshot = torrents.list();
+            let active = snapshot
+                .iter()
+                .filter(|torrent| torrent.state == "downloading")
+                .count();
+            if last_queue_active != Some(active) {
+                let queued = snapshot
+                    .iter()
+                    .filter(|torrent| torrent.state == "paused")
+                    .count();
+                let rate_kib: u64 = snapshot
+                    .iter()
+                    .map(|torrent| torrent.download_rate)
+                    .sum::<u64>()
+                    / 1024;
+                let (limit_kib, _) = current_speed_limits(&cfg);
+                tracing::info!(
+                    "📊 Coda: {} download attivi, {} in coda · {} KB/s su {} KB/s disponibili",
+                    active,
+                    queued,
+                    rate_kib,
+                    limit_kib
+                );
+                last_queue_active = Some(active);
+            }
             last_dynamic_adjustment = now;
         }
         if now.duration_since(last_speed_policy) >= Duration::from_secs(60) {
@@ -9696,7 +9740,17 @@ async fn torrent_event_worker(
             match torrents.set_global_speed_limits(download_kib, upload_kib) {
                 Ok(_) => {
                     if changed {
-                        tracing::info!(download_kib, upload_kib, "global speed limits applied")
+                        let origine = if scheduled_speed_limits(&cfg).is_some() {
+                            "fascia oraria"
+                        } else {
+                            "limiti base"
+                        };
+                        tracing::info!(
+                            "🚦 Limiti di velocità applicati ({}): {} KB/s in download · {} KB/s in upload",
+                            origine,
+                            download_kib,
+                            upload_kib
+                        )
                     }
                 }
                 Err(error) => tracing::debug!(%error, "speed policy apply failed"),
@@ -10248,7 +10302,16 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
         if ratio_reached || time_reached {
             match torrents.pause(&torrent.hash) {
                 Ok(true) => {
-                    tracing::info!(hash=%torrent.hash, ratio_reached, time_reached, "torrent paused at seed limit")
+                    let motivo = match (ratio_reached, time_reached) {
+                        (true, true) => "ratio e tempo",
+                        (true, false) => "ratio",
+                        _ => "tempo",
+                    };
+                    tracing::info!(
+                        "⏸️ Torrent in pausa: limite di seed raggiunto ({}) · {}",
+                        motivo,
+                        torrent.hash
+                    )
                 }
                 Ok(false) => {
                     tracing::warn!(hash=%torrent.hash, "torrent seed limit could not be applied in current mode")
@@ -11335,12 +11398,17 @@ pub async fn serve(
     let web_listener = tokio::net::TcpListener::bind(web_addr).await?;
     let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?;
     tracing::info!(
-        %web_addr,
-        %engine_addr,
-        dry_run = state.cfg.dry_run,
-        active = state.cfg.active,
-        libtorrent = %crate::libtorrent::libtorrent_version(),
-        "rextto daemon ready"
+        "🚀 Rextto avviato · interfaccia http://{} · motore http://{} · libtorrent {} · {}",
+        web_addr,
+        engine_addr,
+        crate::libtorrent::libtorrent_version(),
+        if state.cfg.dry_run {
+            "modalità dry-run (nessun download reale)"
+        } else if state.cfg.active {
+            "attivo (download abilitati)"
+        } else {
+            "in stand-by (download in pausa)"
+        }
     );
     let worker = tokio::spawn(torrent_event_worker(
         state.config_path.clone(),

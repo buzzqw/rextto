@@ -654,15 +654,27 @@ impl LibtorrentClient {
             return Ok(());
         };
         let lt = &cfg.libtorrent;
-        // One-line session summary: utile in diagnosi, ma viene ripetuto ad ogni
-        // "Applica ora"/ottimizzazione, quindi resta a debug.
-        tracing::debug!(
-            cache_blocks = lt.cache_size,
-            connections_limit = lt.connections_limit,
-            aio_threads = lt.aio_threads,
-            download_limit_kib = lt.download_limit_kib,
-            upload_limit_kib = lt.upload_limit_kib,
-            "libtorrent session settings"
+        // Come il legacy extto ("🧠 Memoria libtorrent → ..."): frase leggibile
+        // con unità, non un dump di campi tecnici.
+        let cache_label = if lt.cache_size > 0 {
+            format!("{} MB", lt.cache_size.saturating_mul(16) / 1024)
+        } else {
+            "automatica".to_string()
+        };
+        let limit_label = |kib: i64| {
+            if kib > 0 {
+                format!("{kib} KB/s")
+            } else {
+                "illimitata".to_string()
+            }
+        };
+        tracing::info!(
+            "🧠 Memoria libtorrent: cache {}, connessioni max {}, thread I/O {}, banda base {} in download / {} in upload",
+            cache_label,
+            lt.connections_limit,
+            lt.aio_threads,
+            limit_label(lt.download_limit_kib),
+            limit_label(lt.upload_limit_kib)
         );
         let mut lines: Vec<String> = Vec::new();
         let int = |lines: &mut Vec<String>, key: &str, value: i64| {
@@ -1422,7 +1434,10 @@ impl LibtorrentClient {
             tracing::warn!(%warning, "some fastresume files were not restored");
         }
         if restored > 0 {
-            tracing::info!(restored, "restored libtorrent fastresume state");
+            tracing::info!(
+                "♻️ Stato libtorrent ripristinato: {} torrent ripartono da dove erano",
+                restored
+            );
         }
         Ok(restored)
     }
