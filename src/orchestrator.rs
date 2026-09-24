@@ -562,6 +562,7 @@ pub async fn run_cycle_domain(
                 }
             }
         }
+        reconcile_pack_identity_from_magnet(&mut release);
         let is_ready_pending =
             magnet_hash(&release.magnet).is_some_and(|hash| ready_pending.contains(&hash));
         if release.kind == "series" {
@@ -819,6 +820,38 @@ fn release_target(release: &Release) -> String {
         }
     }
     release.title.clone()
+}
+
+/// Some indexers publish a corrected/translated title while the torrent's
+/// display name still carries the actual season and episode range. Prefer that
+/// identity for season packs: the files are named from the torrent metadata,
+/// and rejecting a valid S05 pack as S06 would make it download again forever.
+fn reconcile_pack_identity_from_magnet(release: &mut Release) {
+    if release.kind != "series" || !release.is_pack {
+        return;
+    }
+    let Ok(url) = url::Url::parse(&release.magnet) else {
+        return;
+    };
+    let Some(display_name) = url
+        .query_pairs()
+        .find(|(key, _)| key == "dn")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.trim().is_empty() && value != &release.title)
+    else {
+        return;
+    };
+    let Some(corrected) = crate::parser::reconcile_pack_identity(release, &display_name) else {
+        return;
+    };
+    tracing::warn!(
+        title = %release.title,
+        torrent_name = %display_name,
+        declared_season = ?release.season,
+        torrent_season = ?corrected.season,
+        "correcting season-pack identity from torrent display name"
+    );
+    *release = corrected;
 }
 
 /// `1,2,3`, or `none` when empty; avoids `[]` in the log.

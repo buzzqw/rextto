@@ -11324,32 +11324,6 @@ fn discard_completed_source(
     event: &TorrentEvent,
     reason: &str,
 ) {
-    // A completed source rejected as invalid must never be selected again. The
-    // normal error cleanup removes placeholders so legitimate failed downloads
-    // can retry; this specific rejection is permanent for the same info hash.
-    let release = db
-        .lock()
-        .unwrap()
-        .torrent_meta(&event.hash)
-        .ok()
-        .flatten()
-        .map(|meta| meta.release);
-    if let Some(release) = release {
-        match db.lock().unwrap().blocklist(&release, reason) {
-            Ok(()) => tracing::info!(
-                hash = %event.hash,
-                name = %event.name,
-                reason,
-                "rejected release added to blocklist; it will not be downloaded again"
-            ),
-            Err(error) => tracing::error!(
-                hash = %event.hash,
-                name = %event.name,
-                %error,
-                "could not blocklist rejected release"
-            ),
-        }
-    }
     let source = postprocess::completion_path(event);
 
     // Detach the completed torrent before touching its storage. This prevents
@@ -11419,6 +11393,54 @@ fn discard_completed_source(
     }
 }
 
+/// Legacy parity: if the torrent name is generic or unavailable, derive the
+/// pack season from the actual video filenames before validating the import.
+fn reconcile_pack_identity_from_files(
+    release: &Release,
+    source: &std::path::Path,
+) -> Option<Release> {
+    if release.kind != "series" || !release.is_pack {
+        return None;
+    }
+    let mut seasons: HashMap<i64, Vec<i64>> = HashMap::new();
+    for file in postprocess::video_files(source).ok()? {
+        let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(parsed) = parser::parse_release(name, &release.magnet, &release.source) else {
+            continue;
+        };
+        if parsed.kind != "series"
+            || !parser::series_names_match(
+                release.series.as_deref().unwrap_or_default(),
+                parsed.series.as_deref().unwrap_or_default(),
+            )
+        {
+            continue;
+        }
+        let (Some(season), Some(episode)) = (parsed.season, parsed.episode) else {
+            continue;
+        };
+        if episode > 0 {
+            seasons.entry(season).or_default().push(episode);
+        }
+    }
+    let (season, mut episodes) = seasons
+        .into_iter()
+        .max_by_key(|(_, episodes)| episodes.len())?;
+    if Some(season) == release.season || episodes.is_empty() {
+        return None;
+    }
+    episodes.sort_unstable();
+    episodes.dedup();
+    let mut corrected = release.clone();
+    corrected.season = Some(season);
+    corrected.episode = episodes.first().copied();
+    corrected.episode_range = episodes;
+    corrected.is_pack = true;
+    Some(corrected)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_torrent_event(
     cfg: &Config,
@@ -11476,21 +11498,37 @@ async fn handle_torrent_event(
                 tracing::debug!(hash=%event.hash, name=%event.name, "ignoring completion for already completed torrent");
                 return Ok(false);
             }
-            let destination = postprocess::destination_for(&metadata.release, cfg);
+            let mut release = metadata.release.clone();
+            let source = postprocess::completion_path(&event);
+            let corrected = crate::parser::reconcile_pack_identity(&release, &event.name)
+                .or_else(|| reconcile_pack_identity_from_files(&release, &source));
+            if let Some(corrected) = corrected {
+                tracing::warn!(
+                    hash = %event.hash,
+                    title = %release.title,
+                    torrent_name = %event.name,
+                    declared_season = ?release.season,
+                    torrent_season = ?corrected.season,
+                    "correcting season-pack identity from the actual torrent name"
+                );
+                db.lock()
+                    .unwrap()
+                    .reconcile_pack_release(&event.hash, &corrected)?;
+                release = corrected;
+            }
+            let destination = postprocess::destination_for(&release, cfg);
             let current = FsPath::new(&event.save_path);
-            if metadata.release.is_pack {
+            if release.is_pack {
                 if let Some(destination) = destination {
-                    let source = postprocess::completion_path(&event);
                     let size = postprocess::size_of_path(&source)?;
-                    let matching = postprocess::matching_pack_files(&source, &metadata.release)?;
+                    let matching = postprocess::matching_pack_files(&source, &release)?;
                     if matching.is_empty() {
                         let error = "season pack filenames do not match declared season";
                         tracing::warn!(
                             hash = %event.hash,
                             name = %event.name,
-                            title = %metadata.release.title,
-                            declared_season = %metadata
-                                .release
+                            title = %release.title,
+                            declared_season = %release
                                 .season
                                 .map(|season| season.to_string())
                                 .unwrap_or_else(|| "unknown".into()),
@@ -11506,7 +11544,7 @@ async fn handle_torrent_event(
                     // rename/trash files while they are still being copied,
                     // producing transient duplicates and stale DB paths.
                     let _import_guard =
-                        ArchiveImportGuard::acquire(metadata.release.series.as_deref());
+                        ArchiveImportGuard::acquire(release.series.as_deref());
                     // Copy and process one episode at a time so a partially
                     // copied file is never visible and the old, inferior file
                     // is removed as soon as its replacement is in place.
@@ -11517,14 +11555,14 @@ async fn handle_torrent_event(
                             &source,
                             &destination,
                             cfg,
-                            metadata.release.quality.score_with_settings(&cfg.settings),
+                            release.quality.score_with_settings(&cfg.settings),
                         )?
                         else {
                             continue;
                         };
                         let mut partial = postprocess::process_pack_files(
                             &[(placed, file.clone())],
-                            &metadata.release,
+                            &release,
                             cfg,
                             tmdb,
                         )
@@ -11534,7 +11572,7 @@ async fn handle_torrent_event(
                     if !processed.is_empty() && processed.iter().all(|item| item.discarded) {
                         let restored = db.lock().unwrap().restore_upgrade(&event.hash)?;
                         if !restored {
-                            db.lock().unwrap().rollback_release(&metadata.release)?;
+                            db.lock().unwrap().rollback_release(&release)?;
                         }
                         db.lock().unwrap().mark_torrent_error(
                             &event.hash,
@@ -11566,7 +11604,7 @@ async fn handle_torrent_event(
                         })
                         .collect::<Vec<_>>();
                     db.lock().unwrap().mark_pack_completed(
-                        &metadata.release,
+                        &release,
                         &entries,
                         &destination.display().to_string(),
                         size,
@@ -11574,19 +11612,19 @@ async fn handle_torrent_event(
                     let episodes = processed
                         .iter()
                         .filter(|item| !item.discarded)
-                        .map(|item| serde_json::json!({"series": &metadata.release.series, "season": metadata.release.season, "episode": item.episode, "path": &item.path}))
+                        .map(|item| serde_json::json!({"series": &release.series, "season": release.season, "episode": item.episode, "path": &item.path}))
                         .collect::<Vec<_>>();
                     tracing::info!(
                         "🎉 Season pack complete — «{}» · {} episodes · {} · archived to {}",
-                        metadata.release.title,
+                        release.title,
                         episodes.len(),
                         crate::logging::human_bytes_i64(size),
                         destination.display()
                     );
                     let notification = notifier.notify_event("season_pack_completed", serde_json::json!({
-                        "series": &metadata.release.series,
-                        "season": metadata.release.season,
-                        "title": &metadata.release.title,
+                        "series": &release.series,
+                        "season": release.season,
+                        "title": &release.title,
                         "path": destination.display().to_string(),
                         "size_bytes": size,
                         "new_count": episodes.len(),
@@ -11613,17 +11651,17 @@ async fn handle_torrent_event(
                     );
                     true
                 } else {
-                    complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
+                    complete_torrent(cfg, db, torrents, &event, &release, tmdb).await?
                 }
             } else if let Some(destination) = destination {
                 if postprocess::same_path(current, &destination) {
-                    complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
+                    complete_torrent(cfg, db, torrents, &event, &release, tmdb).await?
                 } else if move_requests.insert(event.hash.clone()) {
                     postprocess::validate_destination_from(current, &destination)?;
                     tracing::debug!(
                         hash = %event.hash,
                         name = %event.name,
-                        title = %metadata.release.title,
+                        title = %release.title,
                         from = %current.display(),
                         to = %destination.display(),
                         "📁 MOVING TO NAS — completed download leaves the work folder"
@@ -11646,7 +11684,7 @@ async fn handle_torrent_event(
                         }
                         Err(error) => {
                             move_requests.remove(&event.hash);
-                            let destination = postprocess::destination_for(&metadata.release, cfg)
+                            let destination = postprocess::destination_for(&release, cfg)
                                 .or_else(|| Some(cfg.libtorrent_dir.clone()));
                             if let Some(destination) = destination {
                                 schedule_storage_move_retry(
@@ -11670,7 +11708,7 @@ async fn handle_torrent_event(
                     false
                 }
             } else {
-                complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
+                complete_torrent(cfg, db, torrents, &event, &release, tmdb).await?
             }
         }
         "storage_move_failed" => {

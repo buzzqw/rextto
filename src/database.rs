@@ -876,7 +876,7 @@ impl Database {
 
     pub fn is_blocklisted(&self, hash: &str) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM blocklist WHERE lower(magnet_hash)=?1) OR EXISTS(SELECT 1 FROM torrent_meta WHERE lower(hash)=?1 AND status='error' AND error='season pack filenames do not match declared season')",
+            "SELECT EXISTS(SELECT 1 FROM blocklist WHERE magnet_hash=?1)",
             [hash.to_ascii_lowercase()],
             |row| row.get(0),
         )?)
@@ -1684,6 +1684,82 @@ impl Database {
             }));
         }
         Ok(None)
+    }
+
+    /// Persists the identity found in the actual torrent name when an indexer
+    /// advertised a different season. Move the not-yet-downloaded placeholders
+    /// with it, otherwise the old RSS season remains eligible for later cycles.
+    pub fn reconcile_pack_release(&self, hash: &str, release: &Release) -> Result<()> {
+        let normalized = hash.to_ascii_lowercase();
+        let Some(old) = self.torrent_meta(&normalized)? else {
+            return Ok(());
+        };
+        if old.release.kind != "series" || !old.release.is_pack {
+            return Ok(());
+        }
+        let old_magnet = old.release.magnet;
+        let metadata_json = serde_json::to_string(&TorrentMeta {
+            release: release.clone(),
+        })?;
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+
+        let new_series_id: Option<i64> = if let Some(series) = release.series.as_deref() {
+            tx.query_row("SELECT id FROM series WHERE name=?1", [series], |row| row.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        let Some(new_series_id) = new_series_id else {
+            tx.execute(
+                "UPDATE torrent_meta SET kind=?1,title=?2,series_name=?3,season=?4,episode=?5,year=?6,quality_score=?7,source=?8,metadata_json=?9,updated_at=?10 WHERE hash=?11",
+                params![release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, metadata_json, now, normalized],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        };
+        let targets = release
+            .episode_range
+            .iter()
+            .copied()
+            .filter(|episode| *episode >= 0)
+            .collect::<std::collections::HashSet<_>>();
+        let mut statement = tx.prepare(
+            "SELECT id,episode FROM episodes WHERE (lower(COALESCE(magnet_hash,''))=?1 OR magnet_link=?2) AND downloaded_at IS NULL AND COALESCE(archive_path,'')=''",
+        )?;
+        let rows = statement
+            .query_map(params![normalized, old_magnet], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (id, episode) in rows {
+            if !targets.contains(&episode) {
+                tx.execute("DELETE FROM episodes WHERE id=?1", [id])?;
+                continue;
+            }
+            let conflict: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3 AND id<>?4",
+                    params![new_series_id, release.season, episode, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if conflict.is_some() {
+                tx.execute("DELETE FROM episodes WHERE id=?1", [id])?;
+            } else {
+                tx.execute(
+                    "UPDATE episodes SET series_id=?1,season=?2,title=?3,magnet_link=?4 WHERE id=?5",
+                    params![new_series_id, release.season, release.title, release.magnet, id],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE torrent_meta SET kind=?1,title=?2,series_name=?3,season=?4,episode=?5,year=?6,quality_score=?7,source=?8,metadata_json=?9,updated_at=?10 WHERE hash=?11",
+            params![release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, metadata_json, now, normalized],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Riconcilia i torrent tracciati ma assenti dalla sessione libtorrent.
@@ -2929,6 +3005,62 @@ mod tests {
             db.torrent_status(&digest).unwrap().as_deref(),
             Some("queued")
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn reconciles_pack_placeholders_when_torrent_season_differs() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-pack-season-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(id,name) VALUES (1,'Example')", [])
+            .unwrap();
+        let mut advertised = release();
+        advertised.title = "Example.S06E01-06.1080p".into();
+        advertised.season = Some(6);
+        advertised.is_pack = true;
+        advertised.episode_range = (1..=6).collect();
+        let hash = magnet_hash(&advertised.magnet).unwrap();
+        db.register_torrent(&advertised).unwrap();
+        for episode in 1..=6 {
+            db.conn
+                .execute(
+                    "INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (1,6,?1,?2,100,?3,?4)",
+                    params![
+                        episode,
+                        advertised.title,
+                        (episode == 1).then_some(hash.as_str()),
+                        advertised.magnet,
+                    ],
+                )
+                .unwrap();
+        }
+        let mut actual = advertised.clone();
+        actual.title = "Example.S05E01-06.1080p".into();
+        actual.season = Some(5);
+        db.reconcile_pack_release(&hash, &actual).unwrap();
+
+        assert_eq!(db.torrent_meta(&hash).unwrap().unwrap().release.season, Some(5));
+        let old_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM episodes WHERE season=6", [], |row| row.get(0))
+            .unwrap();
+        let new_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM episodes WHERE season=5", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old_count, 0);
+        assert_eq!(new_count, 6);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

@@ -465,6 +465,42 @@ pub fn parse_release(title: &str, magnet: &str, source: &str) -> Option<Release>
     parse_release_at(title, magnet, source, Utc::now())
 }
 
+/// Reconcile a season pack with the name supplied by the torrent itself.
+///
+/// Indexers occasionally publish a title whose season differs from the actual
+/// torrent name (for example an RSS title saying `S06E01-06` while the torrent
+/// and its files are `S05E01-06`). The legacy importer parsed the completed
+/// filenames, so the torrent's identity is authoritative at that point.
+pub fn reconcile_pack_identity(release: &Release, torrent_name: &str) -> Option<Release> {
+    if release.kind != "series" || !release.is_pack || torrent_name.trim().is_empty() {
+        return None;
+    }
+    let parsed = parse_release(torrent_name, &release.magnet, &release.source)?;
+    if !parsed.is_pack {
+        return None;
+    }
+    let same_series = match (release.series.as_deref(), parsed.series.as_deref()) {
+        (Some(left), Some(right)) => series_names_match(left, right),
+        _ => false,
+    };
+    if !same_series
+        || (parsed.season == release.season && parsed.episode_range == release.episode_range)
+    {
+        return None;
+    }
+    let mut corrected = release.clone();
+    corrected.title = parsed.title;
+    // Keep the configured/canonical series name; the torrent name may use an
+    // alias or a translated title even when its season is the authoritative
+    // one.
+    corrected.season = parsed.season;
+    corrected.episode = parsed.episode;
+    corrected.is_pack = parsed.is_pack;
+    corrected.episode_range = parsed.episode_range;
+    corrected.quality = merge_quality(parsed.quality, release.quality.clone());
+    Some(corrected)
+}
+
 pub fn parse_release_at(
     title: &str,
     magnet: &str,
@@ -633,6 +669,24 @@ mod tests {
         assert_eq!(release.series.as_deref(), Some("Example Show"));
         assert_eq!(release.season, Some(2));
         assert_eq!(release.episode_range, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn corrects_pack_season_from_the_actual_torrent_name() {
+        let advertised = parse_release(
+            "Slow.Horses.S06E01-06.1080p.WEB-DL.ITA",
+            MAGNET,
+            "test",
+        )
+        .unwrap();
+        let corrected = reconcile_pack_identity(
+            &advertised,
+            "Slow Horses S05e01-06 (1080p Ita Eng Spa h265 10bit SubS) byMe7alh",
+        )
+        .expect("torrent name should override the wrong RSS season");
+        assert_eq!(corrected.season, Some(5));
+        assert_eq!(corrected.episode_range, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(corrected.series.as_deref(), Some("Slow Horses"));
     }
 
     #[test]
