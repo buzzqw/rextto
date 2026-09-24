@@ -10013,6 +10013,10 @@ async fn torrent_event_worker(
                 events.drain(..overflow);
             }
         }
+        // Un pack archiviato che ha già seedato abbastanza non deve restare in
+        // trasferimento: la sorgente è ridondante (copia sul NAS) e va rimossa
+        // prima che la seed policy la sposti su disco solo per cancellarla.
+        remove_seeded_archived_packs(&cfg, &torrents, &db);
         // Enforce the seed policy only after handling this tick's events: with a
         // very low seed limit a just-finished torrent could otherwise be removed
         // before its `torrent_finished` event is post-processed and archived.
@@ -10232,6 +10236,114 @@ fn needs_infinite_seed_resume(torrent: &crate::models::TorrentView) -> bool {
         && torrent.progress >= 100.0
         && torrent.state == "paused"
         && !torrent.auto_managed
+}
+
+/// Un season pack archiviato sul NAS non deve restare per sempre in
+/// trasferimento: la sorgente serve solo a seedare, quindi appena raggiunge il
+/// limite di ratio/tempo va rimossa come qualsiasi altro download concluso.
+/// Si agisce solo se esiste davvero una copia in libreria (`processed_path`
+/// fuori dallo storage del torrent), così non si cancella mai l'unica copia.
+fn remove_seeded_archived_packs(
+    cfg: &Config,
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+) {
+    for torrent in torrents.list() {
+        // Seed infinito esplicito: il pack deve restare in seed.
+        if torrent.seed_ratio == 0.0 || torrent.seed_days == 0 {
+            continue;
+        }
+        let completed = torrent.progress >= 99.99
+            || matches!(torrent.state.as_str(), "finished" | "seeding" | "paused");
+        if !completed {
+            continue;
+        }
+        let (ratio_reached, time_reached) = seed_limits_reached(cfg, &torrent);
+        if !ratio_reached && !time_reached {
+            continue;
+        }
+        if !archived_pack_source_disposable(db, &torrent.hash, &torrent.save_path) {
+            continue;
+        }
+        match torrents.remove(&torrent.hash, true) {
+            Ok(true) => {
+                let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
+                tracing::info!(
+                    hash = %torrent.hash,
+                    name = %torrent.name,
+                    "🗑️ SEASON PACK SEEDED — source removed (copy kept on NAS)"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(hash=%torrent.hash, %error, "archived pack removal failed")
+            }
+        }
+    }
+}
+
+/// Limiti di seed effettivi (per-torrent se impostati, altrimenti globali) e se
+/// ratio/tempo sono stati raggiunti. Stessa semantica di `enforce_seed_policy`.
+fn seed_limits_reached(cfg: &Config, torrent: &crate::models::TorrentView) -> (bool, bool) {
+    let global_ratio = cfg
+        .libtorrent
+        .stop_at_ratio
+        .then_some(cfg.libtorrent.seed_ratio)
+        .filter(|value| *value > 0.0);
+    let global_time = if cfg.libtorrent.seed_time_days > 0 {
+        Some(cfg.libtorrent.seed_time_days.saturating_mul(86_400))
+    } else {
+        (cfg.libtorrent.seed_time_minutes > 0)
+            .then_some(cfg.libtorrent.seed_time_minutes.saturating_mul(60))
+    };
+    let ratio_limit = if torrent.seed_ratio > 0.0 {
+        Some(torrent.seed_ratio)
+    } else if torrent.seed_ratio < 0.0 {
+        global_ratio
+    } else {
+        None
+    };
+    let time_limit = if torrent.seed_days > 0 {
+        Some(torrent.seed_days.saturating_mul(86_400))
+    } else if torrent.seed_days < 0 {
+        global_time
+    } else {
+        None
+    };
+    let ratio_reached = ratio_limit.is_some_and(|limit| {
+        torrent.all_time_download > 0
+            && (torrent.all_time_upload as f64 / torrent.all_time_download as f64) >= limit
+    });
+    let time_reached = time_limit.is_some_and(|limit| torrent.seeding_seconds >= limit);
+    (ratio_reached, time_reached)
+}
+
+/// Vero solo se il torrent è un season pack già archiviato e `processed_path`
+/// punta fuori dallo storage del torrent: in quel caso la sorgente è una copia
+/// ridondante e può essere rimossa lasciando il seeding.
+fn archived_pack_source_disposable(db: &Arc<Mutex<Database>>, hash: &str, save_path: &str) -> bool {
+    let (is_pack, status, processed) = {
+        let database = db.lock().unwrap();
+        let is_pack = database
+            .torrent_meta(hash)
+            .ok()
+            .flatten()
+            .map(|meta| meta.release.is_pack)
+            .unwrap_or(false);
+        let status = database.torrent_status(hash).ok().flatten();
+        let processed = database.torrent_processed(hash).ok().flatten();
+        (is_pack, status, processed)
+    };
+    if !is_pack || status.as_deref() != Some("completed") {
+        return false;
+    }
+    let Some(processed) = processed else {
+        return false;
+    };
+    if processed.trim().is_empty() {
+        return false;
+    }
+    !FsPath::new(&processed).starts_with(FsPath::new(save_path))
 }
 
 fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>) {
@@ -11489,6 +11601,80 @@ mod tests {
         assert!(!needs_infinite_seed_resume(&torrent_view("paused", false, 3)));
         // Already seeding: nothing to do.
         assert!(!needs_infinite_seed_resume(&torrent_view("seeding", false, 0)));
+    }
+
+    #[test]
+    fn seed_limits_reached_matches_seed_policy() {
+        let mut cfg = Config::default();
+        cfg.libtorrent.stop_at_ratio = true;
+        cfg.libtorrent.seed_ratio = 2.0;
+        cfg.libtorrent.seed_time_days = 0;
+        cfg.libtorrent.seed_time_minutes = 0;
+
+        // Global ratio reached: 2.5x uploaded over 1GB downloaded.
+        let mut torrent = torrent_view("seeding", true, -1);
+        torrent.all_time_download = 1_000;
+        torrent.all_time_upload = 2_500;
+        assert_eq!(seed_limits_reached(&cfg, &torrent), (true, false));
+
+        // Below the global limit.
+        torrent.all_time_upload = 1_000;
+        assert_eq!(seed_limits_reached(&cfg, &torrent), (false, false));
+
+        // Per-torrent override wins over the global one.
+        torrent.seed_ratio = 5.0;
+        assert_eq!(seed_limits_reached(&cfg, &torrent), (false, false));
+
+        // Time limit: days is authoritative when set.
+        cfg.libtorrent.seed_time_days = 3;
+        let mut timed = torrent_view("seeding", true, -1);
+        timed.seed_days = -1;
+        timed.seeding_seconds = 3 * 86_400 + 1;
+        assert_eq!(seed_limits_reached(&cfg, &timed), (false, true));
+    }
+
+    #[test]
+    fn archived_pack_source_disposable_requires_copy_outside_torrent() {
+        let root = std::env::temp_dir().join(format!("rextto-packorg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Arc::new(Mutex::new(Database::open(&root.join("series.db")).unwrap()));
+        let release = crate::parser::parse_release(
+            "Show.S01.1080p.WEB-DL.ITA",
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "test",
+        )
+        .unwrap();
+        assert!(release.is_pack);
+        let hash = crate::utils::magnet_hash(&release.magnet).unwrap();
+        db.lock().unwrap().register_torrent(&release).unwrap();
+
+        // Not completed yet: the source must never be removed.
+        assert!(!archived_pack_source_disposable(
+            &db,
+            &hash,
+            "/tmp/torrents"
+        ));
+        db.lock()
+            .unwrap()
+            .mark_pack_completed(&release, &[], "/nas/Show", 1)
+            .unwrap();
+        // Archived to /nas: the copy exists, the source is disposable.
+        assert!(archived_pack_source_disposable(&db, &hash, "/tmp/torrents"));
+        // A processed path inside the torrent storage is not a copy.
+        db.lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE torrent_meta SET processed_path=?1 WHERE hash=?2",
+                rusqlite::params!["/tmp/torrents/Show S01", hash],
+            )
+            .unwrap();
+        assert!(!archived_pack_source_disposable(
+            &db,
+            &hash,
+            "/tmp/torrents"
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
