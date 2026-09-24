@@ -11324,6 +11324,32 @@ fn discard_completed_source(
     event: &TorrentEvent,
     reason: &str,
 ) {
+    // A completed source rejected as invalid must never be selected again. The
+    // normal error cleanup removes placeholders so legitimate failed downloads
+    // can retry; this specific rejection is permanent for the same info hash.
+    let release = db
+        .lock()
+        .unwrap()
+        .torrent_meta(&event.hash)
+        .ok()
+        .flatten()
+        .map(|meta| meta.release);
+    if let Some(release) = release {
+        match db.lock().unwrap().blocklist(&release, reason) {
+            Ok(()) => tracing::info!(
+                hash = %event.hash,
+                name = %event.name,
+                reason,
+                "rejected release added to blocklist; it will not be downloaded again"
+            ),
+            Err(error) => tracing::error!(
+                hash = %event.hash,
+                name = %event.name,
+                %error,
+                "could not blocklist rejected release"
+            ),
+        }
+    }
     let source = postprocess::completion_path(event);
 
     // Detach the completed torrent before touching its storage. This prevents

@@ -876,7 +876,7 @@ impl Database {
 
     pub fn is_blocklisted(&self, hash: &str) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM blocklist WHERE magnet_hash=?1)",
+            "SELECT EXISTS(SELECT 1 FROM blocklist WHERE lower(magnet_hash)=?1) OR EXISTS(SELECT 1 FROM torrent_meta WHERE lower(hash)=?1 AND status='error' AND error='season pack filenames do not match declared season')",
             [hash.to_ascii_lowercase()],
             |row| row.get(0),
         )?)
