@@ -225,7 +225,7 @@ impl Engine {
                     // già il totale in "Step 2/2 completato".
                     tracing::debug!(query = %query, compatible, "🔎 release compatibili");
                 } else {
-                    tracing::debug!(query = %query, found = items.len(), "🔎 search: nessuna release compatibile");
+                    tracing::debug!(query = %query, found = items.len(), "🔎 search: no matching releases");
                 }
                 all.extend(items);
             }

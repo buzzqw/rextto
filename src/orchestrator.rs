@@ -202,8 +202,9 @@ pub async fn run_cycle_domain(
     }
     for ((series, season), mut episodes) in gap_summary {
         episodes.sort_unstable();
-        // Come il legacy extto: una riga discorsiva per serie/stagione.
-        tracing::info!(
+        // Only at debug: the full list of open gaps is noisy. The log reports a
+        // gap when it is actually filled (see DOWNLOAD STARTED below).
+        tracing::debug!(
             "→ {} S{:02} gap: {}",
             series,
             season,
@@ -623,20 +624,25 @@ pub async fn run_cycle_domain(
             };
             match added {
                 Ok(true) => {
-                    let gap_note = if gap_episodes.is_empty() {
-                        String::new()
+                    if gap_episodes.is_empty() {
+                        tracing::info!(
+                            "📥 Download started [{}]: {} · {} · score {} · hash: {}",
+                            release.source,
+                            release_target(&release),
+                            release.kind,
+                            score,
+                            hash_label(&release)
+                        );
                     } else {
-                        format!(" · episodi mancanti: {}", episodes_label(&gap_episodes))
-                    };
-                    tracing::info!(
-                        "📥 Download avviato [{}]: {} · {} · punteggio {}{} · hash: {}",
-                        release.source,
-                        release_target(&release),
-                        release.kind,
-                        score,
-                        gap_note,
-                        hash_label(&release)
-                    );
+                        tracing::info!(
+                            "✅ Gap filled: {} · episodes {} · downloading [{}]: {} · hash: {}",
+                            release_target(&release),
+                            episodes_label(&gap_episodes),
+                            release.source,
+                            release.title,
+                            hash_label(&release)
+                        );
+                    }
                     db.lock().unwrap().register_torrent(&release)?;
                     if let Some(hash) = magnet_hash(&release.magnet) {
                         let _ = db

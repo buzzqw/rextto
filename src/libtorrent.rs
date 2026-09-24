@@ -654,22 +654,22 @@ impl LibtorrentClient {
             return Ok(());
         };
         let lt = &cfg.libtorrent;
-        // Come il legacy extto ("🧠 Memoria libtorrent → ..."): frase leggibile
-        // con unità, non un dump di campi tecnici.
+        // Readable sentence with units, like the legacy extto line, instead of
+        // a dump of key: value fields.
         let cache_label = if lt.cache_size > 0 {
             format!("{} MB", lt.cache_size.saturating_mul(16) / 1024)
         } else {
-            "automatica".to_string()
+            "auto".to_string()
         };
         let limit_label = |kib: i64| {
             if kib > 0 {
                 format!("{kib} KB/s")
             } else {
-                "illimitata".to_string()
+                "unlimited".to_string()
             }
         };
         tracing::info!(
-            "🧠 Memoria libtorrent: cache {}, connessioni max {}, thread I/O {}, banda base {} in download / {} in upload",
+            "🧠 libtorrent memory: cache {}, max connections {}, I/O threads {}, base bandwidth {} down / {} up",
             cache_label,
             lt.connections_limit,
             lt.aio_threads,
@@ -1435,7 +1435,7 @@ impl LibtorrentClient {
         }
         if restored > 0 {
             tracing::info!(
-                "♻️ Stato libtorrent ripristinato: {} torrent ripartono da dove erano",
+                "♻️ libtorrent state restored: {} torrent(s) resume where they left off",
                 restored
             );
         }

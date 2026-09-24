@@ -913,7 +913,7 @@ async fn index() -> Html<String> {
 <html lang="it">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Rextto</title>
   <link rel="stylesheet" href="/pkg/ui.css">
 </head>
@@ -938,7 +938,7 @@ const MAGNET_PAGE: &str = r#"<!doctype html>
 <html lang="it">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Rextto — aggiungi magnet</title>
   <style>
     body { font-family: Inter, system-ui, sans-serif; background: #0a0f1a; color: #e9f0fb; display: grid; place-items: center; min-height: 100vh; margin: 0; }
@@ -9720,7 +9720,7 @@ async fn torrent_event_worker(
                     / 1024;
                 let (limit_kib, _) = current_speed_limits(&cfg);
                 tracing::info!(
-                    "📊 Coda: {} download attivi, {} in coda · {} KB/s su {} KB/s disponibili",
+                    "📊 Queue: {} active downloads, {} queued · {} KB/s of {} KB/s available",
                     active,
                     queued,
                     rate_kib,
@@ -9740,14 +9740,14 @@ async fn torrent_event_worker(
             match torrents.set_global_speed_limits(download_kib, upload_kib) {
                 Ok(_) => {
                     if changed {
-                        let origine = if scheduled_speed_limits(&cfg).is_some() {
-                            "fascia oraria"
+                        let source = if scheduled_speed_limits(&cfg).is_some() {
+                            "schedule"
                         } else {
-                            "limiti base"
+                            "base limits"
                         };
                         tracing::info!(
-                            "🚦 Limiti di velocità applicati ({}): {} KB/s in download · {} KB/s in upload",
-                            origine,
+                            "🚦 Speed limits applied ({}): {} KB/s down · {} KB/s up",
+                            source,
                             download_kib,
                             upload_kib
                         )
@@ -10302,14 +10302,14 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
         if ratio_reached || time_reached {
             match torrents.pause(&torrent.hash) {
                 Ok(true) => {
-                    let motivo = match (ratio_reached, time_reached) {
-                        (true, true) => "ratio e tempo",
+                    let reason = match (ratio_reached, time_reached) {
+                        (true, true) => "ratio and time",
                         (true, false) => "ratio",
-                        _ => "tempo",
+                        _ => "time",
                     };
                     tracing::info!(
-                        "⏸️ Torrent in pausa: limite di seed raggiunto ({}) · {}",
-                        motivo,
+                        "⏸️ Torrent paused: seed limit reached ({}) · {}",
+                        reason,
                         torrent.hash
                     )
                 }
@@ -11398,16 +11398,16 @@ pub async fn serve(
     let web_listener = tokio::net::TcpListener::bind(web_addr).await?;
     let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?;
     tracing::info!(
-        "🚀 Rextto avviato · interfaccia http://{} · motore http://{} · libtorrent {} · {}",
+        "🚀 Rextto started · UI http://{} · engine http://{} · libtorrent {} · {}",
         web_addr,
         engine_addr,
         crate::libtorrent::libtorrent_version(),
         if state.cfg.dry_run {
-            "modalità dry-run (nessun download reale)"
+            "dry-run (no real downloads)"
         } else if state.cfg.active {
-            "attivo (download abilitati)"
+            "active (downloads enabled)"
         } else {
-            "in stand-by (download in pausa)"
+            "stand-by (downloads paused)"
         }
     );
     let worker = tokio::spawn(torrent_event_worker(
