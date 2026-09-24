@@ -886,6 +886,9 @@ pub fn App() -> impl IntoView {
             .map(|item| value_f64(item, "num_peers"))
             .sum::<f64>() as i64
     });
+    // Su mobile la voce "Sistema" è comprimibile: evita che la barra di
+    // navigazione diventi una fila interminabile di voci poco usate.
+    let nav_more = RwSignal::new(false);
 
     view! {
         <Title text="Rextto" />
@@ -896,10 +899,17 @@ pub fn App() -> impl IntoView {
                         <div><strong>Rextto</strong><small title=ctx_tr("Versione applicazione")>{move || format!("Media daemon · v{}", text(&data.get().status, "version", "?"))}</small></div>
                     </div>
                     <nav>
-                        {NAV_GROUPS.iter().map(|(_group, items)| {
+                        {NAV_GROUPS.iter().enumerate().map(|(index, (_group, items))| {
                             let items = *items;
+                            let is_system = index + 1 == NAV_GROUPS.len();
                             view! {
-                                <div class="nav-group">
+                                <div class="nav-group" class:system-group=is_system class:open=move || nav_more.get()>
+                                    {is_system.then(|| view! {
+                                        <button class="nav-more" on:click=move |_| nav_more.update(|open| *open = !*open)>
+                                            <span>{ctx_tr("Sistema")}</span>
+                                            <span>{move || if nav_more.get() { "▲" } else { "▾" }}</span>
+                                        </button>
+                                    })}
                                     {items.iter().map(|(id, label)| {
                                         let id = *id;
                                         let item_label = *label;
