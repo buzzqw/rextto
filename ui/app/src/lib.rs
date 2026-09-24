@@ -34,7 +34,6 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("maintenance", "Manutenzione"),
             ("health", "Salute"),
             ("logs", "Log"),
-            ("blocklist", "Blocklist"),
         ],
     ),
 ];
@@ -992,7 +991,6 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "logs"><LogsView data /></Show>
                         <Show when=move || page.get() == "health"><HealthView data /></Show>
                         <Show when=move || page.get() == "gaps"><MissingView data /></Show>
-                        <Show when=move || page.get() == "blocklist"><BlocklistView data /></Show>
                     </div>
                 </main>
                 <ToastHost data />
@@ -7936,6 +7934,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </div>
             </Panel>
+            <BlocklistPanel data />
         </div>
     }
 }
@@ -8466,25 +8465,24 @@ fn CalendarView(data: RwSignal<Data>) -> impl IntoView {
     }
 }
 
+/// Pannello Blocklist: vive dentro Manutenzione, non ha più una voce di menu.
 #[component]
-fn BlocklistView(data: RwSignal<Data>) -> impl IntoView {
+fn BlocklistPanel(data: RwSignal<Data>) -> impl IntoView {
     view! {
-        <div class="view">
-            <Panel title="Blocklist">
-                <div class="list">
-                    {move || data.get().blocklist.iter().cloned().map(|item| {
-                        let hash = text(&item, "hash", "");
-                        view! {
-                            <div class="list-item">
-                                <div><strong>{text(&item, "title", "Release")}</strong><small class="mono">{hash.clone()}"/ "{text(&item, "reason", "-")}</small></div>
-                                <button class="btn sm" on:click=move |_| run_post(data, &format!("/api/blocklist/{hash}/remove"), None, "Elemento sbloccato")>{ctx_tr("Sblocca")}</button>
-                            </div>
-                        }
-                    }).collect_view()}
-                </div>
-                <Show when=move || data.get().blocklist.is_empty()><Empty text="Nessun magnet bloccato." /></Show>
-            </Panel>
-        </div>
+        <Panel title="Blocklist">
+            <div class="list">
+                {move || data.get().blocklist.iter().cloned().map(|item| {
+                    let hash = text(&item, "hash", "");
+                    view! {
+                        <div class="list-item">
+                            <div><strong>{text(&item, "title", "Release")}</strong><small class="mono">{hash.clone()}"/ "{text(&item, "reason", "-")}</small></div>
+                            <button class="btn sm" on:click=move |_| run_post(data, &format!("/api/blocklist/{hash}/remove"), None, "Elemento sbloccato")>{ctx_tr("Sblocca")}</button>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+            <Show when=move || data.get().blocklist.is_empty()><Empty text="Nessun magnet bloccato." /></Show>
+        </Panel>
     }
 }
 
