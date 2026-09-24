@@ -10245,8 +10245,11 @@ fn remove_seeded_completed(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<M
         if torrent.seed_ratio == 0.0 || torrent.seed_days == 0 {
             continue;
         }
+        // Deve essere davvero completo: un download in pausa a metà non va
+        // toccato, anche se ha già caricato qualcosa (ratio raggiunto) o è
+        // fermo da giorni. I pack archiviati al limite di seed sono a 100%.
         let completed = torrent.progress >= 99.99
-            || matches!(torrent.state.as_str(), "finished" | "seeding" | "paused");
+            || matches!(torrent.state.as_str(), "finished" | "seeding");
         if !completed {
             continue;
         }
