@@ -1807,7 +1807,7 @@ fn setting_tooltip(key: &str) -> &'static str {
         "libtorrent_seed_ratio" => "Rapporto upload/download dopo cui fermare il seeding (0 = infinito).",
         "libtorrent_seed_time" => "Limite di seeding in minuti, usato solo se Seed massimo (giorni) è 0; utile per limiti inferiori a 24 ore.",
         "libtorrent_seed_time_days" => "Limite principale di seeding in giorni; se maggiore di 0 prevale sul limite in minuti.",
-        "auto_remove_completed" => "Rimuove dalla sessione i torrent completati appena raggiungono i limiti di seed (o appena archiviati), senza dover premere Pulisci completati. Non cancella l'archivio NAS.",
+        "auto_remove_completed" => "Elimina dalla sessione i torrent completati appena raggiungono i limiti di seed (ratio/tempo), senza dover premere Pulisci completati. I file si cancellano solo se la copia è già archiviata sul NAS.",
         "libtorrent_connections_limit" => "Numero massimo di connessioni peer simultanee a livello di sessione.",
         "libtorrent_upload_slots_limit" => "Numero di peer non bloccati in upload (-1 = automatico).",
         "libtorrent_half_open_limit" => "Numero massimo di connessioni in fase di apertura (-1 = automatico).",
@@ -2445,6 +2445,13 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 <p class="muted">{ctx_tr("Torrent ancora nel client (download e seed). Il badge NAS indica che i file sono già archiviati: restano qui a seedare e passano allo Storico download solo quando escono dalla sessione (Pulisci completati, rimozione manuale, o automaticamente al limite di seed).")}</p>
                 <div class="toolbar" style="margin-bottom:10px">
                     <button class="btn sm" title=ctx_tr("Toglie dalla coda libtorrent i torrent completati che hanno già raggiunto i limiti di seed (ratio/tempo). Esclude il seed infinito e non cancella l'archivio NAS: i torrent escono dalla Sessione e passano allo Storico download.") on:click=move |_| run_cleanup_completed(data)>{ctx_tr("Pulisci completati")}</button>
+                    <label class="check" title=ctx_tr("Elimina dalla sessione i torrent completati appena raggiungono i limiti di seed (ratio/tempo). Non cancella l'archivio NAS: la copia in libreria resta.")>
+                        <input type="checkbox" prop:checked=move || flag(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_remove_completed", false) on:change=move |event| {
+                            let value = if event_target_checked(&event) { "true" } else { "false" };
+                            run_post(data, "/api/config/settings", Some(json!({"key": "auto_remove_completed", "value": value})), "Impostazione salvata");
+                        } />
+                        <span>{ctx_tr("Elimina i completati dopo il seed")}</span>
+                    </label>
                     <select style="width:auto" title=ctx_tr("Filtra i torrent per tag") prop:value=tag_filter on:change=move |event| tag_filter.set(event_target_value(&event))>
                         <option value="">{ctx_tr("Tutti i tag")}</option>
                         <option value="__none__">{ctx_tr("Senza tag")}</option>
@@ -2552,7 +2559,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 </div>
                 <Show when=move || data.get().history.is_empty()><Empty text="Nessun download concluso." /></Show>
                 <div class="table-wrap" style="margin-top:10px">
-                    <table class="data-table">
+                    <table class="data-table history-table">
                         <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("Tipo")}</th><th>{ctx_tr("Tag NAS")}</th><th>{ctx_tr("Score")}</th><th>{ctx_tr("Stato")}</th><th>{ctx_tr("Cartella libreria / NAS")}</th><th>{ctx_tr("Concluso")}</th></tr></thead>
                         <tbody>
                             {move || data.get().history.iter().cloned().map(|item| {
@@ -2616,9 +2623,10 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                 view! {
                                     <tr>
                                         <td class="truncate" title=name_title>
-                                            <div>{name}
+                                            <div class="torrent-name">
+                                                <span class="torrent-name-text">{name}</span>
                                                 <Show when=move || archived>
-                                                    <span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
+                                                    <span class="badge ok" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
                                                 </Show>
                                             </div>
                                             <Show when=move || !origin_show.is_empty()>
@@ -3325,7 +3333,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                                 } else if ended {
                                                     view! { <span class="badge" title=ctx_tr("Serie terminata: mancano ancora episodi")>{ctx_tr("🏁 terminata")}</span> }.into_any()
                                                 } else if complete {
-                                                    view! { <span class="badge ok" title=ctx_tr("Serie completa: tutti gli episodi disponibili sono archiviati")>{ctx_tr("✓✓ completa")}</span> }.into_any()
+                                                    view! { <span class="badge" title=ctx_tr("Al passo: tutti gli episodi pubblicati finora sono archiviati, ma la serie non è terminata")>{ctx_tr("✓ in pari")}</span> }.into_any()
                                                 } else {
                                                     view! { <span class="badge" class:ok=enabled>{if enabled { "attiva" } else { "in pausa" }}</span> }.into_any()
                                                 }}
@@ -3582,8 +3590,19 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                     if total == 0 { return None; }
                                     let downloaded = episodes.iter().filter(|item| text(item, "status", "") == "downloaded").count();
                                     let complete = downloaded >= total;
+                                    let ended = matches!(
+                                        text(&series_info.get(), "status", "").to_ascii_lowercase().as_str(),
+                                        "ended" | "canceled" | "cancelled"
+                                    );
+                                    let label = if !complete {
+                                        tr(data, "In corso")
+                                    } else if ended {
+                                        tr(data, "Completa")
+                                    } else {
+                                        tr(data, "In pari")
+                                    };
                                     Some(view! {
-                                        <span class="badge" class:ok=complete>{format!("{downloaded}/{total} · {}", if complete { tr(data, "Completa") } else { tr(data, "In corso") })}</span>
+                                        <span class="badge" class:ok=complete && ended>{format!("{downloaded}/{total} · {label}")}</span>
                                     })
                                 }}
                                 {move || {
@@ -4197,6 +4216,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
     let tab = RwSignal::new("config".to_string());
     let detail = RwSignal::new(Value::Null);
     let best_matches = RwSignal::new(Vec::<Value>::new());
+    let best_filter = RwSignal::new(String::new());
     let name = RwSignal::new(String::new());
     let year = RwSignal::new(String::new());
     let quality = RwSignal::new(String::new());
@@ -4555,9 +4575,13 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                             <Show when=move || !best_matches.get().is_empty()>
                                 <div class="table-wrap" style="margin-top:12px">
                                     <h4 style="margin:0 0 8px">{ctx_tr("Migliori trovati")}</h4>
+                                    <div class="toolbar" style="margin-bottom:8px">
+                                        <input style="flex:1" prop:value=best_filter on:input=move |event| best_filter.set(event_target_value(&event)) placeholder=ctx_tr("Filtra per titolo/anno… (-parola per escludere)") title=ctx_tr("Tutti i termini devono comparire nel titolo; quelli con - davanti devono mancare. Un anno a 4 cifre filtra anche per anno.") />
+                                        <span class="muted">{move || format!("{}/{}", best_matches.get().iter().filter(|release| matches_release_filter(release, &best_filter.get())).count(), best_matches.get().len())}</span>
+                                    </div>
                                     <table class="data-table">
                                         <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Fonte")}</th><th></th></tr></thead>
-                                        <tbody>{move || best_matches.get().iter().cloned().map(|release| {
+                                        <tbody>{move || best_matches.get().iter().filter(|release| matches_release_filter(release, &best_filter.get())).cloned().map(|release| {
                                             let queued = release.clone();
                                             view! { <tr><td class="truncate">{text(&release, "title", "Release")}</td><td class="muted">{text(&release, "source", "-")}</td><td><button class="btn sm primary" on:click=move |_| { let release = queued.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></td></tr> }
                                         }).collect_view()}</tbody>
@@ -4910,7 +4934,7 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                         }
                     });
                 }>
-                    <input prop:value=query title=ctx_tr("Cerca nell'archivio torrent per parole nel titolo; tutte le parole devono essere presenti") on:input=move |event| query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca parole nel titolo…") />
+                    <input prop:value=query title=ctx_tr("Cerca nell'archivio per parole nel titolo: quelle scritte devono essere presenti, quelle con - davanti devono mancare (es. -cam)") on:input=move |event| query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca parole nel titolo… (-parola esclude)") />
                     <button class="btn primary">{ctx_tr("Cerca")}</button>
                     <button type="button" class="btn" on:click=move |_| {
                         let chosen = selected.get();
@@ -5251,6 +5275,32 @@ fn apply_movie_metadata_choice(
         }
         metadata_loading.set(false);
     });
+}
+
+/// Filtro "regex facilitato" per le release: i termini separati da spazi devono
+/// comparire nel titolo, quelli prefissati da `-` devono essere assenti. Un anno
+/// a 4 cifre confronta anche il campo `year` della release.
+fn matches_release_filter(release: &Value, filter: &str) -> bool {
+    let title = text(release, "title", "").to_lowercase();
+    let year = release.get("year").and_then(Value::as_i64);
+    for raw in filter.split_whitespace() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(negated) = raw.strip_prefix('-') {
+            if !negated.is_empty() && title.contains(&negated.to_lowercase()) {
+                return false;
+            }
+            continue;
+        }
+        let wanted = raw.to_lowercase();
+        let is_year = raw.len() == 4 && raw.chars().all(|character| character.is_ascii_digit());
+        let hit = title.contains(&wanted) || (is_year && year == raw.parse::<i64>().ok());
+        if !hit {
+            return false;
+        }
+    }
+    true
 }
 
 /// Cartella finale da mostrare nella colonna "Cartella libreria / NAS": per un
@@ -5923,7 +5973,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                             <TextSetting label="Seed ratio globale (0 = infinito)" setting_key="libtorrent_seed_ratio" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_ratio", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (minuti, fallback)" setting_key="libtorrent_seed_time" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_minutes", "0")) placeholder="0" />
                              <TextSetting label="Seed massimo (giorni)" setting_key="libtorrent_seed_time_days" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "seed_time_days", "0")) placeholder="0" />
-                              <BooleanSetting label="Rimozione automatica dei completati" setting_key="auto_remove_completed" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_remove_completed", "false")) />
+                              <BooleanSetting label="Elimina i completati dopo il seed" setting_key="auto_remove_completed" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_remove_completed", "false")) />
                         </SettingGroup>
                         <SettingGroup title="Connessioni e prestazioni">
                             <TextSetting label="Limite connessioni totali" setting_key="libtorrent_connections_limit" value=Signal::derive(move || number(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "connections_limit")) placeholder="200" />
