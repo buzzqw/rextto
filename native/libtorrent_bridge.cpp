@@ -155,7 +155,15 @@ static void copy_string(char* output, size_t output_size, const std::string& val
 }
 
 static std::string hex_hash(lt::torrent_handle const& handle) {
+    // A hybrid torrent has two hashes. Magnets and Rextto's database are keyed
+    // by BTIH (v1), while `info_hash().to_string()` may pick the v2 hash. Keep
+    // the bridge stable by preferring v1 whenever it is available.
+#if LIBTORRENT_VERSION_NUM >= 20000
+    const auto hashes = handle.info_hashes();
+    auto raw = hashes.has_v1() ? hashes.v1.to_string() : hashes.v2.to_string();
+#else
     auto raw = handle.info_hash().to_string();
+#endif
     static constexpr char hex[] = "0123456789abcdef";
     std::string result;
     result.reserve(raw.size() * 2);

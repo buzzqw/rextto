@@ -55,7 +55,18 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
     let mut discovered_at = Utc::now();
     let mut out = Vec::new();
     loop {
-        match reader.read_event()? {
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            Err(error) if !out.is_empty() => {
+                // Some RSS endpoints keep the connection open after sending a
+                // useful prefix. Preserve the complete items already parsed
+                // instead of discarding them because the XML tail is missing.
+                tracing::debug!(%error, items = out.len(), "accepting partial RSS body");
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match event {
             Event::Start(start) => {
                 let name = local_name(start.name().as_ref());
                 if name == "item" || name == "entry" {
@@ -399,6 +410,11 @@ const FEED_FETCH_ATTEMPTS: u32 = 3;
 /// Timeout del singolo tentativo: il vecchio limite di 10s poteva troncare i
 /// feed grandi su linea lenta.
 const FEED_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Knaben keeps streaming a very large RSS response instead of closing it
+/// promptly. The browser can render the first entries while that happens; do
+/// the same here and stop after one normal listing page.
+const KNABEN_STREAM_ITEM_LIMIT: usize = 50;
+const KNABEN_STREAM_BODY_LIMIT: usize = 512 * 1024;
 
 /// Esito di un singolo tentativo diretto (senza FlareSolverr), per decidere se
 /// ritentare, passare a FlareSolverr o arrendersi.
@@ -435,19 +451,24 @@ async fn fetch_body_direct(
     throttle_host(url).await;
     let direct = request.send().await;
     drop(host_permit);
-    let response = match direct {
+    let mut response = match direct {
         Ok(response) => response,
         Err(error) => return FetchAttempt::Transient(error.to_string()),
     };
     let status = response.status();
     if status.is_success() {
-        return match response.text().await {
+        let body = if domain_of(url).is_some_and(|host| host.ends_with("knaben.org")) {
+            read_knaben_stream(&mut response).await
+        } else {
+            response.text().await.map_err(|error| error.to_string())
+        };
+        return match body {
             Ok(body) if is_cloudflare_challenge(&body) => {
                 FetchAttempt::Cloudflare("cloudflare challenge body".into())
             }
             Ok(body) => FetchAttempt::Body(body),
             // Stream chiuso a metà: errore transitorio, si ritenta.
-            Err(error) => FetchAttempt::Transient(error.to_string()),
+            Err(error) => FetchAttempt::Transient(error),
         };
     }
     if cloudflare_blocked(status.as_u16()) {
@@ -462,6 +483,37 @@ async fn fetch_body_direct(
         return FetchAttempt::Transient(format!("HTTP {status}"));
     }
     FetchAttempt::Fatal(format!("HTTP {status}"))
+}
+
+/// Read the useful prefix of Knaben's streaming RSS response. Its endpoint can
+/// keep producing items for a long time without sending the closing `</rss>`;
+/// waiting for `Response::text()` would make an otherwise usable feed hit the
+/// global cycle budget.
+async fn read_knaben_stream(response: &mut reqwest::Response) -> std::result::Result<String, String> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        body.extend_from_slice(&chunk);
+
+        let item_count = body
+            .windows(b"</item>".len())
+            .filter(|window| window == b"</item>")
+            .count();
+        if item_count >= KNABEN_STREAM_ITEM_LIMIT || body.len() >= KNABEN_STREAM_BODY_LIMIT {
+            break;
+        }
+    }
+
+    if body.is_empty() {
+        return Err("empty Knaben RSS response".into());
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Scarica il corpo di un feed con qualche tentativo sui soli errori
@@ -852,7 +904,7 @@ fn is_placeholder_magnet(magnet: &str) -> bool {
 }
 
 fn extract_magnet(body: &str) -> Option<String> {
-    let direct = crate::utils::cached_regex(r#"magnet:\?xt=urn:btih:[0-9a-fA-F]{40,64}[^\s\"'<>]*"#)
+    let direct = crate::utils::cached_regex(r#"magnet:\?xt=urn:bt(?:ih|mh):[0-9A-Za-z]{32,68}[^\s\"'<>]*"#)
         .ok()?
         .find(body)
         .map(|value| value.as_str().to_owned());

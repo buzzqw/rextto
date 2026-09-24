@@ -6,6 +6,8 @@ use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 
+const DOWNLOAD_HISTORY_RETENTION_DAYS: i64 = 30;
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -1744,6 +1746,7 @@ impl Database {
     /// Sono esclusi i download annullati prima di concludersi (`status='removed'`
     /// con progresso incompleto) e le righe senza nome.
     /// Il nome usa, nell'ordine, `name`, `title` o `series_name`.
+    /// Mantiene nello storico solo i download conclusi negli ultimi 30 giorni.
     /// Ritorna `(items_della_pagina, totale)`. `offset` è l'indice di partenza.
     pub fn completed_torrents(
         &self,
@@ -1751,10 +1754,11 @@ impl Database {
         limit: usize,
         query: &str,
     ) -> Result<(Vec<StoredTorrent>, i64)> {
-        let mut where_clause = String::from("FROM torrent_meta
+        let mut where_clause = format!("FROM torrent_meta
              WHERE removed_at IS NOT NULL
                AND (status IN ('completed','error') OR COALESCE(progress,0) >= 1)
-                AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''");
+               AND datetime(COALESCE(NULLIF(completed_at,''), NULLIF(removed_at,''), updated_at)) >= datetime('now', '-{} days')
+               AND COALESCE(NULLIF(name,''),NULLIF(title,''),NULLIF(series_name,'')) <> ''", DOWNLOAD_HISTORY_RETENTION_DAYS);
         // Ricerca intelligente: ogni parola deve comparire in almeno uno dei
         // campi utili dello storico, così `silo nas` trova anche titoli con
         // parole separate fra nome e cartella, senza scaricare tutte le pagine.
@@ -3753,6 +3757,43 @@ mod tests {
         let (page, total) = db.completed_torrents(1, 1, "silo").unwrap();
         assert_eq!(total, 2);
         assert_eq!(page.len(), 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn completed_history_keeps_only_the_last_30_days() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-history-retention-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let timestamp = |modifier: &str| {
+            db.conn
+                .query_row("SELECT datetime('now', ?1)", [modifier], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        let insert = |hash: &str, name: &str, completed_at: &str| {
+            db.conn
+                .execute(
+                    "INSERT INTO torrent_meta(hash,name,status,removed_at,completed_at,progress,updated_at) VALUES (?1,?2,'completed',?3,?3,1,?3)",
+                    params![hash, name, completed_at],
+                )
+                .unwrap();
+        };
+        insert("recent", "Recent download", &timestamp("-29 days"));
+        insert("old", "Old download", &timestamp("-31 days"));
+
+        let (items, total) = db.completed_torrents(0, 10, "").unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Recent download");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

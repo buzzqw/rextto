@@ -10402,10 +10402,15 @@ fn remove_seeded_completed(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<M
             continue;
         }
         let archived_pack = archived_pack_source_disposable(db, &torrent.hash, &torrent.save_path);
-        if !archived_pack && !cfg.libtorrent.auto_remove_completed {
+        // Never turn a completed download into an orphan in the temporary
+        // folder. Auto-removal is safe only after post-processing recorded a
+        // real archived copy outside libtorrent's storage; packs have the same
+        // requirement through `archived_pack`.
+        let archived_copy = completed_source_disposable(db, &torrent.hash, &torrent.save_path);
+        if !archived_copy || (!archived_pack && !cfg.libtorrent.auto_remove_completed) {
             continue;
         }
-        match torrents.remove(&torrent.hash, archived_pack) {
+        match torrents.remove(&torrent.hash, archived_copy) {
             Ok(true) => {
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
                 if archived_pack {
@@ -10424,6 +10429,29 @@ fn remove_seeded_completed(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<M
             Err(error) => tracing::warn!(hash=%torrent.hash, %error, "seeded torrent removal failed"),
         }
     }
+}
+
+/// True when post-processing has completed and its destination is a real copy
+/// outside the torrent's working directory. This gate protects movies and
+/// single episodes as well as season packs from premature auto-removal.
+fn completed_source_disposable(
+    db: &Arc<Mutex<Database>>,
+    hash: &str,
+    save_path: &str,
+) -> bool {
+    let (status, processed) = {
+        let database = db.lock().unwrap();
+        (
+            database.torrent_status(hash).ok().flatten(),
+            database.torrent_processed(hash).ok().flatten(),
+        )
+    };
+    let Some(processed) = processed.filter(|path| !path.trim().is_empty()) else {
+        return false;
+    };
+    let processed = std::path::Path::new(&processed);
+    processed.exists() && !processed.starts_with(std::path::Path::new(save_path))
+        && status.as_deref() == Some("completed")
 }
 
 /// Limiti di seed effettivi (per-torrent se impostati, altrimenti globali) e se

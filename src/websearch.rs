@@ -496,7 +496,7 @@ async fn search_limetorrents(
     let mut output = Vec::new();
     for (title, detail) in details {
         let detail_body = fetch_html(client, &detail, flaresolverr_url).await?;
-        let magnet = crate::utils::cached_regex(r#"magnet:\?xt=urn:btih:[0-9a-fA-F]{40,64}[^\s"'<>]*"#)
+        let magnet = crate::utils::cached_regex(r#"magnet:\?xt=urn:bt(?:ih|mh):[0-9A-Za-z]{32,68}[^\s"'<>]*"#)
             .unwrap()
             .find(&detail_body)
             .map(|value| value.as_str().to_owned());
@@ -538,7 +538,7 @@ async fn search_torrentz2(
     let mut output = Vec::new();
     for (title, detail) in details {
         let detail_body = fetch_html(client, &detail, flaresolverr_url).await?;
-        let magnet = crate::utils::cached_regex(r#"magnet:\?xt=urn:btih:[0-9a-fA-F]{40,64}[^\s"'<>]*"#)
+        let magnet = crate::utils::cached_regex(r#"magnet:\?xt=urn:bt(?:ih|mh):[0-9A-Za-z]{32,68}[^\s"'<>]*"#)
             .unwrap()
             .find(&detail_body)
             .map(|value| value.as_str().to_owned());
@@ -637,7 +637,7 @@ async fn search_1337x(
 }
 
 fn first_magnet(body: &str) -> Option<String> {
-    crate::utils::cached_regex(r#"magnet:\?xt=urn:btih:[0-9a-fA-F]{40,64}[^\s"'<>]*"#)
+    crate::utils::cached_regex(r#"magnet:\?xt=urn:bt(?:ih|mh):[0-9A-Za-z]{32,68}[^\s"'<>]*"#)
         .ok()?
         .find(body)
         .map(|value| value.as_str().to_owned())

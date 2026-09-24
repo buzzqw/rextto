@@ -2411,7 +2411,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     <div class="add-torrent-grid">
                         <label class="field" title=ctx_tr("Incolla un link magnet oppure un indirizzo http(s) che punta a un file .torrent")>
                             <span>{ctx_tr("Opzione 1 — Magnet o URL")}</span>
-                            <input prop:value=magnet on:input=move |event| magnet.set(event_target_value(&event)) placeholder=ctx_tr("magnet:?xt=urn:btih:… oppure https://…/file.torrent") />
+                            <input prop:value=magnet on:input=move |event| magnet.set(event_target_value(&event)) placeholder=ctx_tr("magnet:?xt=urn:btih:… / urn:btmh:1220… oppure https://…/file.torrent") />
                             <small class="hint">{ctx_tr("Copia/incolla un link: Rextto lo aggiunge e inizia a scaricare.")}</small>
                         </label>
                         <label class="field" title=ctx_tr("Carica un file .torrent salvato sul tuo computer, utile quando non c'è un link magnet")>
@@ -2540,7 +2540,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 <Show when=move || data.get().torrents.is_empty()><Empty text="Nessun torrent nella sessione." /></Show>
             </Panel>
             <Panel title="Storico download">
-                <p class="muted">{ctx_tr("Download conclusi. Il badge NAS indica che il file è stato archiviato (percorso in libreria/NAS); il tag è la regola di cartella applicata.")}</p>
+                <p class="muted">{ctx_tr("Download conclusi negli ultimi 30 giorni. Il badge NAS indica che il file è stato archiviato (percorso in libreria/NAS); il tag è la regola di cartella applicata.")}</p>
                 <div class="search-row" style="margin-top:10px">
                     <input prop:value=history_filter on:input=move |event| {
                         let value = event_target_value(&event);

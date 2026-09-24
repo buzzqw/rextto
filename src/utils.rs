@@ -122,21 +122,51 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn magnet_hash(magnet: &str) -> Option<String> {
-    let lower = magnet.to_ascii_lowercase();
-    let marker = "urn:btih:";
-    let start = lower.find(marker)? + marker.len();
-    let value: String = lower[start..]
-        .split('&')
-        .next()?
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    if value.len() == 40 || value.len() == 32 {
-        Some(value)
-    } else {
-        None
+#[derive(Clone, Copy)]
+enum MagnetHashKind {
+    V1,
+    V2,
+}
+
+/// Returns the canonical hash used internally for a magnet. Hybrid magnets
+/// keep using the v1 hash so existing database/session keys remain stable;
+/// pure v2 magnets use the 64 hexadecimal SHA-256 payload from `btmh:1220…`.
+fn parsed_magnet_hash(magnet: &str) -> Option<(MagnetHashKind, String)> {
+    let url = url::Url::parse(magnet).ok()?;
+    let mut v2 = None;
+    for (key, value) in url.query_pairs() {
+        if key != "xt" {
+            continue;
+        }
+        let lower = value.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("urn:btih:") {
+            let value: String = value
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .collect();
+            if value.len() == 40 || value.len() == 32 {
+                return Some((MagnetHashKind::V1, value));
+            }
+        } else if let Some(value) = lower.strip_prefix("urn:btmh:") {
+            // BEP 52 uses the multihash prefix 0x12 (SHA-256) + 0x20
+            // (32-byte digest), written as the hexadecimal `1220` prefix.
+            let Some(digest) = value.strip_prefix("1220") else {
+                continue;
+            };
+            if digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                v2 = Some(digest.to_owned());
+            }
+        }
     }
+    v2.map(|value| (MagnetHashKind::V2, value))
+}
+
+pub fn magnet_hash(magnet: &str) -> Option<String> {
+    parsed_magnet_hash(magnet).map(|(_, hash)| hash)
 }
 
 /// Parses the timestamp formats used in the databases: SQLite `datetime()`
@@ -208,8 +238,11 @@ pub fn sanitize_magnet(input: &str, fallback_title: Option<&str>) -> Option<Stri
         return None;
     }
     let url = url::Url::parse(input).ok()?;
-    let hash = magnet_hash(input)?;
-    let mut out = format!("magnet:?xt=urn:btih:{hash}");
+    let (kind, hash) = parsed_magnet_hash(input)?;
+    let mut out = match kind {
+        MagnetHashKind::V1 => format!("magnet:?xt=urn:btih:{hash}"),
+        MagnetHashKind::V2 => format!("magnet:?xt=urn:btmh:1220{hash}"),
+    };
     if let Some(name) = url
         .query_pairs()
         .find(|(k, _)| k == "dn")
@@ -536,6 +569,21 @@ mod tests {
         );
         assert!(magnet_hash("magnet:?xt=urn:btih:short").is_none());
         assert!(magnet_hash("not a magnet").is_none());
+    }
+
+    #[test]
+    fn magnet_hash_accepts_v2_multihash_and_prefers_v1_for_hybrid() {
+        let digest = "a".repeat(64);
+        let v2 = format!("magnet:?xt=urn:btmh:1220{digest}&dn=Pure-v2");
+        assert_eq!(magnet_hash(&v2), Some(digest.clone()));
+        let sanitized = sanitize_magnet(&v2, None).unwrap();
+        assert_eq!(sanitized, format!("magnet:?xt=urn:btmh:1220{digest}&dn=Pure-v2"));
+
+        let v1 = "0123456789abcdef0123456789abcdef01234567";
+        let hybrid = format!("magnet:?xt=urn:btmh:1220{digest}&xt=urn:btih:{v1}");
+        assert_eq!(magnet_hash(&hybrid).as_deref(), Some(v1));
+        assert!(sanitize_magnet(&hybrid, None)
+            .is_some_and(|magnet| magnet.starts_with("magnet:?xt=urn:btih:")));
     }
 
     #[test]
