@@ -519,7 +519,12 @@ pub async fn rename_episode(
         apply_sidecars(&source, &target, cfg);
         return Ok(Some(target));
     }
-    if crate::cleaner::resolve_existing_target(&source, &target, release.quality.score(), cfg)? {
+    if crate::cleaner::resolve_existing_target(
+        &source,
+        &target,
+        release.quality.score_with_settings(&cfg.settings),
+        cfg,
+    )? {
         apply_sidecars(&source, &target, cfg);
         return Ok(Some(target));
     }
@@ -781,7 +786,12 @@ pub async fn rename_movie(
     if same_path(source, &target) {
         return Ok(Some(target));
     }
-    if crate::cleaner::resolve_existing_target(source, &target, release.quality.score(), cfg)? {
+    if crate::cleaner::resolve_existing_target(
+        source,
+        &target,
+        release.quality.score_with_settings(&cfg.settings),
+        cfg,
+    )? {
         return Ok(Some(target));
     }
     move_across_devices(source, &target)?;

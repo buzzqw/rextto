@@ -2672,7 +2672,14 @@ async fn series_rename_apply(
                 // Già conforme al formato ma non tracciato: collega comunque il
                 // file al DB, così il prossimo ciclo sa che l'episodio c'è.
                 if execute {
-                    link_archive_file(&s.db, &series.name, season, episode_number, &file);
+                    link_archive_file(
+                        &s.db,
+                        &series.name,
+                        season,
+                        episode_number,
+                        &cfg.settings,
+                        &file,
+                    );
                 }
                 continue;
             }
@@ -2729,7 +2736,14 @@ async fn series_rename_apply(
                         &target,
                         target.parent().unwrap_or(FsPath::new(&series.archive_path)),
                     );
-                    link_archive_file(&s.db, &series.name, season, episode_number, &target);
+                    link_archive_file(
+                        &s.db,
+                        &series.name,
+                        season,
+                        episode_number,
+                        &cfg.settings,
+                        &target,
+                    );
                     items.push(serde_json::json!({
                         "season": season,
                         "episode": episode_number,
@@ -2740,7 +2754,14 @@ async fn series_rename_apply(
                 }
                 Ok(None) => {
                     // Nessuna rinomina necessaria: collega il file esistente.
-                    link_archive_file(&s.db, &series.name, season, episode_number, &file);
+                    link_archive_file(
+                        &s.db,
+                        &series.name,
+                        season,
+                        episode_number,
+                        &cfg.settings,
+                        &file,
+                    );
                 }
                 Err(error) => {
                     // Never surface API keys embedded in URLs (e.g. TMDB) in logs.
@@ -5416,6 +5437,7 @@ fn link_archive_file(
     series: &str,
     season: i64,
     episode: i64,
+    settings: &std::collections::BTreeMap<String, String>,
     path: &FsPath,
 ) {
     let Some(title) = path
@@ -5429,13 +5451,15 @@ fn link_archive_file(
         .metadata()
         .map(|value| value.len().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
-    if let Err(error) = db.lock().unwrap().sync_archive_file(
+    let quality_score = crate::parser::parse_quality(title).score_with_settings(settings);
+    if let Err(error) = db.lock().unwrap().sync_archive_file_scored(
         series,
         season,
         episode,
         title,
         &path.display().to_string(),
         size,
+        quality_score,
     ) {
         tracing::warn!(%error, series, season, episode, "archive file linking failed");
     }
@@ -5445,6 +5469,7 @@ fn scan_archive_path(
     db: &Arc<Mutex<Database>>,
     series: &SeriesConfig,
     path: &FsPath,
+    settings: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<(usize, usize)> {
     if !path.is_dir() {
         anyhow::bail!("archive path is not a directory: {}", path.display());
@@ -5476,13 +5501,15 @@ fn scan_archive_path(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(name)
             .to_string();
-        db.lock().unwrap().sync_archive_file(
+        let quality_score = crate::parser::parse_quality(&title).score_with_settings(settings);
+        db.lock().unwrap().sync_archive_file_scored(
             &series.name,
             season,
             episode,
             &title,
             &file.display().to_string(),
             size,
+            quality_score,
         )?;
         updated += 1;
     }
@@ -5523,7 +5550,7 @@ async fn scan_series_archive(
         .map(FsPath::new)
         .map(FsPath::to_path_buf)
         .unwrap_or_else(|| FsPath::new(&series.archive_path).to_path_buf());
-    match scan_archive_path(&s.db, series, &path) {
+    match scan_archive_path(&s.db, series, &path, &cfg.settings) {
         Ok((found, updated)) => (
             StatusCode::OK,
             Json(
@@ -5546,7 +5573,12 @@ async fn scan_all_archives(State(s): State<AppState>) -> impl IntoResponse {
         .filter(|series| series.enabled && !series.archive_path.trim().is_empty())
         .filter(|series| !archive_import_busy().lock().unwrap().contains(&series.name))
     {
-        match scan_archive_path(&s.db, series, FsPath::new(&series.archive_path)) {
+        match scan_archive_path(
+            &s.db,
+            series,
+            FsPath::new(&series.archive_path),
+            &cfg.settings,
+        ) {
             Ok((_found, count)) => updated += count,
             Err(error) => {
                 errors.push(serde_json::json!({"series":series.name,"error":error.to_string()}))
@@ -8068,7 +8100,15 @@ async fn add_parsed_release(
             Ok(Some(hash)) => {
                 // Registra sotto l'hash reale così il post-processing ha i metadati.
                 release.magnet = format!("magnet:?xt=urn:btih:{hash}");
-                match s.db.lock().unwrap().register_torrent(&release) {
+                let score = release
+                    .quality
+                    .score_with_settings(&latest_config(s).settings);
+                match s
+                    .db
+                    .lock()
+                    .unwrap()
+                    .register_torrent_scored(&release, score)
+                {
                     Ok(()) => {
                         let _ = s.db.lock().unwrap().set_torrent_reason(&hash, "manual");
                         (
@@ -8096,7 +8136,15 @@ async fn add_parsed_release(
     // verification or session state, so never run it in an Axum worker (or make
     // the user wait for it). Persist the intent first, then isolate the native
     // call in Tokio's blocking pool.
-    if let Err(error) = s.db.lock().unwrap().register_torrent(&release) {
+    let score = release
+        .quality
+        .score_with_settings(&latest_config(s).settings);
+    if let Err(error) = s
+        .db
+        .lock()
+        .unwrap()
+        .register_torrent_scored(&release, score)
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -8303,12 +8351,18 @@ async fn pin_torrent(
     Json(input): Json<TorrentHashInput>,
 ) -> impl IntoResponse {
     let hash = input.hash.to_ascii_lowercase();
-    let _ = Config::save_setting(&s.cfg.data_dir, "libtorrent_pinned_hash", &hash);
-    torrent_action(s.torrents.set_pin(&hash, true))
+    let result = s.torrents.set_pin(&hash, true);
+    if result.is_ok() {
+        let _ = Config::save_setting(&s.cfg.data_dir, "libtorrent_pinned_hash", &hash);
+    }
+    torrent_action(result)
 }
 async fn unpin_torrent(State(s): State<AppState>) -> impl IntoResponse {
-    let _ = Config::save_setting(&s.cfg.data_dir, "libtorrent_pinned_hash", "");
-    torrent_action(Ok(true))
+    let result = s.torrents.set_pin("", false);
+    if result.is_ok() {
+        let _ = Config::save_setting(&s.cfg.data_dir, "libtorrent_pinned_hash", "");
+    }
+    torrent_action(result)
 }
 async fn set_sequential(
     State(s): State<AppState>,
@@ -10050,6 +10104,22 @@ async fn torrent_event_worker(
                         .lock()
                         .unwrap()
                         .mark_torrent_error(&hash, &error.to_string());
+                    // Completion errors are terminal for the persisted state;
+                    // detach the torrent so it cannot remain active forever.
+                    // Keep its source files in place for manual inspection.
+                    if matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
+                        match torrents.remove(&hash, false) {
+                            Ok(true) => {
+                                let _ = db.lock().unwrap().mark_torrent_removed_at(&hash);
+                            }
+                            Ok(false) => {}
+                            Err(remove_error) => tracing::warn!(
+                                hash = %hash,
+                                %remove_error,
+                                "failed to detach torrent after completion error"
+                            ),
+                        }
+                    }
                     let _ = notifier.notify_event("torrent_error", serde_json::json!({"hash": hash, "error": error.to_string(), "upgrade_restored": restored})).await;
                     tracing::error!(%error, "torrent completion handling failed");
                     false
@@ -10557,7 +10627,7 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
     for torrent in torrents
         .list()
         .into_iter()
-        .filter(|torrent| torrent.state == "seeding")
+        .filter(|torrent| matches!(torrent.state.as_str(), "seeding" | "finished"))
     {
         let has_override = torrent.seed_ratio >= 0.0 || torrent.seed_days >= 0;
         // legacy treats either explicit zero as an infinite per-torrent seed rule.
@@ -10584,8 +10654,10 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
         });
         let time_reached = torrent_time_limit.is_some_and(|limit| torrent.seeding_seconds >= limit);
         if ratio_reached || time_reached {
+            let mut stopped = false;
             match torrents.pause(&torrent.hash) {
                 Ok(true) => {
+                    stopped = true;
                     let reason = match (ratio_reached, time_reached) {
                         (true, true) => "ratio and time reached",
                         (true, false) => "ratio reached",
@@ -10600,17 +10672,21 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
                     tracing::warn!(hash=%torrent.hash, %error, "failed to stop torrent at seed limit")
                 }
             }
+            if !stopped {
+                continue;
+            }
             post_seed_relocate(cfg, torrents, &torrent);
             if cfg.libtorrent.auto_remove_completed {
-                let is_pack = db
-                    .lock()
-                    .unwrap()
-                    .torrent_meta(&torrent.hash)
-                    .ok()
-                    .flatten()
-                    .map(|meta| meta.release.is_pack)
-                    .unwrap_or(false);
-                match torrents.remove(&torrent.hash, is_pack) {
+                // Delete storage only after verifying the archived copy. This
+                // also protects packs with stale or invalid processed_path data.
+                if !completed_source_disposable(db, &torrent.hash, &torrent.save_path) {
+                    tracing::warn!(
+                        hash = %torrent.hash,
+                        "seed limit reached but archived copy is not verified; keeping torrent files"
+                    );
+                    continue;
+                }
+                match torrents.remove(&torrent.hash, true) {
                     Ok(true) => {
                         let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
                     }
@@ -11126,12 +11202,45 @@ async fn handle_torrent_event(
             }
         }
         "storage_move_failed" => {
+            move_requests.remove(&event.hash);
             tracing::warn!(
                 hash = %event.hash,
                 name = %event.name,
                 save_path = %event.save_path,
                 "storage move failed (destination may already exist); torrent kept in place"
             );
+            // The first move request is asynchronous: a transient destination
+            // race (or a destination created between validation and libtorrent)
+            // is reported only through this alert. Retry once from the current
+            // storage path instead of leaving a completed torrent stranded
+            // forever with no future completion event.
+            let destination = postprocess::destination_for(&metadata.release, cfg);
+            let current = FsPath::new(&event.save_path);
+            if let Some(destination) = destination {
+                if !postprocess::same_path(current, &destination)
+                    && postprocess::validate_destination_from(current, &destination).is_ok()
+                    && move_requests.insert(event.hash.clone())
+                {
+                    match torrents.move_storage(&event.hash, &destination) {
+                        Ok(true) => tracing::debug!(
+                            hash = %event.hash,
+                            to = %destination.display(),
+                            "retrying completed torrent storage move"
+                        ),
+                        Ok(false) => {
+                            move_requests.remove(&event.hash);
+                        }
+                        Err(error) => {
+                            move_requests.remove(&event.hash);
+                            tracing::warn!(
+                                hash = %event.hash,
+                                %error,
+                                "retry of completed torrent storage move failed"
+                            );
+                        }
+                    }
+                }
+            }
             false
         }
         "storage_moved" => {
@@ -11300,6 +11409,13 @@ async fn complete_torrent(
         db.lock()
             .unwrap()
             .mark_torrent_error(&event.hash, "release inferior to existing file")?;
+        discard_completed_source(
+            cfg,
+            db,
+            torrents,
+            event,
+            "release inferior to existing file",
+        );
         tracing::warn!(hash=%event.hash, "completed release discarded as inferior");
         return Ok(false);
     }

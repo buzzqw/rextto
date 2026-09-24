@@ -796,10 +796,27 @@ impl Database {
             self.conn.execute("UPDATE movies SET name=?1,year=?2,title=?1,quality_score=?3,magnet_link=?4,downloaded_at=NULL,removed_at=NULL WHERE id=?5", params![release.title, release.year, score, release.magnet, id])?;
             return Ok((true, "restored".into()));
         }
-        if let Some((id, existing_score)) = self.conn.query_row("SELECT id,quality_score FROM movies WHERE removed_at IS NULL AND name=?1 AND year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).optional()? {
+        if let Some((id, existing_score, metadata_json)) = self.conn.query_row("SELECT m.id,m.quality_score,COALESCE(t.metadata_json,'') FROM movies m LEFT JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) WHERE m.removed_at IS NULL AND m.name=?1 AND m.year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))).optional()? {
             // The movies row stores the configured clean name (not the original
-            // release title), so the quality check can only use the score delta.
-            if existing_score >= score || score - existing_score < min_score_diff {
+            // release title). When the original torrent metadata is still
+            // available, apply the same hard-upgrade rules as series (4K,
+            // source, HDR, REPACK and REMUX); old databases without metadata
+            // retain the historical score-delta fallback.
+            let hard_upgrade = serde_json::from_str::<TorrentMeta>(&metadata_json)
+                .ok()
+                .map(|metadata| {
+                    release.quality.upgrade_reason(
+                        &metadata.release.quality,
+                        score,
+                        existing_score,
+                        min_score_diff,
+                    )
+                    .is_some()
+                });
+            let upgrade = hard_upgrade.unwrap_or_else(|| {
+                score > existing_score && score - existing_score >= min_score_diff
+            });
+            if !upgrade {
                 return Ok((false, "duplicate".into()));
             }
             let previous = self.conn.query_row("SELECT id,name,year,title,quality_score,magnet_hash,magnet_link,downloaded_at,size_bytes FROM movies WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "movie".into(), row_id: row.get(0)?, series_id: None, series_name: None, season: None, episode: None, name: Some(row.get::<_, Option<String>>(1)?.unwrap_or_default()), year: row.get(2)?, title: row.get::<_, Option<String>>(3)?.unwrap_or_default(), quality_score: row.get(4)?, magnet_hash: row.get(5)?, magnet_link: row.get(6)?, downloaded_at: row.get(7)?, archive_path: None, size_bytes: row.get(8)? }))?;
@@ -812,11 +829,15 @@ impl Database {
     }
 
     pub fn register_torrent(&self, release: &Release) -> Result<()> {
+        self.register_torrent_scored(release, release.quality.score())
+    }
+
+    pub fn register_torrent_scored(&self, release: &Release, quality_score: i64) -> Result<()> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO torrent_meta(hash,kind,title,series_name,season,episode,year,quality_score,source,metadata_json,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11) ON CONFLICT(hash) DO UPDATE SET kind=excluded.kind,title=excluded.title,series_name=excluded.series_name,season=excluded.season,episode=excluded.episode,year=excluded.year,quality_score=excluded.quality_score,source=excluded.source,metadata_json=excluded.metadata_json,status=CASE WHEN torrent_meta.status='completed' THEN torrent_meta.status ELSE 'queued' END,updated_at=excluded.updated_at",
-            params![hash, release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, serde_json::to_string(&TorrentMeta { release: release.clone() })?, now],
+            params![hash, release.kind, release.title, release.series, release.season, release.episode, release.year, quality_score, release.source, serde_json::to_string(&TorrentMeta { release: release.clone() })?, now],
         )?;
         Ok(())
     }
@@ -947,6 +968,15 @@ impl Database {
     }
 
     pub fn queue_pending(&self, release: &Release, timeframe_hours: i64) -> Result<()> {
+        self.queue_pending_scored(release, timeframe_hours, release.quality.score())
+    }
+
+    pub fn queue_pending_scored(
+        &self,
+        release: &Release,
+        timeframe_hours: i64,
+        quality_score: i64,
+    ) -> Result<()> {
         let series_name = release.series.as_deref().unwrap_or(&release.title);
         self.conn.execute(
             "INSERT OR IGNORE INTO series(name) VALUES (?1)",
@@ -959,11 +989,11 @@ impl Database {
         )?;
         let existing: Option<(i64, i64)> = self.conn.query_row("SELECT id,best_quality_score FROM pending_downloads WHERE series_id=?1 AND season=?2 AND episode=?3 AND status='pending'", params![series_id, release.season, release.episode], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
         if let Some((id, score)) = existing {
-            if release.quality.score() > score {
-                self.conn.execute("UPDATE pending_downloads SET best_title=?1,best_quality_score=?2,best_magnet=?3 WHERE id=?4", params![release.title, release.quality.score(), release.magnet, id])?;
+            if quality_score > score {
+                self.conn.execute("UPDATE pending_downloads SET best_title=?1,best_quality_score=?2,best_magnet=?3 WHERE id=?4", params![release.title, quality_score, release.magnet, id])?;
             }
         } else {
-            self.conn.execute("INSERT INTO pending_downloads(series_id,season,episode,best_magnet,best_quality_score,ready_at,best_title,first_seen_at,timeframe_hours,status) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?8,'pending')", params![series_id, release.season, release.episode, release.magnet, release.quality.score(), Utc::now().to_rfc3339(), release.title, timeframe_hours])?;
+            self.conn.execute("INSERT INTO pending_downloads(series_id,season,episode,best_magnet,best_quality_score,ready_at,best_title,first_seen_at,timeframe_hours,status) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?8,'pending')", params![series_id, release.season, release.episode, release.magnet, quality_score, Utc::now().to_rfc3339(), release.title, timeframe_hours])?;
         }
         Ok(())
     }
@@ -1412,6 +1442,27 @@ impl Database {
         path: &str,
         size_bytes: i64,
     ) -> Result<()> {
+        self.sync_archive_file_scored(
+            series_name,
+            season,
+            episode,
+            title,
+            path,
+            size_bytes,
+            parse_quality(title).score(),
+        )
+    }
+
+    pub fn sync_archive_file_scored(
+        &self,
+        series_name: &str,
+        season: i64,
+        episode: i64,
+        title: &str,
+        path: &str,
+        size_bytes: i64,
+        quality_score: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO series(name) VALUES (?1)",
             [series_name],
@@ -1425,11 +1476,10 @@ impl Database {
         // scansionato risultava "inferiore" e veniva ri-scaricato. Il titolo
         // passato dal chiamante è il nome file completo, quindi `parse_quality`
         // vede risoluzione/sorgente/codec.
-        let score = parse_quality(title).score();
         // Never let a scan downgrade an episode that already holds a better
         // file: a stale 1080p file next to the kept 2160p one must not reset the
         // stored quality (and make the episode look inferior).
-        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=CASE WHEN excluded.quality_score>=episodes.quality_score THEN excluded.title ELSE episodes.title END,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=MAX(excluded.quality_score, episodes.quality_score)", params![series_id, season, episode, title, score, path, size_bytes])?;
+        self.conn.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path,size_bytes) VALUES (?1,?2,?3,?4,?5,datetime('now'),?6,?7) ON CONFLICT(series_id,season,episode) DO UPDATE SET title=CASE WHEN excluded.quality_score>=episodes.quality_score THEN excluded.title ELSE episodes.title END,downloaded_at=excluded.downloaded_at,archive_path=excluded.archive_path,size_bytes=excluded.size_bytes,quality_score=MAX(excluded.quality_score, episodes.quality_score)", params![series_id, season, episode, title, quality_score, path, size_bytes])?;
         Ok(())
     }
 
@@ -3331,6 +3381,53 @@ mod tests {
                 |row| row.get::<_, bool>(0)
             )
             .unwrap());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn movie_remux_upgrade_is_allowed_with_small_score_delta() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-movie-upgrade-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let old = Release {
+            torrent_url: None,
+            title: "Example Movie".into(),
+            magnet: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            source: "rss".into(),
+            quality: Quality {
+                resolution: "2160p".into(),
+                source: "webdl".into(),
+                ..Default::default()
+            },
+            kind: "movie".into(),
+            series: None,
+            season: None,
+            episode: None,
+            is_pack: false,
+            episode_range: Vec::new(),
+            year: Some(2024),
+            discovered_at: Utc::now(),
+        };
+        assert_eq!(db.check_movie(&old).unwrap(), (true, "approved".into()));
+        db.register_torrent(&old).unwrap();
+
+        let mut upgrade = old.clone();
+        upgrade.magnet =
+            "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        upgrade.quality.source = "remux".into();
+        assert_eq!(
+            db.check_movie_scored(&upgrade, upgrade.quality.score(), 200)
+                .unwrap(),
+            (true, "upgrade".into())
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

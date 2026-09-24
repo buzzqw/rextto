@@ -576,7 +576,11 @@ pub async fn run_cycle_domain(
                     );
                     db.lock()
                         .unwrap()
-                        .queue_pending(&release, series.timeframe)?;
+                        .queue_pending_scored(
+                            &release,
+                            series.timeframe,
+                            release.quality.score_with_settings(&cfg.settings),
+                        )?;
                     continue;
                 }
             }
@@ -656,7 +660,9 @@ pub async fn run_cycle_domain(
                             release.title
                         );
                     }
-                    db.lock().unwrap().register_torrent(&release)?;
+                    db.lock()
+                        .unwrap()
+                        .register_torrent_scored(&release, score)?;
                     if let Some(hash) = magnet_hash(&release.magnet) {
                         let _ = db
                             .lock()

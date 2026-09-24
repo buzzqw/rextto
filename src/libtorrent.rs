@@ -1367,6 +1367,16 @@ impl LibtorrentClient {
             &serde_json::to_vec_pretty(&limits)?,
         )
     }
+    fn clear_seed_limit(&self, hash: &str) -> Result<()> {
+        let mut limits = self.seed_limits()?;
+        if limits.remove(&hash.to_ascii_lowercase()).is_some() {
+            atomic_write(
+                &self.seed_limits_path(),
+                &serde_json::to_vec_pretty(&limits)?,
+            )?;
+        }
+        Ok(())
+    }
     fn apply_stored_limits(&self, session: &NativeSession, hash: &str) -> Result<()> {
         let Some((download_limit, upload_limit)) = self.stored_limits(hash)? else {
             return Ok(());
@@ -1433,6 +1443,8 @@ impl LibtorrentClient {
         conn.execute("INSERT INTO torrent_limits(info_hash,dl_bytes,ul_bytes,updated_at) VALUES (?1,?2,?3,datetime('now')) ON CONFLICT(info_hash) DO UPDATE SET dl_bytes=excluded.dl_bytes,ul_bytes=excluded.ul_bytes,updated_at=excluded.updated_at", params![normalized, download_limit, upload_limit])?;
         if seed_ratio >= 0.0 || seed_days >= 0 {
             self.save_seed_limit(&normalized, seed_ratio, seed_days)?;
+        } else {
+            self.clear_seed_limit(&normalized)?;
         }
         Ok(true)
     }
@@ -1494,6 +1506,9 @@ impl LibtorrentClient {
         // torrent e "riappare" in Scarico, annullando la rimozione.
         let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.fastresume")));
         let _ = std::fs::remove_file(self.state_dir.join(format!("{normalized}.torrent")));
+        if let Err(error) = self.clear_seed_limit(&normalized) {
+            tracing::warn!(hash = %normalized, %error, "could not clear removed torrent seed limits");
+        }
         Ok(self
             .torrents
             .write()

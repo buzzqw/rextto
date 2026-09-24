@@ -884,13 +884,24 @@ int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, 
     std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
-        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
-        session->pinned_hash = (pinned && hash != nullptr) ? std::string(hash) : std::string();
+        if (pinned && !handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        const auto previous_hash = session->pinned_hash;
+        const auto requested_hash = (pinned && hash != nullptr) ? std::string(hash) : std::string();
+        if (!previous_hash.empty() && previous_hash != requested_hash) {
+            auto previous = find_torrent(session, previous_hash.c_str());
+            if (previous.is_valid()) {
+                const auto status = previous.status();
+                if (!(status.flags & lt::torrent_flags::paused)) {
+                    previous.set_flags(lt::torrent_flags::auto_managed);
+                }
+            }
+        }
+        session->pinned_hash = requested_hash;
         if (pinned) {
             handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.resume();
             handle.queue_position_top();
-        } else {
+        } else if (handle.is_valid()) {
             handle.set_flags(lt::torrent_flags::auto_managed);
             handle.resume();
         }
