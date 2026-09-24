@@ -886,38 +886,58 @@ impl Config {
         Self::season_allowed(specification, season)
     }
 
+    /// Token alfanumerici minuscoli: "Spider-Man" -> ["spider","man"],
+    /// "Minions & Monsters" -> ["minions","monsters"]. La punteggiatura non
+    /// deve impedire il match.
+    fn title_tokens(value: &str) -> Vec<String> {
+        value
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// True se il titolo contiene tutte le parole del nome monitorato (o del
+    /// titolo originale), ignorando la punteggiatura. Gestisce nomi di una sola
+    /// parola, trattini, "&", "vs." e doppi spazi.
+    fn movie_title_matches(movie: &MovieConfig, title: &str) -> bool {
+        let title_tokens = Self::title_tokens(title);
+        if title_tokens.is_empty() {
+            return false;
+        }
+        let matches_name = |value: &str| {
+            let tokens = Self::title_tokens(value);
+            !tokens.is_empty()
+                && tokens
+                    .iter()
+                    .all(|word| title_tokens.iter().any(|token| token == word))
+        };
+        matches_name(&movie.name)
+            || (!movie.original_title.trim().is_empty() && matches_name(&movie.original_title))
+    }
+
+    fn movie_excluded(movie: &MovieConfig, title: &str) -> bool {
+        !movie.exclude.is_empty()
+            && movie
+                .exclude
+                .split(',')
+                .map(str::trim)
+                .any(|word| {
+                    !word.is_empty() && title.to_ascii_lowercase().contains(&word.to_ascii_lowercase())
+                })
+    }
+
     pub fn find_movie_match(&self, title: &str, year: Option<i64>) -> Option<&MovieConfig> {
         // legacy rejects obvious non-movies before matching (episodes, sport,
         // wrestling, magazines, videogames, console ROMs, some music).
         if !crate::parser::passes_movie_filter(title) {
             return None;
         }
-        let title = title.to_ascii_lowercase();
         self.movies.iter().find(|movie| {
-            if !movie.enabled {
-                return false;
-            }
-            let name_words = movie
-                .name
-                .to_ascii_lowercase()
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            if name_words.len() < 2
-                || !name_words.iter().all(|word| {
-                    title
-                        .split(|c: char| !c.is_ascii_alphanumeric())
-                        .any(|token| token == word)
-                })
-            {
-                return false;
-            }
-            if !movie.exclude.is_empty()
-                && movie
-                    .exclude
-                    .split(',')
-                    .map(str::trim)
-                    .any(|word| !word.is_empty() && title.contains(&word.to_ascii_lowercase()))
+            if !movie.enabled
+                || !Self::movie_title_matches(movie, title)
+                || Self::movie_excluded(movie, title)
             {
                 return false;
             }
@@ -925,6 +945,29 @@ impl Config {
                 return false;
             };
             year.is_some_and(|found| (found - configured_year).abs() <= 1)
+        })
+    }
+
+    /// Come `find_movie_match`, ma per l'accoda manuale (archivio, ricerca,
+    /// risultati dei feed): il titolo deve combaciare, mentre l'anno è
+    /// facoltativo. Se entrambi gli anni sono presenti devono restare entro ±1;
+    /// se manca l'anno del film o della release si accetta il match, così un
+    /// film monitorato non viene rifiutato con "film non monitorato".
+    pub fn find_movie_match_manual(&self, title: &str, year: Option<i64>) -> Option<&MovieConfig> {
+        if !crate::parser::passes_movie_filter(title) {
+            return None;
+        }
+        self.movies.iter().find(|movie| {
+            if !movie.enabled
+                || !Self::movie_title_matches(movie, title)
+                || Self::movie_excluded(movie, title)
+            {
+                return false;
+            }
+            match (movie.year.parse::<i64>().ok(), year) {
+                (Some(configured), Some(found)) => (found - configured).abs() <= 1,
+                _ => true,
+            }
         })
     }
 
@@ -1877,7 +1920,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn normalizes_language_codes() {
         assert_eq!(normalize_language_code("IT"), "ita");
         assert_eq!(normalize_language_code("ITA"), "ita");
@@ -2095,6 +2137,45 @@ mod tests {
         });
         assert!(cfg
             .find_movie_match("No.Year.Movie.2022", Some(2022))
+            .is_none());
+    }
+
+    #[test]
+    fn manual_movie_matching_tolerates_punctuation_and_missing_year() {
+        let mut cfg = Config::default();
+        for (name, year) in [
+            ("Spider-Man Brand New Day", "2026"),
+            ("Minions & Monsters", "2026"),
+            ("Highlander", "2027"),
+            ("Creation of the Gods Under Heaven", ""),
+        ] {
+            cfg.movies.push(MovieConfig {
+                name: name.into(),
+                year: year.into(),
+                enabled: true,
+                ..Default::default()
+            });
+        }
+        // Punteggiatura e nomi di una parola: il match manuale ora funziona.
+        assert!(cfg
+            .find_movie_match_manual("Spider-Man.Brand.New.Day.1080p", None)
+            .is_some());
+        assert!(cfg
+            .find_movie_match_manual("Minions.and.Monsters.2026.1080p", None)
+            .is_some());
+        assert!(cfg
+            .find_movie_match_manual("Highlander.2027.1080p", Some(2027))
+            .is_some());
+        // Anno del film vuoto: l'accoda manuale accetta, quella automatica no.
+        assert!(cfg
+            .find_movie_match_manual("Creation.of.the.Gods.Under.Heaven.1080p", None)
+            .is_some());
+        assert!(cfg
+            .find_movie_match("Creation.of.the.Gods.Under.Heaven.1080p", None)
+            .is_none());
+        // Anno palesemente diverso: resta il vincolo ±1.
+        assert!(cfg
+            .find_movie_match_manual("Highlander.2010.1080p", Some(2010))
             .is_none());
     }
 

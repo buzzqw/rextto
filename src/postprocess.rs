@@ -702,7 +702,7 @@ pub async fn rename_movie(
         return Ok(None);
     }
     let configured = release.title.clone();
-    let movie = cfg.find_movie_match(&release.title, release.year);
+    let movie = cfg.find_movie_match_manual(&release.title, release.year);
     let configured_name = movie
         .map(|value| value.name.clone())
         .unwrap_or_else(|| configured.replace('.', " "));
