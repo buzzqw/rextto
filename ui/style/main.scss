@@ -458,6 +458,10 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 
 /* Torrent table: keep state badges and numbers aligned */
 .data-table .badge { white-space: nowrap; }
+/* Nome torrent: il nome tronca, il badge NAS resta sempre visibile. */
+.torrent-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.torrent-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.torrent-name .badge { flex: none; }
 .data-table:not(.lib-table) td:first-child { min-width: 220px; }
 /* Tabelle libreria: la prima cella è una checkbox, non va allargata a 220px. */
 .data-table.lib-table td:first-child { min-width: 0; }

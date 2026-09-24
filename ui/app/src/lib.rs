@@ -2765,7 +2765,10 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
         <tr>
             <td><input type="checkbox" title=ctx_tr("Seleziona il torrent") prop:checked=move || selected.get().contains(&hash_check) on:change=move |_| { let hash = hash_check_toggle.clone(); selected.update(|items| { if items.contains(&hash) { items.retain(|value| value != &hash); } else { items.push(hash); } }); } /></td>
             <td class="truncate" title=move || name.get()>
-                <div>{move || name.get()}<Show when=move || item.get().get("archived").and_then(Value::as_bool).unwrap_or(false)><span class="badge ok" style="margin-left:6px" title=ctx_tr("File archiviati nella cartella NAS")>{ctx_tr("NAS")}</span></Show></div>
+                <div class="torrent-name">
+                    <span class="torrent-name-text">{move || name.get()}</span>
+                    <Show when=move || item.get().get("archived").and_then(Value::as_bool).unwrap_or(false)><span class="badge ok" title=ctx_tr("File archiviati nella cartella NAS")>{ctx_tr("NAS")}</span></Show>
+                </div>
                 <Show when=move || !origin_line.get().is_empty()>
                     <div class="muted" style="font-size:11px;white-space:normal;overflow:hidden;text-overflow:ellipsis">{move || origin_line.get()}</div>
                 </Show>
