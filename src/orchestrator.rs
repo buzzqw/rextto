@@ -321,14 +321,15 @@ pub async fn run_cycle_domain(
             |set: &mut tokio::task::JoinSet<(String, i64, i64, Vec<Release>)>,
              iter: &mut std::vec::IntoIter<(String, i64, i64, String)>| {
                 if let Some((series, season, episode, query)) = iter.next() {
-                    let engine = engine.clone();
-                    let cfg = cfg_arc.clone();
-                    set.spawn(async move {
-                        tracing::debug!(series = %series, season, episode, query = %query, "gap-fill live search started");
-                        let found = engine.search_query(&cfg, &query).await;
-                        tracing::debug!(series = %series, season, episode, query = %query, results = found.len(), "gap-fill live search completed");
-                        (series, season, episode, found)
-                    });
+                     let engine = engine.clone();
+                     let cfg = cfg_arc.clone();
+                     set.spawn(async move {
+                         tracing::debug!(series = %series, season, episode, query = %query, "gap-fill live search started");
+                         let started = std::time::Instant::now();
+                         let found = engine.search_query(&cfg, &query).await;
+                         tracing::debug!(series = %series, season, episode, query = %query, elapsed_ms = started.elapsed().as_millis(), results = found.len(), "gap-fill live search completed");
+                         (series, season, episode, found)
+                     });
                 }
             };
         for _ in 0..3 {
@@ -534,6 +535,17 @@ pub async fn run_cycle_domain(
                 match resolve_torrent_url(engine, cfg, &url).await {
                     Ok((magnet, path)) => {
                         release.magnet = magnet;
+                        // The feed was persisted before selection. Replace its
+                        // short-lived Jackett URL with the stable magnet so a
+                        // later archive search can use it without re-downloading
+                        // an already expired link.
+                        if let Err(error) = archive
+                            .lock()
+                            .unwrap()
+                            .canonicalize_torrent_url(&url, &release.magnet)
+                        {
+                            tracing::warn!(%error, "could not canonicalize archived torrent URL");
+                        }
                         torrent_file = Some(path);
                     }
                     Err(error) => {

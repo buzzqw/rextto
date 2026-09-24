@@ -2585,8 +2585,10 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                     else { "Serie".to_string() }
                                 } else if kind == "movie" {
                                     if year > 0 { format!("Film · {year}") } else { "Film".to_string() }
-                                } else { "—".to_string() };
-                                let tag = text(&item, "tag", "");
+                                 } else { "—".to_string() };
+                                 let tag = text(&item, "tag", "");
+                                let tag_empty = tag.is_empty();
+                                let tag_label = tag.clone();
                                 let name = text(&item, "name", "Senza nome");
                                 let when_full = {
                                     let completed = text(&item, "completed_at", "");
@@ -2622,19 +2624,28 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                 let when_title = when_full.clone();
                                 view! {
                                     <tr>
-                                        <td class="truncate" title=name_title>
-                                            <div class="torrent-name">
-                                                <span class="torrent-name-text">{name}</span>
-                                                <Show when=move || archived>
-                                                    <span class="badge ok" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
-                                                </Show>
-                                            </div>
+                                         <td class="truncate" title=name_title>
+                                             <div class="torrent-name">
+                                                 <span class="torrent-name-text">{name}</span>
+                                             </div>
                                             <Show when=move || !origin_show.is_empty()>
                                                 <div class="muted" style="font-size:11px;white-space:normal">{origin_label.clone()}</div>
                                             </Show>
                                         </td>
                                         <td class="muted">{type_label}</td>
-                                        <td>{if tag.is_empty() { "—".to_string() } else { tag }}</td>
+                                        <td>
+                                            <div class="history-tags">
+                                                <Show when=move || archived>
+                                                    <span class="badge ok" title=ctx_tr("File archiviato nella cartella libreria/NAS")>{ctx_tr("NAS")}</span>
+                                                </Show>
+                                                <Show when=move || !tag_empty>
+                                                    <span class="badge" title=ctx_tr("Regola di cartella applicata")>{tag_label.clone()}</span>
+                                                </Show>
+                                                <Show when=move || !archived && tag_empty>
+                                                    <span class="muted">{"—"}</span>
+                                                </Show>
+                                            </div>
+                                        </td>
                                         <td class="numeric">{number(&item, "quality_score")}</td>
                                         <td><span class=format!("badge {state_tone}")>{state_label}</span></td>
                                         <td class="truncate mono muted" title=path_title>{path_display}</td>
@@ -8623,4 +8634,3 @@ fn LicenseView() -> impl IntoView {
         </div>
     }
 }
-

@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -135,6 +136,11 @@ struct rextto_lt_status {
     long long total_size;
     long long total_done;
 };
+
+// Rust calls this bridge from the web server and several background tasks.
+// Serialize every session API call: although libtorrent has its own worker
+// threads, the wrapper also owns mutable alert/queue state.
+static std::recursive_mutex LIBTORRENT_API_MUTEX;
 
 static void set_error(char* output, size_t output_size, const std::string& message) {
     if (output == nullptr || output_size == 0) return;
@@ -262,6 +268,7 @@ rextto_lt_session* rextto_lt_create(unsigned short port_min, unsigned short port
 }
 
 void rextto_lt_destroy(rextto_lt_session* session) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     delete session;
 }
 
@@ -270,6 +277,7 @@ void rextto_lt_version(char* output, size_t output_size) {
 }
 
 int rextto_lt_load_ipfilter(rextto_lt_session* session, const char* path, int* rules_out, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || path == nullptr) {
         set_error(error, error_size, "invalid ip filter parameters");
         return 0;
@@ -287,6 +295,7 @@ int rextto_lt_load_ipfilter(rextto_lt_session* session, const char* path, int* r
 }
 
 int rextto_lt_save_torrent(rextto_lt_session* session, const char* hash, const char* path, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || hash == nullptr || path == nullptr) {
         set_error(error, error_size, "invalid torrent metadata save parameters");
         return 0;
@@ -316,6 +325,7 @@ int rextto_lt_save_torrent(rextto_lt_session* session, const char* hash, const c
 }
 
 int rextto_lt_apply_settings(rextto_lt_session* session, const char* settings, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || settings == nullptr) {
         set_error(error, error_size, "invalid libtorrent settings parameters");
         return 0;
@@ -406,6 +416,7 @@ int rextto_lt_apply_settings(rextto_lt_session* session, const char* settings, c
 }
 
 int rextto_lt_add(rextto_lt_session* session, const char* magnet, const char* save_path, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || magnet == nullptr || save_path == nullptr) {
         set_error(error, error_size, "invalid libtorrent add parameters");
         return 0;
@@ -435,6 +446,7 @@ int rextto_lt_add(rextto_lt_session* session, const char* magnet, const char* sa
 }
 
 int rextto_lt_add_file(rextto_lt_session* session, const char* torrent_path, const char* save_path, char* hash, size_t hash_size, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || torrent_path == nullptr || save_path == nullptr) {
         set_error(error, error_size, "invalid torrent-file add parameters");
         return 0;
@@ -460,11 +472,13 @@ int rextto_lt_add_file(rextto_lt_session* session, const char* torrent_path, con
 }
 
 unsigned int rextto_lt_torrent_count(const rextto_lt_session* session) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return 0;
     return static_cast<unsigned int>(session->session.get_torrents().size());
 }
 
 size_t rextto_lt_statuses(const rextto_lt_session* session, rextto_lt_status* output, size_t capacity) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return 0;
     auto statuses = session->session.get_torrent_status(
         [](lt::torrent_status const&) { return true; },
@@ -510,6 +524,7 @@ size_t rextto_lt_statuses(const rextto_lt_session* session, rextto_lt_status* ou
 }
 
 size_t rextto_lt_events(rextto_lt_session* session, rextto_lt_event* output, size_t capacity) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return 0;
     collect_events(session);
     if (output == nullptr || capacity == 0) return 0;
@@ -522,6 +537,7 @@ size_t rextto_lt_events(rextto_lt_session* session, rextto_lt_event* output, siz
 }
 
 void rextto_lt_promote_metadata(rextto_lt_session* session) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return;
     const auto now = std::chrono::steady_clock::now();
     for (auto const& handle : session->session.get_torrents()) {
@@ -542,6 +558,7 @@ void rextto_lt_promote_metadata(rextto_lt_session* session) {
 // metadata-fetch deve poter ignorare la coda (vedi rextto_lt_promote_metadata).
 // I torrent in pausa (scelta utente o politica) restano invariati.
 size_t rextto_lt_ensure_auto_managed(rextto_lt_session* session) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return 0;
     size_t changed = 0;
     for (auto const& handle : session->session.get_torrents()) {
@@ -564,6 +581,7 @@ size_t rextto_lt_ensure_auto_managed(rextto_lt_session* session) {
 // all'auto-manager nativo di libtorrent, che non ha questo punto cieco.
 
 void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_downloads, int minimum, int maximum, int static_seeds, int static_limit, int global_download_limit) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return;
     minimum = std::max(1, minimum);
     maximum = std::max(minimum, maximum);
@@ -749,6 +767,7 @@ void rextto_lt_adjust_queue(rextto_lt_session* session, int enabled, int static_
 }
 
 size_t rextto_lt_peers(rextto_lt_session* session, const char* hash, rextto_lt_peer* output, size_t capacity, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -773,6 +792,7 @@ size_t rextto_lt_peers(rextto_lt_session* session, const char* hash, rextto_lt_p
 }
 
 size_t rextto_lt_trackers(rextto_lt_session* session, const char* hash, rextto_lt_tracker* output, size_t capacity, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -792,6 +812,7 @@ size_t rextto_lt_trackers(rextto_lt_session* session, const char* hash, rextto_l
 }
 
 size_t rextto_lt_files(rextto_lt_session* session, const char* hash, rextto_lt_file* output, size_t capacity, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -816,6 +837,7 @@ size_t rextto_lt_files(rextto_lt_session* session, const char* hash, rextto_lt_f
 }
 
 int rextto_lt_move_storage(rextto_lt_session* session, const char* hash, const char* destination, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || hash == nullptr || destination == nullptr) {
         set_error(error, error_size, "invalid move storage parameters");
         return 0;
@@ -832,6 +854,7 @@ int rextto_lt_move_storage(rextto_lt_session* session, const char* hash, const c
 }
 
 int rextto_lt_set_paused(rextto_lt_session* session, const char* hash, int paused, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -850,6 +873,7 @@ int rextto_lt_set_paused(rextto_lt_session* session, const char* hash, int pause
 }
 
 int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -872,6 +896,7 @@ int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, 
 }
 
 int rextto_lt_set_sequential(rextto_lt_session* session, int enabled, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         if (session == nullptr) { set_error(error, error_size, "invalid session"); return 0; }
         session->sequential_enabled = enabled != 0;
@@ -892,6 +917,7 @@ int rextto_lt_set_sequential(rextto_lt_session* session, int enabled, char* erro
 }
 
 int rextto_lt_remove(rextto_lt_session* session, const char* hash, int delete_files, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -904,6 +930,7 @@ int rextto_lt_remove(rextto_lt_session* session, const char* hash, int delete_fi
 }
 
 int rextto_lt_force_recheck(rextto_lt_session* session, const char* hash, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -916,6 +943,7 @@ int rextto_lt_force_recheck(rextto_lt_session* session, const char* hash, char* 
 }
 
 int rextto_lt_reannounce(rextto_lt_session* session, const char* hash, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -928,6 +956,7 @@ int rextto_lt_reannounce(rextto_lt_session* session, const char* hash, char* err
 }
 
 int rextto_lt_set_limits(rextto_lt_session* session, const char* hash, int download_limit, int upload_limit, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     try {
         auto handle = find_torrent(session, hash);
         if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
@@ -941,6 +970,7 @@ int rextto_lt_set_limits(rextto_lt_session* session, const char* hash, int downl
 }
 
 size_t rextto_lt_restore(rextto_lt_session* session, const char* state_dir, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || state_dir == nullptr) { set_error(error, error_size, "invalid resume restore parameters"); return 0; }
     try {
         const std::filesystem::path directory(state_dir);
@@ -1002,6 +1032,7 @@ size_t rextto_lt_restore(rextto_lt_session* session, const char* state_dir, char
 }
 
 int rextto_lt_save_resume(rextto_lt_session* session, const char* state_dir, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr || state_dir == nullptr) { set_error(error, error_size, "invalid resume save parameters"); return 0; }
     try {
         const std::filesystem::path directory(state_dir);

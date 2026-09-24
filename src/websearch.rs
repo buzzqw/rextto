@@ -2,7 +2,7 @@ use crate::utils::{magnet_hash, sanitize_magnet};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 const TRACKERS: [&str; 3] = [
@@ -10,6 +10,12 @@ const TRACKERS: [&str; 3] = [
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
 ];
+
+/// This limit must be shared by *all* title searches. A limiter allocated in
+/// `search_with_timeout` only caps one query; with several scheduled queries it
+/// still permits dozens of simultaneous HTML fetches and parsers.
+static WEB_ENGINE_LIMITER: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(4));
 
 /// Per-cycle counters of web-engine failures, drained by the engine to print a
 /// single summary line instead of one warning per query.
@@ -80,12 +86,10 @@ pub async fn search_with_timeout(
     timeout: Option<Duration>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut set = tokio::task::JoinSet::new();
-    let limiter = Arc::new(Semaphore::new(4));
     for engine in engines.iter().map(|value| value.to_ascii_lowercase()) {
         let client = client.clone();
         let query = query.to_string();
         let flaresolverr = flaresolverr_url.map(str::to_string);
-        let limiter = limiter.clone();
         if !matches!(
             engine.as_str(),
             "bitsearch"
@@ -110,7 +114,7 @@ pub async fn search_with_timeout(
             continue;
         }
         set.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok();
+            let _permit = WEB_ENGINE_LIMITER.acquire().await.ok();
             let flaresolverr = flaresolverr.as_deref();
             let found = match engine.as_str() {
                 "bitsearch" => search_bitsearch(&client, &query).await,

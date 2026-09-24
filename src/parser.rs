@@ -474,16 +474,19 @@ pub fn parse_release_at(
     parse_release_source(title, magnet, None, source, discovered_at)
 }
 
-/// True per un link HTTP(S) che punta a un file `.torrent`.
+/// True per un link HTTP(S) che punta a un file `.torrent`. Jackett does not
+/// use a `.torrent` suffix: its download links are `/dl/<indexer>/?path=...`.
 pub fn is_torrent_url(value: &str) -> bool {
     let value = value.trim();
-    (value.starts_with("http://") || value.starts_with("https://"))
-        && value
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(value)
-            .to_ascii_lowercase()
-            .ends_with(".torrent")
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let path = url.path().to_ascii_lowercase();
+    path.ends_with(".torrent")
+        || (path.contains("/dl/") && url.query_pairs().any(|(key, _)| key == "path"))
 }
 
 /// Come [`parse_release_at`], ma accetta anche un link `.torrent` diretto: molti
@@ -668,6 +671,22 @@ mod tests {
             "BTDigg"
         )
         .is_none());
+    }
+
+    #[test]
+    fn accepts_jackett_download_urls_as_torrent_sources() {
+        let url = "http://jackett:9117/dl/limetorrents/?path=ZXhhbXBsZQ";
+        assert!(is_torrent_url(url));
+        let release = parse_release_source(
+            "Example.Show.S01E01.1080p.ITA",
+            "",
+            Some(url),
+            "Jackett RSS - LimeTorrents",
+            Utc::now(),
+        )
+        .expect("Jackett URL release");
+        assert!(release.magnet.is_empty());
+        assert_eq!(release.torrent_url.as_deref(), Some(url));
     }
 
     #[test]

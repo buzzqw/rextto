@@ -15,8 +15,19 @@ pub struct Engine {
     client: Client,
 }
 
-const QUERY_CONCURRENCY: usize = 8;
-const FEED_CONCURRENCY: usize = 10;
+/// A title search fans out again to every configured indexer and web engine.
+/// Keep this deliberately below the Tokio worker count so HTTP handlers retain
+/// workers while a scheduled cycle is running.
+const QUERY_CONCURRENCY: usize = 2;
+/// Feed HTML/RSS can decode and parse large response bodies. Keep enough Tokio
+/// workers available for Axum while a cycle scans remote sources.
+const FEED_CONCURRENCY: usize = 4;
+/// Includes direct retries and the optional FlareSolverr fallback. A malformed
+/// or stalled feed must not indefinitely retain a slot in the feed fan-out.
+const FEED_FETCH_BUDGET: Duration = Duration::from_secs(75);
+/// A single unresponsive indexer or HTML engine must not keep a cycle task
+/// alive forever. This covers the whole fan-out, not just one HTTP request.
+const AUTOMATIC_SEARCH_TIMEOUT: Duration = Duration::from_secs(90);
 /// Le ricerche avviate dall'interfaccia non devono attendere gli indexer/web
 /// lenti. I cicli automatici mantengono invece il timeout HTTP più generoso.
 const MANUAL_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -71,15 +82,25 @@ impl Engine {
                 let flaresolverr = flaresolverr.clone();
                 let feed = feed_label(&url);
                 set.spawn(async move {
-                    let result = fetch_feed(
-                        &client,
-                        &url,
-                        flaresolverr.as_deref(),
-                        max_pages,
-                        max_age_days,
-                        old_ratio,
+                    let result = match tokio::time::timeout(
+                        FEED_FETCH_BUDGET,
+                        fetch_feed(
+                            &client,
+                            &url,
+                            flaresolverr.as_deref(),
+                            max_pages,
+                            max_age_days,
+                            old_ratio,
+                        ),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "feed exceeded the {}s total time budget",
+                            FEED_FETCH_BUDGET.as_secs()
+                        )),
+                    };
                     match &result {
                         Ok(items) => {
                             crate::logging::source_ok("feed", &feed, items.len());
@@ -174,7 +195,29 @@ impl Engine {
                 let client = self.client.clone();
                 let cfg = cfg.clone();
                 set.spawn(async move {
-                    let items = search_one(&client, &cfg, &query, &ids, None).await;
+                    let started = std::time::Instant::now();
+                    let items = match tokio::time::timeout(
+                        AUTOMATIC_SEARCH_TIMEOUT,
+                        search_one(&client, &cfg, &query, &ids, None),
+                    )
+                    .await
+                    {
+                        Ok(items) => items,
+                        Err(_) => {
+                            tracing::warn!(
+                                query = %query,
+                                timeout_secs = AUTOMATIC_SEARCH_TIMEOUT.as_secs(),
+                                "scheduled title search timed out"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    tracing::debug!(
+                        query = %query,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        results = items.len(),
+                        "scheduled title search completed"
+                    );
                     (query, items)
                 });
             }
@@ -308,7 +351,22 @@ impl Engine {
     }
 
     pub async fn search_query(&self, cfg: &Config, query: &str) -> Vec<Release> {
-        self.search_query_ids(cfg, query, &[]).await
+        match tokio::time::timeout(
+            AUTOMATIC_SEARCH_TIMEOUT,
+            self.search_query_ids(cfg, query, &[]),
+        )
+        .await
+        {
+            Ok(items) => items,
+            Err(_) => {
+                tracing::warn!(
+                    query,
+                    timeout_secs = AUTOMATIC_SEARCH_TIMEOUT.as_secs(),
+                    "gap-fill title search timed out"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Ricerca interattiva: gli indexer Torznab restano disponibili per tutta

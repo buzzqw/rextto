@@ -40,6 +40,11 @@ use std::{
 static RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, serde_json::Value)>>> =
     OnceLock::new();
 
+/// Health may stat NFS paths and walk a large trash directory. Permit only one
+/// such blocking operation at a time; callers wait asynchronously rather than
+/// causing Tokio's blocking pool to create an unbounded number of threads.
+static HEALTH_CHECK_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
 fn cache_get(key: &str, ttl: Duration) -> Option<serde_json::Value> {
     let cache = RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = cache.lock().unwrap();
@@ -1202,24 +1207,45 @@ async fn ui_no_cache(request: Request, next: Next) -> Response {
     response
 }
 async fn health_api(State(s): State<AppState>) -> Json<health::Health> {
+    // Health gathers disk usage, walks the trash and stats configured paths.
+    // Some of those paths are NFS mounts, so this must never run on an Axum /
+    // Tokio worker: a slow stat or directory walk used to consume every worker
+    // when the dashboard polled `/api/health`, making the whole daemon appear
+    // dead even though the network runtime was still alive.
+    let data_dir = s.cfg.data_dir.clone();
     let trash = s
         .cfg
         .trash_path
         .clone()
-        .unwrap_or_else(|| s.cfg.data_dir.join("trash"));
+        .unwrap_or_else(|| data_dir.join("trash"));
+    let download_path = s.cfg.libtorrent_dir.clone();
+    let archive_root = s.cfg.archive_root.clone();
     let ramdisk = s
         .cfg
         .settings
         .get("libtorrent_ramdisk_dir")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
-    Json(health::check_with_paths(&health::HealthPaths {
-        data_dir: &s.cfg.data_dir,
-        trash_path: &trash,
-        download_path: &s.cfg.libtorrent_dir,
-        archive_root: s.cfg.archive_root.as_deref(),
-        ramdisk_path: ramdisk.as_deref(),
-    }))
+    let limiter = HEALTH_CHECK_LIMITER
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    let permit = limiter.acquire_owned().await.ok();
+    let report = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        health::check_with_paths(&health::HealthPaths {
+            data_dir: &data_dir,
+            trash_path: &trash,
+            download_path: &download_path,
+            archive_root: archive_root.as_deref(),
+            ramdisk_path: ramdisk.as_deref(),
+        })
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "health check task failed");
+        health::check(&s.cfg.data_dir)
+    });
+    Json(report)
 }
 async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let marker = setup_complete(&s.cfg);
@@ -8066,35 +8092,31 @@ async fn add_parsed_release(
             ),
         };
     }
-    match s.torrents.add(&source, &s.cfg) {
-        Ok(true) => match s.db.lock().unwrap().register_torrent(&release) {
-            Ok(()) => {
-                if let Some(hash) = crate::utils::magnet_hash(&release.magnet) {
-                    let _ = s
-                        .db
-                        .lock()
-                        .unwrap()
-                        .set_torrent_reason(&hash, "manual");
-                }
-                (
-                    StatusCode::ACCEPTED,
-                    Json(serde_json::json!({"ok":true,"title":release.title})),
-                )
-            }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-            ),
-        },
-        Ok(false) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"ok":false,"error":"torrent duplicate"})),
-        ),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
+    // Adding a magnet enters native libtorrent code. It can wait on disk
+    // verification or session state, so never run it in an Axum worker (or make
+    // the user wait for it). Persist the intent first, then isolate the native
+    // call in Tokio's blocking pool.
+    if let Err(error) = s.db.lock().unwrap().register_torrent(&release) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-        ),
+        );
     }
+    if let Some(hash) = crate::utils::magnet_hash(&release.magnet) {
+        let _ = s.db.lock().unwrap().set_torrent_reason(&hash, "manual");
+    }
+    let torrents = s.torrents.clone();
+    let cfg = s.cfg.clone();
+    let title = release.title.clone();
+    tokio::task::spawn_blocking(move || match torrents.add(&source, &cfg) {
+        Ok(true) => tracing::info!(title = %title, "manual torrent queued"),
+        Ok(false) => tracing::info!(title = %title, "manual torrent already queued"),
+        Err(error) => tracing::error!(title = %title, %error, "manual torrent add failed"),
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"ok":true,"title":release.title,"queued":true})),
+    )
 }
 
 fn is_torrent_url(value: &str) -> bool {

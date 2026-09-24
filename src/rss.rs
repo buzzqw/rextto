@@ -985,10 +985,19 @@ pub async fn fetch_torznab_flaresolverr(
             (content_type, body)
         }
     };
-    if content_type.contains("json") || body.trim_start().starts_with('[') {
-        return parse_prowlarr_json(&body, &indexer.name);
-    }
-    parse_feed_body(&body, &indexer.name)
+    // Torznab/Prowlarr replies can be large. XML/JSON decoding also invokes the
+    // release parser for every item, all of which is synchronous CPU work. Do
+    // not let that monopolize Tokio's workers (and consequently Axum's accept
+    // and request tasks) during the scheduled fan-out.
+    let source = indexer.name.clone();
+    tokio::task::spawn_blocking(move || {
+        if content_type.contains("json") || body.trim_start().starts_with('[') {
+            parse_prowlarr_json(&body, &source)
+        } else {
+            parse_feed_body(&body, &source)
+        }
+    })
+    .await?
 }
 
 #[cfg(test)]

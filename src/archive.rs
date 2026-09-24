@@ -45,8 +45,35 @@ impl Archive {
     pub fn save_batch(&self, releases: &[Release]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for r in releases {
-            tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, r.magnet, magnet_hash(&r.magnet), r.source, r.quality.score()])?;
+            // RSS sources such as Jackett can expose only a `.torrent` URL.
+            // Do not collapse all those releases into one empty unique magnet.
+            let source = if r.magnet.trim().is_empty() {
+                r.torrent_url.as_deref().unwrap_or_default()
+            } else {
+                &r.magnet
+            };
+            if source.trim().is_empty() {
+                continue;
+            }
+            tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, r.quality.score()])?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces an ephemeral `.torrent` URL with its durable infohash magnet
+    /// once the torrent has been downloaded successfully. If the same magnet
+    /// is already archived, the obsolete URL row is simply removed.
+    pub fn canonicalize_torrent_url(&self, torrent_url: &str, magnet: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM archive WHERE magnet=?1 AND EXISTS (SELECT 1 FROM archive WHERE magnet=?2)",
+            params![torrent_url, magnet],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE archive SET magnet=?1, magnet_hash=?2 WHERE magnet=?3",
+            params![magnet, magnet_hash(magnet), torrent_url],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -342,6 +369,38 @@ mod tests {
                 .total,
             0
         );
+        drop(archive);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn stores_and_canonicalizes_torrent_urls() {
+        let path = std::env::temp_dir().join(format!("rextto-archive-{}", uuid::Uuid::new_v4()));
+        let archive = Archive::open(&path).unwrap();
+        let torrent_url = "http://jackett:9117/dl/test/?path=ZXhhbXBsZQ";
+        let release = Release {
+            torrent_url: Some(torrent_url.into()),
+            title: "Example.Show.S01E01.1080p".into(),
+            magnet: String::new(),
+            source: "Jackett RSS - Test".into(),
+            quality: Default::default(),
+            kind: "series".into(),
+            series: Some("Example Show".into()),
+            season: Some(1),
+            episode: Some(1),
+            is_pack: false,
+            episode_range: vec![1],
+            year: None,
+            discovered_at: Utc::now(),
+        };
+        archive.save_batch(&[release]).unwrap();
+        assert_eq!(archive.count().unwrap(), 1);
+        let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+        archive.canonicalize_torrent_url(torrent_url, magnet).unwrap();
+        let entries = archive.search("Example Show").unwrap();
+        assert_eq!(entries[0].1, magnet);
         drop(archive);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
