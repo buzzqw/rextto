@@ -68,29 +68,30 @@ install_system_packages() {
             root_cmd apt-get update
             root_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 ca-certificates curl tar gzip xz-utils pkg-config \
-                build-essential cmake libssl-dev libboost-dev libboost-system-dev mediainfo
+                build-essential binutils mold cmake libssl-dev \
+                libboost-dev libboost-system-dev mediainfo
             ;;
         fedora)
             root_cmd dnf install -y \
                 ca-certificates curl tar gzip xz pkgconf-pkg-config \
-                gcc-c++ make cmake openssl-devel boost-devel mediainfo
+                gcc-c++ binutils mold make cmake openssl-devel boost-devel mediainfo
             ;;
         rhel|rocky|almalinux|centos)
             root_cmd dnf install -y epel-release || true
             root_cmd dnf install -y \
                 ca-certificates curl tar gzip xz pkgconf-pkg-config \
-                gcc-c++ make cmake openssl-devel boost-devel mediainfo
+                gcc-c++ binutils mold make cmake openssl-devel boost-devel mediainfo
             ;;
         opensuse*|sles)
             root_cmd zypper --non-interactive refresh
             root_cmd zypper --non-interactive install --no-recommends \
                 ca-certificates curl tar gzip xz pkg-config \
-                gcc-c++ make cmake libopenssl-devel boost-devel mediainfo
+                gcc-c++ binutils mold make cmake libopenssl-devel boost-devel mediainfo
             ;;
         arch|manjaro|endeavouros)
             root_cmd pacman -Sy --noconfirm --needed \
                 ca-certificates curl tar gzip xz pkgconf \
-                base-devel cmake openssl boost mediainfo
+                base-devel binutils mold cmake openssl boost mediainfo
             ;;
         *)
             die "unsupported distribution '$id'. Supported: Debian, Ubuntu, Fedora, openSUSE and Arch Linux."
