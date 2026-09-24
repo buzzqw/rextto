@@ -87,8 +87,15 @@ impl Engine {
                         }
                         Err(error) => {
                             let message = crate::utils::redact_url_secrets(&error.to_string());
-                            crate::logging::source_fail("feed", &feed, &message);
-                            tracing::warn!(feed = %feed, error = %message, "rss feed failed")
+                            // Cloudflare a volte chiude lo stream a metà: reqwest lo
+                            // riporta come errore di decodifica. Meglio dirlo in chiaro.
+                            let friendly = if message.contains("decoding response body") {
+                                "connection interrupted before the feed was complete".to_string()
+                            } else {
+                                message.clone()
+                            };
+                            crate::logging::source_fail("feed", &feed, &friendly);
+                            tracing::warn!("⚠️ RSS feed unavailable — {feed}: {friendly}")
                         }
                     }
                     result

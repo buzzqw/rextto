@@ -392,8 +392,29 @@ async fn flaresolverr_or(
     }
 }
 
-async fn fetch_body(client: &Client, url: &str, flaresolverr: Option<&str>) -> Result<String> {
-    let mut request = client.get(url).timeout(std::time::Duration::from_secs(10));
+/// Tentativi per scaricare il corpo di un feed: Cloudflare a volte chiude lo
+/// stream a metà ("error decoding response body" è proprio questo). I feed sono
+/// testi piccoli, quindi in caso di errore transitorio si può riscaricare.
+const FEED_FETCH_ATTEMPTS: u32 = 3;
+/// Timeout del singolo tentativo: il vecchio limite di 10s poteva troncare i
+/// feed grandi su linea lenta.
+const FEED_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Esito di un singolo tentativo diretto (senza FlareSolverr), per decidere se
+/// ritentare, passare a FlareSolverr o arrendersi.
+enum FetchAttempt {
+    Body(String),
+    Cloudflare(String),
+    Transient(String),
+    Fatal(String),
+}
+
+async fn fetch_body_direct(
+    client: &Client,
+    url: &str,
+    timeout: std::time::Duration,
+) -> FetchAttempt {
+    let mut request = client.get(url).timeout(timeout);
     if let Some(session) = session_for(url) {
         if !session.user_agent.is_empty() {
             request = request.header(reqwest::header::USER_AGENT, session.user_agent);
@@ -402,62 +423,82 @@ async fn fetch_body(client: &Client, url: &str, flaresolverr: Option<&str>) -> R
             request = request.header(reqwest::header::COOKIE, session.cookie);
         }
     }
-    // Cap aggregate concurrency per host, then release the permit before a
-    // possible FlareSolverr call (which talks to a different host).
+    // Cap aggregate concurrency per host; il permit viene rilasciato prima di un
+    // eventuale retry o chiamata FlareSolverr (che parla con un altro host).
     let host_permit = match host_semaphore(url) {
-        Some(semaphore) => Some(
-            semaphore
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow::anyhow!("host request limiter closed"))?,
-        ),
+        Some(semaphore) => match semaphore.acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => return FetchAttempt::Fatal("host request limiter closed".into()),
+        },
         None => None,
     };
     throttle_host(url).await;
     let direct = request.send().await;
     drop(host_permit);
-    match direct {
-        Ok(response) if response.status().is_success() => {
-            let body = response.text().await?;
-            if is_cloudflare_challenge(&body) {
-                if let Some(flaresolverr) = flaresolverr {
-                    return flaresolverr_or(client, flaresolverr, url, "cloudflare challenge body")
-                        .await;
+    let response = match direct {
+        Ok(response) => response,
+        Err(error) => return FetchAttempt::Transient(error.to_string()),
+    };
+    let status = response.status();
+    if status.is_success() {
+        return match response.text().await {
+            Ok(body) if is_cloudflare_challenge(&body) => {
+                FetchAttempt::Cloudflare("cloudflare challenge body".into())
+            }
+            Ok(body) => FetchAttempt::Body(body),
+            // Stream chiuso a metà: errore transitorio, si ritenta.
+            Err(error) => FetchAttempt::Transient(error.to_string()),
+        };
+    }
+    if cloudflare_blocked(status.as_u16()) {
+        return FetchAttempt::Cloudflare(format!("direct status {status}"));
+    }
+    if status.as_u16() == 429 {
+        penalize_host(url, std::time::Duration::from_secs(2));
+        tracing::warn!(feed_url = %url, "host rate limited the request (429)");
+        return FetchAttempt::Transient(format!("HTTP {status}"));
+    }
+    if status.is_server_error() {
+        return FetchAttempt::Transient(format!("HTTP {status}"));
+    }
+    FetchAttempt::Fatal(format!("HTTP {status}"))
+}
+
+/// Scarica il corpo di un feed con qualche tentativo sui soli errori
+/// transitori. Cloudflare è l'ultima spiaggia, dopo i retry diretti, così non
+/// viene martellato ad ogni micro-errore.
+async fn fetch_body(client: &Client, url: &str, flaresolverr: Option<&str>) -> Result<String> {
+    let mut last_transient = String::new();
+    for attempt in 1..=FEED_FETCH_ATTEMPTS {
+        match fetch_body_direct(client, url, FEED_FETCH_TIMEOUT).await {
+            FetchAttempt::Body(body) => return Ok(body),
+            FetchAttempt::Cloudflare(reason) => {
+                // Non è un problema di rete transitorio: lascia fare a FlareSolverr.
+                let Some(flaresolverr) = flaresolverr else {
+                    anyhow::bail!("{reason}");
+                };
+                return flaresolverr_or(client, flaresolverr, url, &reason).await;
+            }
+            FetchAttempt::Fatal(error) => anyhow::bail!("{error}"),
+            FetchAttempt::Transient(error) => {
+                last_transient = error;
+                if attempt < FEED_FETCH_ATTEMPTS {
+                    tracing::debug!(
+                        attempt,
+                        attempts = FEED_FETCH_ATTEMPTS,
+                        error = %last_transient,
+                        "feed fetch attempt failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
                 }
             }
-            Ok(body)
-        }
-        Ok(response) => {
-            let status = response.status();
-            if cloudflare_blocked(status.as_u16()) {
-                if let Some(flaresolverr) = flaresolverr {
-                    return flaresolverr_or(
-                        client,
-                        flaresolverr,
-                        url,
-                        &format!("direct status {status}"),
-                    )
-                    .await;
-                }
-            } else if status.as_u16() == 429 {
-                penalize_host(url, std::time::Duration::from_secs(2));
-                tracing::warn!(feed_url = %url, "host rate limited the request (429)");
-            }
-            Err(response.error_for_status().unwrap_err().into())
-        }
-        Err(error) => {
-            if let Some(flaresolverr) = flaresolverr {
-                return flaresolverr_or(
-                    client,
-                    flaresolverr,
-                    url,
-                    &format!("direct error {error}"),
-                )
-                .await;
-            }
-            Err(error.into())
         }
     }
+    // Stream ostinato: ultima spiaggia FlareSolverr, se configurato.
+    if let Some(flaresolverr) = flaresolverr {
+        return flaresolverr_or(client, flaresolverr, url, "direct attempts exhausted").await;
+    }
+    anyhow::bail!("{last_transient}")
 }
 
 pub async fn fetch_feed(
