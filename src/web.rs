@@ -9599,6 +9599,7 @@ async fn set_torrent_limits_legacy(
     ))
 }
 async fn remove_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
+    blocklist_mismatched_pack(&s.torrents, &s.db, &hash);
     let delete_files = torrent_files_are_disposable(&s.db.lock().unwrap(), &hash);
     let removed = s.torrents.remove(&hash, delete_files);
     if matches!(removed, Ok(true)) {
@@ -9613,7 +9614,8 @@ async fn remove_torrent_with_options(
     Path(hash): Path<String>,
     Json(input): Json<RemoveOptionsInput>,
 ) -> impl IntoResponse {
-    if input.blocklist {
+    let identity_mismatch = blocklist_mismatched_pack(&s.torrents, &s.db, &hash);
+    if input.blocklist && !identity_mismatch {
         let release =
             s.db.lock()
                 .unwrap()
@@ -9634,6 +9636,97 @@ async fn remove_torrent_with_options(
         let _ = db.forget_removed_torrent(&hash);
     }
     torrent_action(removed)
+}
+
+/// Returns the configured release when the torrent's real name identifies a
+/// different season. This catches stale indexer metadata even if the original
+/// metadata event was missed during a restart.
+fn mismatched_pack_release(
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+    hash: &str,
+) -> Option<Release> {
+    let release = db
+        .lock()
+        .unwrap()
+        .torrent_meta(hash)
+        .ok()
+        .flatten()
+        .map(|metadata| metadata.release)?;
+    if release.kind != "series" || !release.is_pack {
+        return None;
+    }
+    let name = torrent_display_name(torrents, hash);
+    let corrected = parser::reconcile_pack_identity(&release, &name)?;
+    (corrected.season != release.season).then_some(release)
+}
+
+/// A manual removal must not leave a mismatched season pack in the archive to
+/// be selected again by gap filling. Normal releases keep manual removal
+/// semantics; only this objectively bad identity is auto-blocklisted.
+fn blocklist_mismatched_pack(
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+    hash: &str,
+) -> bool {
+    let Some(release) = mismatched_pack_release(torrents, db, hash) else {
+        return false;
+    };
+    let Ok(database) = db.lock() else {
+        return false;
+    };
+    if database.is_blocklisted(hash).unwrap_or(false) {
+        return true;
+    }
+    match database.blocklist(&release, "season_pack_identity_mismatch") {
+        Ok(()) => {
+            tracing::warn!(hash = %hash, title = %release.title, "mismatched season pack permanently blocklisted");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(hash = %hash, %error, "could not blocklist mismatched season pack");
+            false
+        }
+    }
+}
+
+/// Periodic safety net for torrents that were already active before the
+/// metadata-time check was deployed, or whose metadata event was lost during
+/// a restart. The real torrent name is authoritative for season-pack identity.
+fn reject_active_pack_identity_mismatches(
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+) {
+    for torrent in torrents.list() {
+        let Some(release) = mismatched_pack_release(torrents, db, &torrent.hash) else {
+            continue;
+        };
+        let already_blocked = db
+            .lock()
+            .unwrap()
+            .is_blocklisted(&torrent.hash)
+            .unwrap_or(false);
+        if already_blocked {
+            let _ = torrents.remove(&torrent.hash, true);
+            continue;
+        }
+        let error = "torrent metadata season does not match declared season";
+        {
+            let database = db.lock().unwrap();
+            let _ = database.mark_torrent_error(&torrent.hash, error);
+            let _ = database.blocklist(&release, "season_pack_identity_mismatch");
+            let _ = database.forget_removed_torrent(&torrent.hash);
+        }
+        match torrents.remove(&torrent.hash, true) {
+            Ok(true) => tracing::warn!(
+                hash = %torrent.hash,
+                name = %torrent.name,
+                "mismatched season pack removed before completion"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(hash = %torrent.hash, %error, "could not remove mismatched season pack"),
+        }
+    }
 }
 async fn set_torrent_no_rename(
     State(s): State<AppState>,
@@ -10440,6 +10533,7 @@ async fn torrent_event_worker(
         }
         detach_error_torrents(&torrents, &db);
         detach_completed_archived_singles(&torrents, &db);
+        reject_active_pack_identity_mismatches(&torrents, &db);
         // Remove completed torrents that have finished seeding (archived packs
         // always, other torrents with `auto_remove_completed`) before the seed
         // policy moves them to disk only to delete them.
@@ -11265,14 +11359,15 @@ fn reconcile_ramdisk(
     torrents: &LibtorrentClient,
     attempts: &mut HashMap<String, Instant>,
 ) {
-    if !cfg.ramdisk_enabled() {
-        attempts.clear();
-        return;
-    }
     let Some(ramdisk) = cfg.ramdisk_dir() else {
         attempts.clear();
         return;
     };
+    cleanup_orphaned_ramdisk(&ramdisk, torrents);
+    if !cfg.ramdisk_enabled() {
+        attempts.clear();
+        return;
+    }
     let now = Instant::now();
     // Move at most a few per sweep: each relocation triggers a recheck, so a
     // large batch would compete with the ongoing downloads for disk I/O.
@@ -11318,6 +11413,54 @@ fn reconcile_ramdisk(
             Err(error) => {
                 tracing::warn!(hash = %hash, name = %torrent.name, %error, "RAM disk reconciliation failed")
             }
+        }
+    }
+}
+
+/// Remove files left behind in the RAM disk after a torrent was removed or a
+/// storage move failed. Only paths belonging to currently known torrents are
+/// protected; this keeps the tmpfs self-cleaning across restarts as well.
+fn cleanup_orphaned_ramdisk(ramdisk: &FsPath, torrents: &LibtorrentClient) {
+    let ramdisk = match std::fs::canonicalize(ramdisk) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::debug!(path = %ramdisk.display(), %error, "RAM disk orphan sweep skipped");
+            return;
+        }
+    };
+    let mut protected = Vec::new();
+    for torrent in torrents.list() {
+        let save_path = FsPath::new(&torrent.save_path);
+        if !crate::libtorrent::path_on_ramdisk(save_path, &ramdisk) {
+            continue;
+        }
+        let save_path = std::fs::canonicalize(save_path).unwrap_or_else(|_| save_path.to_path_buf());
+        if save_path != ramdisk {
+            protected.push(save_path.clone());
+        }
+        if !torrent.name.trim().is_empty() {
+            protected.push(save_path.join(&torrent.name));
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&ramdisk) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if protected
+            .iter()
+            .any(|root| path == *root || path.starts_with(root))
+        {
+            continue;
+        }
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => tracing::info!(path = %path.display(), "removed orphaned RAM disk data"),
+            Err(error) => tracing::warn!(path = %path.display(), %error, "could not remove orphaned RAM disk data"),
         }
     }
 }

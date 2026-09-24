@@ -171,6 +171,14 @@ pub async fn run_cycle_domain(
             let Some(hash) = magnet_hash(&magnet) else {
                 continue;
             };
+            if db
+                .lock()
+                .unwrap()
+                .is_blocklisted(&hash)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if !archive_hashes.insert(hash) {
                 continue;
             }
@@ -188,6 +196,14 @@ pub async fn run_cycle_domain(
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
+                if db
+                    .lock()
+                    .unwrap()
+                    .is_blocklisted(&hash)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 ready_pending.insert(hash);
             }
             releases.push(release);
@@ -286,6 +302,17 @@ pub async fn run_cycle_domain(
         let mut found = false;
         if let Ok(items) = archive.lock().unwrap().search(&query) {
             for (title, magnet, source) in items {
+                let Some(hash) = magnet_hash(&magnet) else {
+                    continue;
+                };
+                if db
+                    .lock()
+                    .unwrap()
+                    .is_blocklisted(&hash)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}"))
                 {
                     if cfg.release_allowed(&release) {

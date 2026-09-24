@@ -32,11 +32,10 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("settings", "Configurazione"),
             ("integrations", "Integrazioni"),
             ("maintenance", "Manutenzione"),
-            ("charts", "Grafici"),
-            ("license", "Licenza"),
             ("health", "Salute"),
             ("logs", "Log"),
             ("blocklist", "Blocklist"),
+            ("license", "Licenza"),
         ],
     ),
 ];
@@ -44,7 +43,7 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
 /// Voci poco usate: restano nel menu su desktop ma sono nascoste su mobile,
 /// così la barra di navigazione del telefono resta corta.
 fn is_optional_nav(id: &str) -> bool {
-    matches!(id, "charts" | "license" | "blocklist")
+    matches!(id, "license" | "blocklist")
 }
 
 fn page_label(page: &str) -> &'static str {
@@ -1001,7 +1000,6 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "logs"><LogsView data /></Show>
                         <Show when=move || page.get() == "health"><HealthView data /></Show>
                         <Show when=move || page.get() == "gaps"><MissingView data /></Show>
-                        <Show when=move || page.get() == "charts"><ChartsView data /></Show>
                         <Show when=move || page.get() == "blocklist"><BlocklistView data /></Show>
                         <Show when=move || page.get() == "license"><LicenseView /></Show>
                     </div>
@@ -7727,9 +7725,6 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
     let duplicates_count = RwSignal::new(0_i64);
     let duplicates_busy = RwSignal::new(false);
     let duplicates_message = RwSignal::new(String::new());
-    let restore_items = RwSignal::new(Vec::<Value>::new());
-    let restore_busy = RwSignal::new(false);
-    let restore_message = RwSignal::new(String::new());
     let rename_status = RwSignal::new(String::new());
     let refresh_trash = move || {
         let trash = trash;
@@ -7863,58 +7858,6 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                                         <td class="mono">{format!("S{season:02}E{episode:02}")}</td>
                                         <td class="truncate mono muted" title=path_title>{path}</td>
                                         <td class="numeric">{format!("{} < {}", number(&item, "resolution_rank"), number(&item, "best_rank"))}</td>
-                                    </tr>
-                                }
-                            }).collect_view()}</tbody>
-                        </table>
-                    </div>
-                </Show>
-            </Panel>
-            <Panel title="Ripristina sorgente nei nomi">
-                <p class="muted">{ctx_tr("Rimette il token [Source] (WEB-DL, HDTV, BluRay…) nei nomi archiviati che l'hanno perso, recuperandolo dal titolo originale della release nel DB. Non inventa la sorgente: se è sconosciuta, il file resta invariato. Nessun riscaricamento.")}</p>
-                <div class="toolbar" style="margin-top:8px">
-                    <button class="btn sm" disabled=move || restore_busy.get() on:click=move |_| {
-                        restore_busy.set(true);
-                        restore_message.set("Scansione in corso…".into());
-                        spawn_local(async move {
-                            match send("POST", "/api/maintenance/restore-source", Some(json!({"execute": false}))).await {
-                                Ok(value) => {
-                                    let items = array(&value, "items");
-                                    restore_message.set(format!("{} file da rinominare ({} serie)", items.len(), number(&value, "series")));
-                                    restore_items.set(items);
-                                }
-                                Err(error) => restore_message.set(format!("Errore: {error}")),
-                            }
-                            restore_busy.set(false);
-                        });
-                    }>{move || if restore_busy.get() { ctx_tr("Scansione…").get() } else { ctx_tr("Anteprima").get() }}</button>
-                    <button class="btn sm danger" disabled=move || restore_busy.get() on:click=move |_| {
-                        restore_busy.set(true);
-                        restore_message.set("Rinomina in corso…".into());
-                        spawn_local(async move {
-                            match send("POST", "/api/maintenance/restore-source", Some(json!({"execute": true}))).await {
-                                Ok(value) => restore_message.set(format!("{} file rinominati ({} errori)", number(&value, "renamed"), number(&value, "errors"))),
-                                Err(error) => restore_message.set(format!("Errore: {error}")),
-                            }
-                            restore_busy.set(false);
-                            restore_items.set(Vec::new());
-                        });
-                    }>{move || if restore_busy.get() { ctx_tr("Attendere…").get() } else { ctx_tr("Ripristina sorgente").get() }}</button>
-                    <small class="muted">{restore_message}</small>
-                </div>
-                <Show when=move || !restore_items.get().is_empty()>
-                    <div class="table-wrap" style="margin-top:10px">
-                        <table class="data-table">
-                            <thead><tr><th>{ctx_tr("Prima")}</th><th>{ctx_tr("Dopo")}</th></tr></thead>
-                            <tbody>{move || restore_items.get().into_iter().map(|item| {
-                                let from = text(&item, "from", "");
-                                let to = text(&item, "to", "");
-                                let from_base = from.rsplit('/').next().unwrap_or(&from).to_string();
-                                let to_base = to.rsplit('/').next().unwrap_or(&to).to_string();
-                                view! {
-                                    <tr>
-                                        <td class="truncate mono muted" title=from>{from_base}</td>
-                                        <td class="truncate mono" title=to>{to_base}</td>
                                     </tr>
                                 }
                             }).collect_view()}</tbody>
@@ -8418,6 +8361,7 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                     }).collect_view()}
                 </div>
             </Panel>
+            <ChartsView data />
         </div>
     }
 }
@@ -8457,15 +8401,13 @@ fn ChartsView(data: RwSignal<Data>) -> impl IntoView {
                 </div>
             </Panel>
             <Panel title="Consumo giornaliero (7 giorni)">
-                <div class="table-wrap">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Data")}</th><th>{ctx_tr("Byte")}</th></tr></thead>
-                        <tbody>
-                            {move || consumption.get().get("daily_7d").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|item| view! {
-                                <tr><td class="mono">{text(&item, "date", "-")}</td><td class="numeric">{size(&item, "bytes")}</td></tr>
-                            }).collect_view()}
-                        </tbody>
-                    </table>
+                <div class="daily-consumption-grid">
+                    {move || consumption.get().get("daily_7d").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|item| view! {
+                        <div class="daily-consumption-item">
+                            <span class="mono muted">{text(&item, "date", "-")}</span>
+                            <strong>{size(&item, "bytes")}</strong>
+                        </div>
+                    }).collect_view()}
                 </div>
             </Panel>
         </div>
