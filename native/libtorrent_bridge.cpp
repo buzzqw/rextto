@@ -896,7 +896,6 @@ int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, 
                 }
             }
         }
-        session->pinned_hash = requested_hash;
         if (pinned) {
             handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.resume();
@@ -905,6 +904,7 @@ int rextto_lt_set_pin(rextto_lt_session* session, const char* hash, int pinned, 
             handle.set_flags(lt::torrent_flags::auto_managed);
             handle.resume();
         }
+        session->pinned_hash = requested_hash;
         return 1;
     } catch (const std::exception& exception) {
         set_error(error, error_size, exception.what());

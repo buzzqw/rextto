@@ -9844,6 +9844,10 @@ async fn torrent_event_worker(
     event_log: Arc<Mutex<Vec<TorrentEvent>>>,
 ) {
     let mut move_requests = HashSet::new();
+    // Storage moves are asynchronous. Keep post-seeding moves protected until
+    // their success/failure alert arrives, otherwise the seed cleanup can
+    // remove the source while libtorrent is still copying it.
+    let mut post_seed_moves = HashSet::new();
     let mut metadata_wait_start = HashMap::new();
     let mut metadata_first_seen = HashMap::new();
     let mut stall_wait_start = HashMap::new();
@@ -9978,12 +9982,25 @@ async fn torrent_event_worker(
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
         if last_pin != pinned {
-            if let Some(hash) = &pinned {
-                if let Err(error) = torrents.set_pin(hash, true) {
-                    tracing::debug!(%error, "pin apply failed");
-                }
+            let applied = match &pinned {
+                Some(hash) => match torrents.set_pin(hash, true) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tracing::debug!(%error, "pin apply failed; will retry");
+                        false
+                    }
+                },
+                None => match torrents.set_pin("", false) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tracing::debug!(%error, "unpin apply failed; will retry");
+                        false
+                    }
+                },
+            };
+            if applied {
+                last_pin = pinned;
             }
-            last_pin = pinned;
         }
         let sequential = matches!(
             cfg.settings
@@ -10091,6 +10108,7 @@ async fn torrent_event_worker(
                 &torrents,
                 &db,
                 &mut move_requests,
+                &mut post_seed_moves,
                 event.clone(),
                 &tmdb,
                 &notifier,
@@ -10224,11 +10242,11 @@ async fn torrent_event_worker(
         // Rimuove i completati che hanno terminato il seed (i pack archiviati
         // sempre, gli altri con `auto_remove_completed`) prima che la seed
         // policy li sposti su disco solo per cancellarli.
-        remove_seeded_completed(&cfg, &torrents, &db);
+        remove_seeded_completed(&cfg, &torrents, &db, &post_seed_moves);
         // Enforce the seed policy only after handling this tick's events: with a
         // very low seed limit a just-finished torrent could otherwise be removed
         // before its `torrent_finished` event is post-processed and archived.
-        enforce_seed_policy(&cfg, &torrents, &db);
+        enforce_seed_policy(&cfg, &torrents, &db, &mut post_seed_moves);
     }
 }
 
@@ -10453,8 +10471,16 @@ fn needs_infinite_seed_resume(torrent: &crate::models::TorrentView) -> bool {
 ///   ratio/tempo esce dalla sessione.
 /// I file si cancellano solo se esiste una copia archiviata fuori dallo storage
 /// del torrent: nessun dato viene mai perso. Il seed infinito esplicito resta.
-fn remove_seeded_completed(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>) {
+fn remove_seeded_completed(
+    cfg: &Config,
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+    post_seed_moves: &HashSet<String>,
+) {
     for torrent in torrents.list() {
+        if post_seed_moves.contains(&torrent.hash) {
+            continue;
+        }
         // Seed infinito esplicito: il torrent deve restare in seed.
         if torrent.seed_ratio == 0.0 || torrent.seed_days == 0 {
             continue;
@@ -10588,7 +10614,12 @@ fn archived_pack_source_disposable(db: &Arc<Mutex<Database>>, hash: &str, save_p
     !FsPath::new(&processed).starts_with(FsPath::new(save_path))
 }
 
-fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex<Database>>) {
+fn enforce_seed_policy(
+    cfg: &Config,
+    torrents: &LibtorrentClient,
+    db: &Arc<Mutex<Database>>,
+    post_seed_moves: &mut HashSet<String>,
+) {
     let ratio_limit = cfg
         .libtorrent
         .stop_at_ratio
@@ -10675,7 +10706,9 @@ fn enforce_seed_policy(cfg: &Config, torrents: &LibtorrentClient, db: &Arc<Mutex
             if !stopped {
                 continue;
             }
-            post_seed_relocate(cfg, torrents, &torrent);
+            if post_seed_relocate(cfg, torrents, &torrent, post_seed_moves) {
+                continue;
+            }
             if cfg.libtorrent.auto_remove_completed {
                 // Delete storage only after verifying the archived copy. This
                 // also protects packs with stale or invalid processed_path data.
@@ -10706,7 +10739,8 @@ fn post_seed_relocate(
     cfg: &Config,
     torrents: &LibtorrentClient,
     torrent: &crate::models::TorrentView,
-) {
+    post_seed_moves: &mut HashSet<String>,
+) -> bool {
     let current = FsPath::new(&torrent.save_path);
     let in_ramdisk = cfg
         .ramdisk_dir()
@@ -10716,15 +10750,15 @@ fn post_seed_relocate(
         .as_deref()
         .is_some_and(|path| postprocess::same_path(current, path));
     if !in_ramdisk && !in_temp {
-        return;
+        return false;
     }
     let destination = cfg.libtorrent_dir.clone();
     if postprocess::same_path(current, &destination) {
-        return;
+        return false;
     }
     if let Err(error) = postprocess::validate_destination_from(current, &destination) {
         tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation refused");
-        return;
+        return false;
     }
     match torrents.move_storage(&torrent.hash, &destination) {
         Ok(true) => {
@@ -10734,10 +10768,18 @@ fn post_seed_relocate(
                 to = %destination.display(),
                 size = %crate::logging::human_bytes_i64(torrent.total_size),
                 "📁 MOVING TO NAS — post-seeding relocation"
-            )
+            );
+            post_seed_moves.insert(torrent.hash.clone());
+            true
         }
-        Ok(false) => tracing::debug!(hash=%torrent.hash, "post-seeding relocation was not applied"),
-        Err(error) => tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation failed"),
+        Ok(false) => {
+            tracing::debug!(hash=%torrent.hash, "post-seeding relocation was not applied");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(hash=%torrent.hash, %error, "post-seeding relocation failed");
+            false
+        }
     }
 }
 
@@ -10997,6 +11039,7 @@ async fn handle_torrent_event(
     torrents: &LibtorrentClient,
     db: &Arc<Mutex<Database>>,
     move_requests: &mut HashSet<String>,
+    post_seed_moves: &mut HashSet<String>,
     event: TorrentEvent,
     tmdb: &TmdbClient,
     notifier: &Notifier,
@@ -11203,6 +11246,15 @@ async fn handle_torrent_event(
         }
         "storage_move_failed" => {
             move_requests.remove(&event.hash);
+            let was_post_seed_move = post_seed_moves.remove(&event.hash)
+                || db
+                    .lock()
+                    .unwrap()
+                    .torrent_status(&event.hash)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("completed");
             tracing::warn!(
                 hash = %event.hash,
                 name = %event.name,
@@ -11214,7 +11266,11 @@ async fn handle_torrent_event(
             // is reported only through this alert. Retry once from the current
             // storage path instead of leaving a completed torrent stranded
             // forever with no future completion event.
-            let destination = postprocess::destination_for(&metadata.release, cfg);
+            let destination = if was_post_seed_move {
+                Some(cfg.libtorrent_dir.clone())
+            } else {
+                postprocess::destination_for(&metadata.release, cfg)
+            };
             let current = FsPath::new(&event.save_path);
             if let Some(destination) = destination {
                 if !postprocess::same_path(current, &destination)
@@ -11222,11 +11278,16 @@ async fn handle_torrent_event(
                     && move_requests.insert(event.hash.clone())
                 {
                     match torrents.move_storage(&event.hash, &destination) {
-                        Ok(true) => tracing::debug!(
-                            hash = %event.hash,
-                            to = %destination.display(),
-                            "retrying completed torrent storage move"
-                        ),
+                        Ok(true) => {
+                            if was_post_seed_move {
+                                post_seed_moves.insert(event.hash.clone());
+                            }
+                            tracing::debug!(
+                                hash = %event.hash,
+                                to = %destination.display(),
+                                "retrying completed torrent storage move"
+                            )
+                        }
                         Ok(false) => {
                             move_requests.remove(&event.hash);
                         }
@@ -11244,6 +11305,7 @@ async fn handle_torrent_event(
             false
         }
         "storage_moved" => {
+            post_seed_moves.remove(&event.hash);
             // A post-seeding relocation happens after the release was already
             // committed. Do not run rename/copy/pack processing a second time.
             if db.lock().unwrap().torrent_status(&event.hash)?.as_deref() == Some("completed") {

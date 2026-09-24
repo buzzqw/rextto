@@ -184,24 +184,7 @@ fn copy_files(files: &[PathBuf], source: &Path, destination: &Path) -> Result<Ve
             copied.push(target);
             continue;
         }
-        let mut input = fs::File::open(&file)?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        let copied_bytes = std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        let source_bytes = file.metadata()?.len();
-        if copied_bytes != source_bytes || target.metadata()?.len() != source_bytes {
-            let _ = fs::remove_file(&target);
-            bail!(
-                "season pack copy size mismatch for {}: source={} copied={} target={}",
-                file.display(),
-                source_bytes,
-                copied_bytes,
-                target.metadata().map(|value| value.len()).unwrap_or(0),
-            );
-        }
+        copy_file_atomically(file, &target)?;
         copied.push(target);
     }
     if copied.is_empty() {
@@ -827,12 +810,53 @@ fn move_across_devices(source: &Path, target: &Path) -> Result<()> {
     match fs::rename(source, target) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            fs::copy(source, target)?;
+            copy_file_atomically(source, target)?;
             fs::remove_file(source)?;
             Ok(())
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Copy a file through a hidden sibling and publish it with one rename. This
+/// keeps a partial cross-filesystem copy from being mistaken for an archived
+/// media file after a crash or an interrupted process.
+fn copy_file_atomically(source: &Path, target: &Path) -> Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("target has no parent: {}", target.display()))?;
+    fs::create_dir_all(parent)?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let temporary = parent.join(format!(".{name}.rextto-copy-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut input = fs::File::open(source)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let copied_bytes = std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        let source_bytes = source.metadata()?.len();
+        let target_bytes = temporary.metadata()?.len();
+        if copied_bytes != source_bytes || target_bytes != source_bytes {
+            bail!(
+                "atomic copy size mismatch for {}: source={} copied={} target={}",
+                source.display(),
+                source_bytes,
+                copied_bytes,
+                target_bytes,
+            );
+        }
+        fs::rename(&temporary, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Controllo economico del pattern del nome (senza TMDB né MediaInfo): vero se
@@ -1505,6 +1529,28 @@ mod tests {
         assert_eq!(tags.audio_codec.as_deref(), Some("AC3"));
         assert_eq!(tags.channels.as_deref(), Some("5.1"));
         assert_eq!(tags.hdr, None);
+    }
+
+    #[test]
+    fn atomic_file_copy_publishes_complete_target() {
+        let root = std::env::temp_dir().join(format!("rextto-atomic-copy-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source.mkv");
+        let target = root.join("archive").join("episode.mkv");
+        std::fs::create_dir_all(&root).unwrap();
+        let content = vec![b'x'; 128 * 1024];
+        std::fs::write(&source, &content).unwrap();
+
+        copy_file_atomically(&source, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), content);
+        assert!(!std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".rextto-copy-")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

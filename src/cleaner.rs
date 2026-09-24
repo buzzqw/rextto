@@ -209,7 +209,25 @@ pub fn move_to_trash(source: &Path, trash: &Path) -> Result<PathBuf> {
     if fs::rename(source, &target).is_ok() {
         return Ok(target);
     }
-    copy_recursive(source, &target)?;
+    // Copy into a hidden sibling first. The final rename makes the complete
+    // trash entry visible atomically, so an interrupted cross-filesystem copy
+    // cannot look like a valid archived duplicate.
+    let partial = trash.join(format!(
+        ".{}.rextto-trash-{}",
+        target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("item"),
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(error) = copy_recursive(source, &partial) {
+        let _ = remove_after_copy(&partial);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&partial, &target) {
+        let _ = remove_after_copy(&partial);
+        return Err(error.into());
+    }
     remove_after_copy(source)?;
     Ok(target)
 }
