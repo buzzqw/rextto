@@ -182,6 +182,4 @@ test. Completion notifications include size, download time and average speed.
   check *Rename* settings and the TMDB key.
 - **FTP backup fails** — use *Test FTP*: it reports the failing step (connection,
   login, remote path, upload, delete) and logs it.
-- **Legacy import** — this is a CLI-only operation. Stop the old instance first
-  and run `import-legacy.sh`; it copies databases without modifying the source.
 - **Logs** — see `data/rextto.log` (rotated at 5 MB) or the in-app log viewer.

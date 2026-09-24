@@ -97,15 +97,11 @@ cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
 Per una prova locale in modalità dry-run, senza download reali:
 
 ```bash
-./run-safe.sh          # avvia su http://127.0.0.1:5000 con REXTTO_ACTIVE=0
+REXTTO_DATA_DIR="$PWD/data" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
+  cargo run --release -- --dry-run
 ```
 
-L'helper del checkout compila se serve, installa/aggiorna l'unità systemd e
-riavvia il servizio:
-
-```bash
-./start-rextto-service.sh
-```
+Per installare il servizio reale usa l'installer descritto sopra.
 
 ### Verifica
 
@@ -257,35 +253,19 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 ## Sviluppo
 
 ```bash
-./scripts/build-fast.sh          # build rapida del demone (target/fast/rexttod)
-./scripts/dev-reload.sh --daemon # compila + copia + riavvia il servizio
-./scripts/dev-reload.sh          # demone + UI + riavvio
+cargo build --profile fast       # build rapida del demone (target/fast/rexttod)
+cargo build --release            # build del demone per produzione
 cargo check                      # feedback più rapido
 cargo test --all-targets         # test
+cargo clean                      # rimuove gli artefatti quando serve
 ```
 
 Le build di sviluppo restano piccole e non crescono all'infinito:
 
 - I profili `dev`/`test` usano solo tabelle di riga e nessuna info di debug per le
   dipendenze (`Cargo.toml`): `target/debug` resta intorno a 1 GB invece di ~10 GB.
-- `scripts/clean.sh` mostra lo spazio recuperabile; `--debug` rimuove gli
-  artefatti di sviluppo (mantenendo il binario release e il bundle UI servito).
-- Un timer systemd **utente** settimanale esegue `scripts/clean.sh --auto` (salta
-  se una build è in corso). Si installa una volta con:
-
-```bash
-scripts/install-dev-clean-timer.sh
-```
-
-## Migrazione da un'istanza precedente
-
-L'importazione di dati legacy non è una funzione della UI: usa lo script CLI su
-una data directory storica **ferma** (database serie, archivio, fumetti). Lo script
-copia i dati nei file `rextto_*.db` e non scrive mai nella directory sorgente.
-
-```bash
-./import-legacy.sh /percorso/legacy /home/user/rextto/data
-```
+- Gli script di supporto per lo sviluppo sono intenzionalmente locali e ignorati
+  da Git; non servono all'installer né a un'installazione di produzione.
 
 ## ❤️ Sostieni il progetto
 

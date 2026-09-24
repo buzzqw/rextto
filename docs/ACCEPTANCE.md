@@ -36,7 +36,8 @@ filename building, log rotation, notifier formatting, config and API auth.
 ## 4. Runtime smoke test (dry-run)
 
 ```bash
-./run-safe.sh
+REXTTO_DATA_DIR="$PWD/data-acceptance" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
+  cargo run --release -- --dry-run
 curl --fail http://127.0.0.1:5000/api/status
 curl --fail http://127.0.0.1:5000/api/health
 ```
@@ -53,14 +54,13 @@ Check, in order:
 ## 5. Service install
 
 ```bash
-./start-rextto-service.sh
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bash
 sudo systemctl status rextto.service
 sudo journalctl -u rextto.service -f
 ```
 
-The install script materialises the placeholders in `systemd/rextto.service`
-(`__ROOT__`, `__USER__`, `__GROUP__`) with the local values, so a reinstall
-does not depend on any hard-coded path.
+The installer creates the dedicated service account, runtime directories,
+systemd unit and initial databases.
 
 ## 6. Enable real downloads
 

@@ -99,15 +99,11 @@ cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
 To run locally in dry-run mode, without real downloads:
 
 ```bash
-./run-safe.sh          # serves http://127.0.0.1:5000 with REXTTO_ACTIVE=0
+REXTTO_DATA_DIR="$PWD/data" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
+  cargo run --release -- --dry-run
 ```
 
-The checkout service helper builds if needed, installs/refreshes the systemd
-unit and restarts it:
-
-```bash
-./start-rextto-service.sh
-```
+For a real service installation, use the installer described above.
 
 ### Check it
 
@@ -257,11 +253,11 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 ## Development
 
 ```bash
-./scripts/build-fast.sh          # fast daemon build (target/fast/rexttod)
-./scripts/dev-reload.sh --daemon # build + copy + restart the service
-./scripts/dev-reload.sh          # daemon + UI + restart
+cargo build --profile fast      # fast daemon build (target/fast/rexttod)
+cargo build --release            # production daemon build
 cargo check                      # fastest feedback
 cargo test --all-targets         # tests
+cargo clean                      # remove build artefacts when needed
 ```
 
 Development builds stay small and never accumulate forever:
@@ -269,24 +265,8 @@ Development builds stay small and never accumulate forever:
 - The `dev`/`test` profiles use line tables only and no debug info for
   dependencies (`Cargo.toml`), which keeps `target/debug` around 1 GB instead of
   ~10 GB.
-- `scripts/clean.sh` prints what is reclaimable; `--debug` removes the dev
-  artifacts (keeping the release binary and the served UI bundle).
-- A weekly systemd **user** timer runs `scripts/clean.sh --auto` (skips while a
-  build is running). Install it once with:
-
-```bash
-scripts/install-dev-clean-timer.sh
-```
-
-## Migrating from a legacy instance
-
-Legacy import is not a UI feature: use the CLI script with a **stopped** legacy
-data directory (series, archive and comics databases). It copies data into
-Rextto's `rextto_*.db` files and never writes to the source directory.
-
-```bash
-./import-legacy.sh /path/to/legacy /home/user/rextto/data
-```
+- Developer-only helper scripts are intentionally local and ignored by Git; they
+  are not required by the installer or by a production installation.
 
 ## ❤️ Support the project
 

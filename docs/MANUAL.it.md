@@ -192,6 +192,4 @@ velocità media.
   tecnici); controlla le impostazioni *Rinomina* e la chiave TMDB.
 - **Il backup FTP fallisce** — usa *Test FTP*: indica il passo che fallisce
   (connessione, login, percorso remoto, upload, rimozione) e lo registra nel log.
-- **Import legacy** — è disponibile solo da CLI. Ferma prima la vecchia istanza e
-  usa `import-legacy.sh`: copia i database senza modificare la sorgente.
 - **Log** — vedi `data/rextto.log` (rotazione a 5 MB) o il viewer nella UI.

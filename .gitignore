@@ -48,3 +48,12 @@ dist/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local developer helpers. They are intentionally kept out of the public tree;
+# developers may keep their private copies in the checkout.
+/import-legacy.sh
+/prepare-rextto-import.sh
+/rextto_tui.sh
+/run-safe.sh
+/start-rextto-service.sh
+/scripts/*.sh
