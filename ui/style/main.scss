@@ -620,6 +620,8 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
   }
   .system-group .nav-item { display: none; }
   .system-group.open .nav-item { display: inline-flex; }
+  /* Voci poco usate: solo desktop, su mobile restano fuori dalla barra. */
+  .system-group.open .nav-item.nav-optional { display: none; }
   .nav-item { padding: 10px 12px; scroll-snap-align: start; }
   .sidebar nav { scroll-snap-type: x proximity; }
   .sidebar::-webkit-scrollbar { display: none; }

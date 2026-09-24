@@ -32,11 +32,20 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("settings", "Configurazione"),
             ("integrations", "Integrazioni"),
             ("maintenance", "Manutenzione"),
+            ("charts", "Grafici"),
+            ("license", "Licenza"),
             ("health", "Salute"),
             ("logs", "Log"),
+            ("blocklist", "Blocklist"),
         ],
     ),
 ];
+
+/// Voci poco usate: restano nel menu su desktop ma sono nascoste su mobile,
+/// così la barra di navigazione del telefono resta corta.
+fn is_optional_nav(id: &str) -> bool {
+    matches!(id, "charts" | "license" | "blocklist")
+}
 
 fn page_label(page: &str) -> &'static str {
     for (_, items) in NAV_GROUPS {
@@ -910,8 +919,9 @@ pub fn App() -> impl IntoView {
                                     {items.iter().map(|(id, label)| {
                                         let id = *id;
                                         let item_label = *label;
+                                        let optional = is_optional_nav(id);
                                         view! {
-                                            <button class="nav-item" class:active=move || page.get() == id on:click=move |_| page.set(id.to_string())>
+                                            <button class="nav-item" class:nav-optional=optional class:active=move || page.get() == id on:click=move |_| page.set(id.to_string())>
                                                 <span>{move || tr(data, item_label)}</span>
                                                 <SidebarCount page=page id=id data />
                                             </button>
@@ -991,6 +1001,9 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "logs"><LogsView data /></Show>
                         <Show when=move || page.get() == "health"><HealthView data /></Show>
                         <Show when=move || page.get() == "gaps"><MissingView data /></Show>
+                        <Show when=move || page.get() == "charts"><ChartsView data /></Show>
+                        <Show when=move || page.get() == "blocklist"><BlocklistView data /></Show>
+                        <Show when=move || page.get() == "license"><LicenseView /></Show>
                     </div>
                 </main>
                 <ToastHost data />
@@ -7934,7 +7947,6 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </div>
             </Panel>
-            <BlocklistPanel data />
         </div>
     }
 }
@@ -8346,6 +8358,56 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
 }
 
 #[component]
+fn ChartsView(data: RwSignal<Data>) -> impl IntoView {
+    let consumption = Signal::derive(move || {
+        data.get()
+            .stats
+            .get("consumption")
+            .cloned()
+            .unwrap_or_default()
+    });
+    view! {
+        <div class="view">
+            <div class="metrics">
+                <Metric label="Totale" value=Signal::derive(move || size(&consumption.get(), "total_bytes")) tone="blue" />
+                <Metric label="30 giorni" value=Signal::derive(move || size(&consumption.get(), "last_30_days_bytes")) tone="amber" />
+                <Metric label="7 giorni" value=Signal::derive(move || size(&consumption.get(), "last_7_days_bytes")) tone="mint" />
+                <Metric label="Torrent" value=Signal::derive(move || data.get().torrents.len().to_string()) tone="violet" />
+            </div>
+            <Panel title="Grafici live">
+                <p class="muted">{ctx_tr("Ultimi 60 campioni, uno ogni 4 secondi (dalla dashboard aperta).")}</p>
+                <div class="live-grid">
+                    {[("CPU", "cpu", "%"), ("RAM", "ram", "%"), ("Download", "down", "B/s"), ("Upload", "up", "B/s"), ("Disco libero", "disk_free", "B"), ("RAM disk", "ramdisk_free", "B")].into_iter().map(|(label, key, unit)| {
+                        let values = Signal::derive(move || data.get().live_history.get(key).cloned().unwrap_or_default());
+                        let last = Signal::derive(move || values.get().last().copied().unwrap_or(0.0));
+                        view! {
+                            <div class="live-card">
+                                <div class="live-head"><span class="muted">{label}</span><strong>{move || if unit == "%" { format!("{:.0}%", last.get()) } else if unit == "B/s" { format!("{}/s", size_str(last.get())) } else { size_str(last.get()) }}</strong></div>
+                                <svg class="sparkline" viewBox="0 0 200 40" preserveAspectRatio="none" aria-label=label>
+                                    <polyline points=move || sparkline_points(&values.get(), 200.0, 40.0) fill="none" />
+                                </svg>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </Panel>
+            <Panel title="Consumo giornaliero (7 giorni)">
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead><tr><th>{ctx_tr("Data")}</th><th>{ctx_tr("Byte")}</th></tr></thead>
+                        <tbody>
+                            {move || consumption.get().get("daily_7d").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|item| view! {
+                                <tr><td class="mono">{text(&item, "date", "-")}</td><td class="numeric">{size(&item, "bytes")}</td></tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            </Panel>
+        </div>
+    }
+}
+
+#[component]
 fn MissingView(data: RwSignal<Data>) -> impl IntoView {
     let results = RwSignal::new(Vec::<Value>::new());
     view! {
@@ -8465,7 +8527,7 @@ fn CalendarView(data: RwSignal<Data>) -> impl IntoView {
     }
 }
 
-/// Pannello Blocklist: vive dentro Manutenzione, non ha più una voce di menu.
+/// Pannello Blocklist, usato dalla pagina Blocklist.
 #[component]
 fn BlocklistPanel(data: RwSignal<Data>) -> impl IntoView {
     view! {
@@ -8486,4 +8548,26 @@ fn BlocklistPanel(data: RwSignal<Data>) -> impl IntoView {
     }
 }
 
+#[component]
+fn BlocklistView(data: RwSignal<Data>) -> impl IntoView {
+    view! {
+        <div class="view">
+            <BlocklistPanel data />
+        </div>
+    }
+}
+
+#[component]
+fn LicenseView() -> impl IntoView {
+    view! {
+        <div class="view">
+            <Panel title="Licenza">
+                <div class="stack">
+                    <p>{ctx_tr("Rextto — media daemon.")}</p>
+                    <p class="muted">{ctx_tr("Licenza EUPL-1.2. Vedi il file LICENSE nel repository.")}</p>
+                </div>
+            </Panel>
+        </div>
+    }
+}
 
