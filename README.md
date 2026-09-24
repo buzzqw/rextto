@@ -52,8 +52,9 @@ disk).
 
 The official installer supports Debian, Ubuntu, Fedora, openSUSE and Arch Linux.
 It installs the compiler dependencies, builds and installs **libtorrent** from
-source, then downloads the latest Rextto release when one is available. Until a
-release asset exists it automatically builds the current GitHub source instead.
+source, then downloads the continuous build of the latest `main` commit. Stable
+release assets can be selected explicitly; if no asset exists yet it automatically
+builds the current GitHub source instead.
 It also creates the service account, systemd service, runtime directories and
 the empty databases on the first start. It never imports legacy data.
 
@@ -64,6 +65,13 @@ curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bas
 Run the same command again to check for updates and restart Rextto with the new
 version. Existing databases, configuration, downloads, archive paths and logs
 are kept in `/var/lib/rextto`; the program and web UI live in `/opt/rextto`.
+
+To install the latest stable tagged release instead of the continuous build:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | \
+  REXTTO_CHANNEL=stable bash
+```
 
 Useful overrides (optional):
 

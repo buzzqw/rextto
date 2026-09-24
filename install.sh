@@ -15,7 +15,7 @@ readonly INSTALL_DIR="${REXTTO_INSTALL_DIR:-/opt/rextto}"
 readonly DATA_DIR="${REXTTO_DATA_DIR:-/var/lib/rextto}"
 readonly PORT="${REXTTO_PORT:-5000}"
 readonly ENGINE_PORT="${REXTTO_ENGINE_PORT:-8889}"
-readonly RELEASE="${REXTTO_VERSION:-latest}"
+readonly RELEASE="${REXTTO_VERSION:-${REXTTO_CHANNEL:-continuous}}"
 readonly SOURCE_REF="${REXTTO_SOURCE_REF:-main}"
 readonly LIBTORRENT_VERSION="${REXTTO_LIBTORRENT_VERSION:-2.0.11}"
 readonly LIBTORRENT_PREFIX="${REXTTO_LIBTORRENT_PREFIX:-$INSTALL_DIR/libtorrent}"
@@ -168,7 +168,7 @@ download_release() {
     local arch="$1" base archive checksum
     archive="$TMP_DIR/rextto.tar.gz"
     checksum="$TMP_DIR/rextto.tar.gz.sha256"
-    if [[ "$RELEASE" == latest ]]; then
+    if [[ "$RELEASE" == latest || "$RELEASE" == stable ]]; then
         base="https://github.com/$REPO/releases/latest/download"
     else
         base="https://github.com/$REPO/releases/download/$RELEASE"

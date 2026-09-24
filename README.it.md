@@ -50,13 +50,21 @@ o disco locale).
 
 L'installer ufficiale supporta Debian, Ubuntu, Fedora, openSUSE e Arch Linux.
 Installa le dipendenze, compila e installa **libtorrent** dai sorgenti, poi
-scarica l'ultima build di Rextto quando disponibile. Finché non esiste una
-release precompilata, compila automaticamente il sorgente corrente da GitHub.
+scarica la build continua dell'ultimo commit di `main`. Le release stabili si
+possono selezionare esplicitamente; se non esiste ancora un asset precompilato,
+compila automaticamente il sorgente corrente da GitHub.
 Crea anche l'utente di servizio, il servizio systemd, le directory runtime e i
 database vuoti al primo avvio. Non importa dati legacy.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bash
+```
+
+Per installare l'ultima release stabile con tag invece della build continua:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | \
+  REXTTO_CHANNEL=stable bash
 ```
 
 Esegui lo stesso comando una seconda volta per cercare aggiornamenti e riavviare
