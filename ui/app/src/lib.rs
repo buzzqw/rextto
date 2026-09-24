@@ -8412,12 +8412,6 @@ fn ChartsView(data: RwSignal<Data>) -> impl IntoView {
     });
     view! {
         <div class="view">
-            <div class="metrics">
-                <Metric label="Totale" value=Signal::derive(move || size(&consumption.get(), "total_bytes")) tone="blue" />
-                <Metric label="30 giorni" value=Signal::derive(move || size(&consumption.get(), "last_30_days_bytes")) tone="amber" />
-                <Metric label="7 giorni" value=Signal::derive(move || size(&consumption.get(), "last_7_days_bytes")) tone="mint" />
-                <Metric label="Torrent" value=Signal::derive(move || data.get().torrents.len().to_string()) tone="violet" />
-            </div>
             <Panel title="Grafici live">
                 <p class="muted">{ctx_tr("Ultimi 60 campioni, uno ogni 4 secondi (dalla dashboard aperta).")}</p>
                 <div class="live-grid">
