@@ -8276,13 +8276,21 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
     let sources = RwSignal::new(Vec::<Value>::new());
     let sources_busy = RwSignal::new(false);
     let sources_loaded = RwSignal::new(false);
+    let live_cpu = Signal::derive(move || data.get().live_history.get("cpu").and_then(|values| values.last()).copied().unwrap_or(0.0));
+    let live_download = Signal::derive(move || data.get().live_history.get("down").and_then(|values| values.last()).copied().unwrap_or(0.0));
+    let live_upload = Signal::derive(move || data.get().live_history.get("up").and_then(|values| values.last()).copied().unwrap_or(0.0));
+    let live_ramdisk = Signal::derive(move || data.get().live_history.get("ramdisk_free").and_then(|values| values.last()).copied().unwrap_or(0.0));
     view! {
         <div class="view">
-            <div class="metrics">
+            <div class="metrics health-metrics">
                 <Metric label="Stato" value=Signal::derive(move || text(&data.get().health, "status", "offline")) tone="mint" />
                 <Metric label="RAM processo" value=Signal::derive(move || size(&data.get().health, "resident_bytes")) tone="blue" />
                 <Metric label="Spazio libero" value=Signal::derive(move || size(&data.get().health, "disk_free_bytes")) tone="amber" />
                 <Metric label="Trash" value=Signal::derive(move || size(&data.get().health, "trash_bytes")) tone="danger" />
+                <Metric label="CPU live" value=Signal::derive(move || format!("{:.0}%", live_cpu.get())) tone="violet" />
+                <Metric label="Download live" value=Signal::derive(move || format!("{}/s", size_str(live_download.get()))) tone="blue" />
+                <Metric label="Upload live" value=Signal::derive(move || format!("{}/s", size_str(live_upload.get()))) tone="mint" />
+                <Metric label="RAM disk" value=Signal::derive(move || size_str(live_ramdisk.get())) tone="amber" />
             </div>
             <Panel title="Runtime">
                 <div class="grid-3">
@@ -8395,49 +8403,6 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Ultimi errori">
                 <Show when=move || array(&data.get().health, "last_errors").is_empty()><span class="muted">{ctx_tr("Nessun errore recente nel log.")}</span></Show>
                 <pre class="output">{move || array(&data.get().health, "last_errors").into_iter().filter_map(|item| item.as_str().map(str::to_owned)).collect::<Vec<_>>().join("\n")}</pre>
-            </Panel>
-            <ChartsView data />
-        </div>
-    }
-}
-
-#[component]
-fn ChartsView(data: RwSignal<Data>) -> impl IntoView {
-    let consumption = Signal::derive(move || {
-        data.get()
-            .stats
-            .get("consumption")
-            .cloned()
-            .unwrap_or_default()
-    });
-    view! {
-        <div class="view">
-            <Panel title="Grafici live">
-                <p class="muted">{ctx_tr("Ultimi 60 campioni, uno ogni 4 secondi (dalla dashboard aperta).")}</p>
-                <div class="live-grid">
-                    {[("CPU", "cpu", "%"), ("RAM", "ram", "%"), ("Download", "down", "B/s"), ("Upload", "up", "B/s"), ("Disco libero", "disk_free", "B"), ("RAM disk", "ramdisk_free", "B")].into_iter().map(|(label, key, unit)| {
-                        let values = Signal::derive(move || data.get().live_history.get(key).cloned().unwrap_or_default());
-                        let last = Signal::derive(move || values.get().last().copied().unwrap_or(0.0));
-                        view! {
-                            <div class="live-card">
-                                <div class="live-head"><span class="muted">{label}</span><strong>{move || if unit == "%" { format!("{:.0}%", last.get()) } else if unit == "B/s" { format!("{}/s", size_str(last.get())) } else { size_str(last.get()) }}</strong></div>
-                                <svg class="sparkline" viewBox="0 0 200 40" preserveAspectRatio="none" aria-label=label>
-                                    <polyline points=move || sparkline_points(&values.get(), 200.0, 40.0) fill="none" />
-                                </svg>
-                            </div>
-                        }
-                    }).collect_view()}
-                </div>
-            </Panel>
-            <Panel title="Consumo giornaliero (7 giorni)">
-                <div class="daily-consumption-grid">
-                    {move || consumption.get().get("daily_7d").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|item| view! {
-                        <div class="daily-consumption-item">
-                            <span class="mono muted">{text(&item, "date", "-")}</span>
-                            <strong>{size(&item, "bytes")}</strong>
-                        </div>
-                    }).collect_view()}
-                </div>
             </Panel>
         </div>
     }

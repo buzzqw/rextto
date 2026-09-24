@@ -314,6 +314,7 @@ label { color: var(--muted); font-size: 0.875rem; }
 
 /* Metrics */
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.health-metrics { grid-template-columns: repeat(8, minmax(0, 1fr)); }
 .metric { padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 .metric span { display: block; color: var(--muted); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .1em; }
 .metric strong { display: block; margin-top: 6px; font-size: 1.5rem; letter-spacing: -.03em; }
@@ -654,6 +655,7 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 
 /* Liste Serie TV / Film su mobile: niente colonne secondarie, azioni a capo. */
 @media (max-width: 700px) {
+  .health-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
   .data-table.lib-table td:first-child { min-width: 0; width: 34px; }
   .data-table.lib-table th:nth-child(2),
