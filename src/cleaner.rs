@@ -8,6 +8,8 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 /// Indice delle migliori qualità presenti su disco nella cartella di una serie.
@@ -208,12 +210,38 @@ pub fn move_to_trash(source: &Path, trash: &Path) -> Result<PathBuf> {
         return Ok(target);
     }
     copy_recursive(source, &target)?;
-    if source.is_dir() {
-        fs::remove_dir_all(source)?;
-    } else {
-        fs::remove_file(source)?;
-    }
+    remove_after_copy(source)?;
     Ok(target)
+}
+
+/// A torrent client can still finish a filesystem operation while its handle
+/// is being removed. On a cross-filesystem move that leaves a short window in
+/// which a directory entry is created between `remove_dir_all`'s scan and its
+/// final `rmdir`, producing `ENOTEMPTY`. Retry that specific race instead of
+/// reporting a failed cleanup after the complete copy is already in the trash.
+fn remove_after_copy(source: &Path) -> Result<()> {
+    const RETRIES: usize = 10;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    for attempt in 0..=RETRIES {
+        let result = if source.is_dir() {
+            fs::remove_dir_all(source)
+        } else {
+            fs::remove_file(source)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(_error) if !source.exists() => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && attempt < RETRIES =>
+            {
+                thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("remove_after_copy exhausted its retry loop")
 }
 
 fn copy_recursive(source: &Path, target: &Path) -> Result<()> {
@@ -830,6 +858,27 @@ mod tests {
         );
         assert!(trash.join("Example.S01E01.720p.WEB-DL.mkv").is_file());
         assert!(kept.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn moves_completed_pack_directory_to_trash() {
+        let root = std::env::temp_dir().join(format!(
+            "rextto-cleaner-pack-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("download");
+        let trash = root.join("trash");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested").join("episode.mkv"), b"episode").unwrap();
+
+        let target = move_to_trash(&source, &trash).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(target.join("nested").join("episode.mkv")).unwrap(), b"episode");
         let _ = fs::remove_dir_all(root);
     }
 

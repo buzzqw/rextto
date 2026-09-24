@@ -10825,8 +10825,8 @@ fn reconcile_ramdisk(
 }
 
 /// A completed download that cannot be imported must not keep occupying the
-/// RAM disk. Keep it recoverable in the configured trash, then remove the
-/// torrent handle because its storage path is no longer active.
+/// RAM disk. Detach the torrent before moving its storage to the configured
+/// trash, because its storage path is no longer active.
 /// Scrive nella cartella del pack un file di nota quando la release viene
 /// rifiutata, così resta chiaro perché era presente.
 fn write_rejection_marker(source: &std::path::Path, reason: &str) {
@@ -10850,6 +10850,27 @@ fn discard_completed_source(
     reason: &str,
 ) {
     let source = postprocess::completion_path(event);
+
+    // Detach the completed torrent before touching its storage. This prevents
+    // libtorrent from recreating/writing directory entries while a
+    // cross-filesystem move copies the rejected pack to the trash. Removing
+    // the handle also deletes its fast-resume files, so it cannot return after
+    // a daemon restart.
+    let removed = match torrents.remove(&event.hash, false) {
+        Ok(true) => {
+            tracing::info!(hash = %event.hash, "rejected completed torrent removed from the session");
+            true
+        }
+        Ok(false) => {
+            tracing::debug!(hash = %event.hash, "rejected torrent was already removed");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(hash = %event.hash, %error, "rejected torrent removal failed");
+            false
+        }
+    };
+
     if source.exists() {
         write_rejection_marker(&source, reason);
         if let Some(trash) = cfg.trash_path.as_deref() {
@@ -10889,14 +10910,9 @@ fn discard_completed_source(
             }
         }
     }
-    match torrents.remove(&event.hash, false) {
-        Ok(true) => {
-            // Il torrent ha lasciato la sessione: entra nello Storico con l'esito.
-            let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
-            tracing::info!("rejected completed torrent removed from the session")
-        }
-        Ok(false) => tracing::debug!(hash = %event.hash, "rejected torrent was already removed"),
-        Err(error) => tracing::warn!(hash = %event.hash, %error, "rejected torrent removal failed"),
+    if removed {
+        // Il torrent ha lasciato la sessione: entra nello Storico con l'esito.
+        let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
     }
 }
 
