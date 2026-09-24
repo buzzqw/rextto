@@ -202,7 +202,9 @@ pub async fn run_cycle_domain(
     }
     for ((series, season), mut episodes) in gap_summary {
         episodes.sort_unstable();
-        tracing::info!(
+        // Dettaglio per serie/stagione: decine di righe per ciclo, utile solo
+        // in diagnosi. Resta il riepilogo "gap-fill starting · gaps: N".
+        tracing::debug!(
             series = %series,
             season,
             gaps = %episodes_label(&episodes),

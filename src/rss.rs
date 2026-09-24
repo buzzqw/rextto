@@ -665,7 +665,7 @@ async fn fetch_tgx_listing(
     let mut output = Vec::new();
     // legacy's `_tgx_user` does not apply the age filter.
     fetch_detail_magnets(client, pending, label, flaresolverr, &mut output, None).await;
-    tracing::info!(feed_url = %url, label = %label, items = output.len(), "torrentgalaxy listing parsed");
+    tracing::debug!(feed_url = %url, label = %label, items = output.len(), "torrentgalaxy listing parsed");
     Ok(output)
 }
 

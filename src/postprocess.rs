@@ -1024,9 +1024,9 @@ pub fn apply_sidecars(source: &Path, target: &Path, cfg: &Config) {
         Ok(sidecars) => {
             for (from, to) in &sidecars {
                 if to.as_os_str().is_empty() {
-                    tracing::info!(from = %from.display(), "rename sidecar: duplicate moved to trash");
+                    tracing::debug!(from = %from.display(), "rename sidecar: duplicate moved to trash");
                 } else {
-                    tracing::info!(from = %from.display(), to = %to.display(), "rename sidecar");
+                    tracing::debug!(from = %from.display(), to = %to.display(), "rename sidecar");
                 }
             }
         }

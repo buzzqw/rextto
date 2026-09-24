@@ -8721,7 +8721,7 @@ async fn refresh_media_libraries(cfg: &Config) {
             .await
         {
             Ok(response) if response.status().is_success() => {
-                tracing::info!("Jellyfin library refresh requested")
+                tracing::debug!("Jellyfin library refresh requested")
             }
             Ok(response) => {
                 tracing::warn!(status=%response.status(), "Jellyfin library refresh failed")
@@ -9808,7 +9808,7 @@ async fn torrent_event_worker(
                     match result {
                         Ok(()) => {
                             match notifier.notify_event("comic_completed", serde_json::json!({"hash": hash, "title": comic.title, "post_url": comic.post_url, "path": event.save_path})).await {
-                                Ok(()) => tracing::info!(hash=%hash, "completion notification sent"),
+                                Ok(()) => tracing::debug!(hash=%hash, "completion notification sent"),
                                 Err(error) => tracing::warn!(hash=%hash, %error, "completion notification failed"),
                             }
                             tracing::info!(hash=%event.hash, title=%comic.title, path=%event.save_path, "comic torrent completed");
@@ -9944,7 +9944,7 @@ async fn torrent_event_worker(
                     })).await;
                     match notification {
                         Ok(()) => {
-                            tracing::info!(hash=%event.hash, event="torrent_completed", "completion notification sent")
+                            tracing::debug!(hash=%event.hash, event="torrent_completed", "completion notification sent")
                         }
                         Err(error) => {
                             tracing::warn!(hash=%event.hash, event="torrent_completed", %error, "completion notification failed")
@@ -10309,7 +10309,7 @@ fn post_seed_relocate(
     }
     match torrents.move_storage(&torrent.hash, &destination) {
         Ok(true) => {
-            tracing::info!(
+            tracing::debug!(
                 hash = %torrent.hash,
                 from = %current.display(),
                 to = %destination.display(),
@@ -10728,7 +10728,7 @@ async fn handle_torrent_event(
                     })).await;
                     match notification {
                         Ok(()) => {
-                            tracing::info!(hash=%event.hash, event="season_pack_completed", "completion notification sent")
+                            tracing::debug!(hash=%event.hash, event="season_pack_completed", "completion notification sent")
                         }
                         Err(error) => {
                             tracing::warn!(hash=%event.hash, event="season_pack_completed", %error, "completion notification failed")
@@ -10754,7 +10754,7 @@ async fn handle_torrent_event(
                     complete_torrent(cfg, db, torrents, &event, &metadata.release, tmdb).await?
                 } else if move_requests.insert(event.hash.clone()) {
                     postprocess::validate_destination_from(current, &destination)?;
-                    tracing::info!(
+                    tracing::debug!(
                         hash = %event.hash,
                         title = %metadata.release.title,
                         from = %current.display(),
@@ -10994,7 +10994,7 @@ async fn complete_torrent(
             Ok(true) => {
                 // Ha lasciato la sessione: entra nello Storico con il percorso NAS.
                 let _ = db.lock().unwrap().mark_torrent_removed_at(&event.hash);
-                tracing::info!(
+                tracing::debug!(
                     hash = %event.hash,
                     "torrent removed after rename: archived under a different path"
                 )

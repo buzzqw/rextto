@@ -654,8 +654,9 @@ impl LibtorrentClient {
             return Ok(());
         };
         let lt = &cfg.libtorrent;
-        // One-line session summary, like legacy: useful at info without per-event noise.
-        tracing::info!(
+        // One-line session summary: utile in diagnosi, ma viene ripetuto ad ogni
+        // "Applica ora"/ottimizzazione, quindi resta a debug.
+        tracing::debug!(
             cache_blocks = lt.cache_size,
             connections_limit = lt.connections_limit,
             aio_threads = lt.aio_threads,

@@ -247,7 +247,7 @@ impl Engine {
         let mut kept = Vec::with_capacity(all.len());
         for release in std::mem::take(&mut all) {
             if let Some(reason) = cfg.release_denied_reason(&release) {
-                tracing::info!(
+                tracing::debug!(
                     title = %release.title,
                     source = %release.source,
                     reason,
@@ -256,7 +256,7 @@ impl Engine {
                 continue;
             }
             if let Some(reason) = cfg.source_filter_denied_reason(&release) {
-                tracing::info!(
+                tracing::debug!(
                     title = %release.title,
                     source = %release.source,
                     reason = %reason,
@@ -439,22 +439,25 @@ fn print_source_report() {
     if stats.is_empty() {
         return;
     }
-    tracing::info!("📡 SOURCE REPORT — outcomes of every source in this cycle");
+    // Report dettagliato per sorgente: utile in diagnosi, ma sono decine di
+    // righe per ciclo. Il riepilogo ("Sources: ..." e i warning sugli engine
+    // irraggiungibili) resta a INFO/WARN.
+    tracing::debug!("📡 SOURCE REPORT — outcomes of every source in this cycle");
     for (kind, name, stat) in stats {
         if stat.fail == 0 {
-            tracing::info!(
+            tracing::debug!(
                 "   ✅ [{kind}] {name}: {} run(s), {} releases",
                 stat.ok,
                 stat.results
             );
         } else if stat.ok == 0 {
-            tracing::warn!(
+            tracing::debug!(
                 "   ❌ [{kind}] {name}: {} failure(s) — {}",
                 stat.fail,
                 stat.last_error.as_deref().unwrap_or("unknown error")
             );
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 "   ⚠️ [{kind}] {name}: {} ok / {} failed, {} releases — {}",
                 stat.ok,
                 stat.fail,
