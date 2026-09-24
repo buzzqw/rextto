@@ -287,7 +287,7 @@ pub fn redact_url_secrets(input: &str) -> String {
             break;
         }
         let value_end = output[value_start..]
-            .find(|character: char| matches!(character, '&' | ' ' | ')' | ']' | '"'))
+            .find(['&', ' ', ')', ']', '"'])
             .map(|offset| value_start + offset)
             .unwrap_or(output.len());
         if output[value_start..value_end].eq_ignore_ascii_case("[redacted]") {

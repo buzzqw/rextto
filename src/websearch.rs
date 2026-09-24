@@ -29,7 +29,7 @@ pub fn take_engine_failures() -> Vec<(String, usize)> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut items = failures.drain().collect::<Vec<_>>();
-    items.sort_by(|a, b| b.1.cmp(&a.1));
+    items.sort_by_key(|item| std::cmp::Reverse(item.1));
     items
 }
 
@@ -327,9 +327,12 @@ async fn search_eztv(client: &Client, query: &str) -> Result<Vec<(String, String
                     .then(|| build_magnet(hash, title))
                     .flatten()
             });
-        if !title.is_empty() && magnet.is_some() {
+        if !title.is_empty() {
+            let Some(magnet) = magnet else {
+                continue;
+            };
             let accepted =
-                crate::parser::parse_release(title, magnet.as_deref().unwrap_or_default(), "EZTV")
+                crate::parser::parse_release(title, &magnet, "EZTV")
                     .is_some_and(|release| {
                         release.kind == "series"
                             && release.season == Some(expected_season)
@@ -339,7 +342,7 @@ async fn search_eztv(client: &Client, query: &str) -> Result<Vec<(String, String
                             })
                     });
             if accepted {
-                output.push((title.to_owned(), magnet.unwrap(), "EZTV".into()));
+                output.push((title.to_owned(), magnet, "EZTV".into()));
             }
         }
         if output.len() >= 20 {

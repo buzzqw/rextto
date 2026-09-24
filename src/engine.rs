@@ -389,6 +389,12 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 async fn search_one(
     client: &Client,
     cfg: &Config,

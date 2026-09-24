@@ -6994,7 +6994,7 @@ fn DbOptimizeTool(data: RwSignal<Data>) -> impl IntoView {
                     if let Ok(info) = get("/api/db/info").await {
                         db_files.set(array(&info, "files"));
                     }
-                    push_toast(data, "ok", format!("{action} completato"));
+                    push_toast(data, "ok", "Fatto".into());
                 }
                 Err(error) => push_toast(data, "err", error),
             }
@@ -7753,7 +7753,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Azioni">
                 <div class="toolbar">
                     <button class="btn primary" title=ctx_tr("Crea subito un backup compresso di database e configurazione") on:click=move |_| run_post(data, "/api/backup", None, "Backup creato")>{ctx_tr("Backup")}</button>
-                    <button class="btn" title=ctx_tr("Svuota subito il cestino ignorando la conservazione configurata") on:click=move |_| run_post(data, "/api/maintenance/clean-trash", None, "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
+                    <button class="btn" title=ctx_tr("Svuota subito il cestino ignorando la conservazione configurata") on:click=move |_| run_post(data, "/api/maintenance/clean-trash", Some(json!({"force": true})), "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
                     <button class="btn" title=ctx_tr("Ricalcola il punteggio di qualità degli episodi indicizzati con le regole scoring attuali") on:click=move |_| run_post(data, "/api/database/rescore", None, "Scoring ricalcolato")>{ctx_tr("Ricalcola scoring")}</button>
                     <button class="btn" title=ctx_tr("Rileggi le cartelle archivio e registra nel database i file video già presenti") on:click=move |_| run_post(data, "/api/scan-all-archives", None, "Archivi scansionati")>{ctx_tr("Scansiona archivi")}</button>
                     <button class="btn" title=ctx_tr("Rinomina in background tutti i file archiviati, con progresso") on:click=move |_| {
@@ -7774,7 +7774,6 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                         });
                     }>{ctx_tr("Rinomina tutto")}</button>
                     <small class="muted">{move || rename_status.get()}</small>
-                    <button class="btn" title=ctx_tr("Importa impostazioni e libreria da una configurazione legacy (Extto/rextto)") on:click=move |_| run_post(data, "/api/config/migrate", None, "Configurazione importata")>{ctx_tr("Importa config legacy")}</button>
                     <button class="btn" title=ctx_tr("Importa serie, film e storico dai database già presenti nella cartella dati") on:click=move |_| run_post(data, "/api/setup/import", None, "Import eseguito")>{ctx_tr("Importa dati esistenti")}</button>
                     <button class="btn" title=ctx_tr("Riavvia il servizio rextto per applicare gli aggiornamenti (richiede l'helper installato una volta da root)") on:click=move |_| {
                         spawn_local(async move {
@@ -7925,7 +7924,8 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
             </Panel>
             </div>
             <DbOptimizeTool data />
-            <Panel title="Stato sorgenti">
+            <Panel title="Diagnostica sorgenti e servizi">
+                <p class="muted" title=ctx_tr("Questa sezione esegue una ricerca reale con query e include anche test porte e notifiche; la sezione Stato sorgenti in Salute mostra invece il controllo generale delle sorgenti.")>{ctx_tr("Test query sulle sorgenti, porte e notifiche")}</p>
                 <div class="toolbar">
                     <input prop:value=source_query on:input=move |event| source_query.set(event_target_value(&event)) placeholder=ctx_tr("Query di test (es. 9-1-1 S10)") />
                     <button class="btn sm" title=ctx_tr("Esegue una ricerca reale su feed, indexer e motori web e mostra quanti risultati trova ciascuno") on:click=move |_| {
@@ -8268,7 +8268,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                 </table>
             </div>
         </Panel>
-        <Panel title="Indexer (Jackett / Prowlarr)">
+        <Panel title="Indexer e FlareSolverr">
             <div class="table-wrap">
                 <table class="data-table">
                     <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("URL")}</th><th>{ctx_tr("Abilitato")}</th><th>{ctx_tr("Raggiungibile")}</th></tr></thead>
@@ -8276,16 +8276,17 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                         {move || {
                             let items = indexers.get();
                             if items.is_empty() {
-                                return view! { <tr><td colspan="4" class="muted">{ctx_tr("Nessun indexer abilitato.")}</td></tr> }.into_any();
+                                return view! { <tr><td colspan="4" class="muted">{ctx_tr("Nessun indexer o FlareSolverr configurato.")}</td></tr> }.into_any();
                             }
                             items.into_iter().map(|entry| {
+                                let is_flaresolverr = text(&entry, "kind", "") == "flaresolverr";
                                 let reachable = entry.get("reachable").and_then(Value::as_bool).unwrap_or(false);
                                 let status = entry.get("status").and_then(Value::as_i64).map(|value| value.to_string()).unwrap_or_else(|| "-".into());
                                 view! {
-                                    <tr>
+                                    <tr title=if is_flaresolverr { Some(ctx_tr("Servizio FlareSolverr configurato come supporto anti-Cloudflare").get()) } else { None }>
                                         <td>{text(&entry, "name", "-")}</td>
                                         <td class="mono truncate muted">{text(&entry, "url", "-")}</td>
-                                        <td><span class="badge ok">{"sì"}</span></td>
+                                        <td><span class="badge ok">{if is_flaresolverr { "configurato" } else { "sì" }}</span></td>
                                         <td><span class="badge" class:ok=reachable class:err=!reachable>{if reachable { format!("ok ({status})") } else { "non raggiungibile".into() }}</span></td>
                                     </tr>
                                 }

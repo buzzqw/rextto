@@ -221,12 +221,8 @@ pub fn matching_pack_files(source: &Path, release: &Release) -> Result<Vec<PackS
     let mut matched = files
         .iter()
         .filter_map(|file| {
-            let Some(name) = file.file_name().and_then(|value| value.to_str()) else {
-                return None;
-            };
-            let Some(capture) = episode_pattern.captures(name) else {
-                return None;
-            };
+            let name = file.file_name().and_then(|value| value.to_str())?;
+            let capture = episode_pattern.captures(name)?;
             let season = capture
                 .name("season")
                 .or_else(|| capture.name("nseason"))
@@ -290,7 +286,7 @@ pub fn matching_pack_files(source: &Path, release: &Release) -> Result<Vec<PackS
     }
     matched.sort_by_key(|file| file.episode);
     matched.dedup_by_key(|file| file.episode);
-    Ok((found == expected).then_some(matched).unwrap_or_default())
+    Ok(if found == expected { matched } else { Vec::new() })
 }
 
 pub fn copy_matching_pack_files(
@@ -1195,7 +1191,7 @@ fn media_resolution(video: Option<&serde_json::Value>) -> Option<String> {
     let height = height.unwrap_or(0);
     let width = width.unwrap_or(0);
     let suffix = if media_text(video, &["Scan_type"])
-        .is_some_and(|value| value.to_ascii_lowercase() == "interlaced")
+        .is_some_and(|value| value.eq_ignore_ascii_case("interlaced"))
     {
         "i"
     } else {
@@ -1499,6 +1495,7 @@ pub fn video_files(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::config::{Config, SeriesConfig};

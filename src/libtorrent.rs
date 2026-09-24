@@ -833,7 +833,6 @@ impl LibtorrentClient {
         } else {
             bail!("libtorrent session is unavailable");
         }
-        let save_path = save_path;
         self.torrents.write().unwrap().insert(
             hash.clone(),
             TorrentView {
@@ -1004,7 +1003,7 @@ impl LibtorrentClient {
         native
             .into_iter()
             .take(received)
-            .filter_map(|event| {
+            .map(|event| {
                 let hash = native_string(&event.hash).to_ascii_lowercase();
                 let kind = match event.kind {
                     1 => "metadata_received",
@@ -1018,12 +1017,12 @@ impl LibtorrentClient {
                         tracing::warn!(hash=%hash, %error, "cannot persist torrent metadata");
                     }
                 }
-                Some(TorrentEvent {
+                TorrentEvent {
                     kind: kind.into(),
                     hash,
                     name: native_string(&event.name),
                     save_path: native_string(&event.save_path),
-                })
+                }
             })
             .collect()
     }
@@ -1551,6 +1550,7 @@ fn effective_listen_interfaces(lt: &LibtorrentSettings) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};

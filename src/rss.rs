@@ -43,7 +43,7 @@ fn attribute(start: &BytesStart<'_>, name: &str) -> Option<String> {
 }
 
 fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
-    let mut reader = Reader::from_str(&body);
+    let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
     let mut current = String::new();
     let mut in_item = false;

@@ -30,6 +30,7 @@ pub async fn run_cycle(
     run_cycle_domain(cfg, engine, db, archive, comics, notifier, torrents, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cycle_domain(
     cfg: &Config,
     engine: &Engine,
@@ -405,7 +406,7 @@ pub async fn run_cycle_domain(
                 .copied()
                 .filter(|episode| *episode > 0)
                 .collect::<std::collections::HashSet<_>>();
-            let complete = release.episode_range.iter().any(|episode| *episode == 0);
+            let complete = release.episode_range.contains(&0);
             if best.iter().any(|old| {
                 old.kind == "series"
                     && old.series.as_deref() == Some(series)
@@ -417,7 +418,7 @@ pub async fn run_cycle_domain(
                             .copied()
                             .filter(|episode| *episode > 0)
                             .collect::<std::collections::HashSet<_>>();
-                        let old_complete = old.episode_range.iter().any(|episode| *episode == 0);
+                        let old_complete = old.episode_range.contains(&0);
                         ((complete && old_complete)
                             || (!complete
                                 && old_complete
@@ -449,7 +450,7 @@ pub async fn run_cycle_domain(
                     .copied()
                     .filter(|episode| *episode > 0)
                     .collect::<std::collections::HashSet<_>>();
-                let old_complete = old.episode_range.iter().any(|episode| *episode == 0);
+                let old_complete = old.episode_range.contains(&0);
                 !((complete || (range.len() > 1 && range.is_superset(&old_range)))
                     && !incumbent_wins(&release, score, old, &cfg.settings)
                     && (!old_complete || complete))
@@ -525,6 +526,7 @@ pub async fn run_cycle_domain(
     };
     let mut upgrades = 0usize;
     let mut new_items = 0usize;
+    let mut started_details = Vec::new();
     for mut release in best {
         // I feed RSS che espongono solo il link `.torrent` (es. TorrentLeech)
         // non hanno un magnet: scarica il file, ricava l'infohash e conserva il
@@ -643,6 +645,23 @@ pub async fn run_cycle_domain(
             };
             match added {
                 Ok(true) => {
+                    let started_detail = if gap_episodes.is_empty() {
+                        format!(
+                            "{} [{}]: {}",
+                            release_target(&release),
+                            release.source,
+                            release.title
+                        )
+                    } else {
+                        format!(
+                            "{} · episodi {} [{}]: {}",
+                            release_target(&release),
+                            episodes_label(&gap_episodes),
+                            release.source,
+                            release.title
+                        )
+                    };
+                    started_details.push(started_detail);
                     if gap_episodes.is_empty() {
                         tracing::info!(
                             "📥 Download started [{}]: {} · {} · score {}",
@@ -761,6 +780,14 @@ pub async fn run_cycle_domain(
         stats.gaps_filled,
         stats.errors
     );
+    if started_details.is_empty() {
+        tracing::info!("📦 CYCLE DOWNLOADS — nessun download avviato");
+    } else {
+        tracing::info!(
+            "📦 CYCLE DOWNLOADS — {}",
+            started_details.join(" · ")
+        );
+    }
     if stats.downloads_started == 0 {
         tracing::info!("💤 No downloads in this cycle");
     }

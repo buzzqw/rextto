@@ -8,6 +8,9 @@ use std::path::Path;
 
 const DOWNLOAD_HISTORY_RETENTION_DAYS: i64 = 30;
 
+pub type ReadyPending = (String, String, String, i64, i64);
+pub type SeriesSummary = (String, i64, i64, Option<String>);
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -577,7 +580,7 @@ impl Database {
             .copied()
             .filter(|episode| *episode > 0)
             .collect();
-        let complete = release.episode_range.iter().any(|episode| *episode == 0) || explicit.is_empty();
+        let complete = release.episode_range.contains(&0) || explicit.is_empty();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO series(name) VALUES (?1)",
@@ -720,7 +723,6 @@ impl Database {
             match existing {
                 None => {
                     let episode_hash = if hash_available {
-                        hash_available = false;
                         Some(hash)
                     } else {
                         None
@@ -735,7 +737,6 @@ impl Database {
                         .is_some()
                     {
                         let episode_hash = if hash_available {
-                            hash_available = false;
                             Some(hash)
                         } else {
                             None
@@ -998,7 +999,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn ready_pending(&self) -> Result<Vec<(String, String, String, i64, i64)>> {
+    pub fn ready_pending(&self) -> Result<Vec<ReadyPending>> {
         let mut statement = self.conn.prepare("SELECT s.name,p.best_title,p.best_magnet,p.season,p.episode FROM pending_downloads p JOIN series s ON s.id=p.series_id WHERE p.status='pending' AND s.enabled=1 AND datetime(COALESCE(p.first_seen_at,p.ready_at), '+' || p.timeframe_hours || ' hours') <= datetime('now')")?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1453,6 +1454,7 @@ impl Database {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_archive_file_scored(
         &self,
         series_name: &str,
@@ -1900,13 +1902,13 @@ impl Database {
                     })
                     .optional()?;
                 if let Some(series_id) = series_id {
-                    if release.is_pack && release.episode_range.iter().any(|episode| *episode == 0)
+                    if release.is_pack && release.episode_range.contains(&0)
                     {
                         self.conn.execute("UPDATE episodes SET downloaded_at=?1,archive_path=?2,size_bytes=?3 WHERE series_id=?4 AND season=?5 AND episode=0", params![now, path, size_bytes, series_id, season])?;
                     }
                     let episodes = if release.is_pack
                         && (release.episode_range.is_empty()
-                            || release.episode_range.iter().any(|episode| *episode == 0))
+                            || release.episode_range.contains(&0))
                     {
                         let count: Option<i64> = self.conn.query_row("SELECT MAX(episode_count) FROM series_metadata WHERE series_name=?1 AND season=?2", params![series, season], |row| row.get(0)).optional()?.flatten();
                         count
@@ -1971,7 +1973,7 @@ impl Database {
                 })
                 .optional()?
             {
-                if release.episode_range.iter().any(|episode| *episode == 0) {
+                if release.episode_range.contains(&0) {
                     self.conn.execute("UPDATE episodes SET downloaded_at=?1,archive_path=?2,size_bytes=?3 WHERE series_id=?4 AND season=?5 AND episode=0", params![now, path, size_bytes, series_id, season])?;
                 }
                 for (episode, episode_path, episode_size, episode_score) in episodes {
@@ -2470,7 +2472,7 @@ impl Database {
     }
 
     /// Per-series aggregate: (name, total episodes, downloaded episodes, last download).
-    pub fn series_summaries(&self) -> Result<Vec<(String, i64, i64, Option<String>)>> {
+    pub fn series_summaries(&self) -> Result<Vec<SeriesSummary>> {
         let mut statement = self.conn.prepare(
             "SELECT s.name, COUNT(e.id), COALESCE(SUM(CASE WHEN e.downloaded_at IS NOT NULL THEN 1 ELSE 0 END),0), MAX(e.downloaded_at) FROM series s LEFT JOIN episodes e ON e.series_id=s.id GROUP BY s.name",
         )?;

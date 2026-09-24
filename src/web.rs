@@ -648,9 +648,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logs/stream", get(logs_stream))
         .route("/api/notifications/stream", get(notifications_stream))
         .route("/api/config", get(config_view).post(save_config_root))
-        .route("/api/config/migration-status", get(migration_status))
-        .route("/api/config/migrate", post(migrate_config))
-        .route("/api/config/rename-old", post(rename_old_config))
         .route("/api/config/library", get(library_view).post(save_library))
         .route("/api/config/series", post(save_series_config))
         .route("/api/config/movies", post(save_movies_config))
@@ -1254,11 +1251,9 @@ async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     if !marker {
         let has_series = s.db.lock().unwrap().has_data().unwrap_or(false);
         let has_archive = s.archive.lock().unwrap().count().unwrap_or(0) > 0;
-        if has_series || has_archive {
-            if complete_setup(&s.cfg).is_ok() {
-                completed = true;
-                auto_completed = true;
-            }
+        if (has_series || has_archive) && complete_setup(&s.cfg).is_ok() {
+            completed = true;
+            auto_completed = true;
         }
     }
     Json(serde_json::json!({
@@ -1310,7 +1305,7 @@ async fn logs_stream(State(s): State<AppState>) -> impl IntoResponse {
             let start = lines.len().saturating_sub(200);
             for (offset, line) in lines[start..].iter().enumerate() {
                 yield Ok::<Event, Infallible>(
-                    Event::default().id((start + offset).to_string()).data((*line).to_string()),
+                    Event::default().id((start + offset).to_string()).data(*line),
                 );
             }
             sent = lines.len();
@@ -1324,9 +1319,9 @@ async fn logs_stream(State(s): State<AppState>) -> impl IntoResponse {
             if lines.len() < sent {
                 sent = 0;
             }
-            for offset in sent..lines.len() {
+            for (offset, line) in lines.iter().enumerate().skip(sent) {
                 yield Ok::<Event, Infallible>(
-                    Event::default().id(offset.to_string()).data(lines[offset].to_string()),
+                    Event::default().id(offset.to_string()).data(*line),
                 );
             }
             sent = lines.len();
@@ -1509,50 +1504,6 @@ async fn save_config_root(
     Json(input): Json<LibraryInput>,
 ) -> impl IntoResponse {
     save_library(State(s), Json(input)).await
-}
-fn legacy_roots<'a>(state: &'a AppState, cfg: &'a Config) -> [&'a std::path::Path; 3] {
-    [
-        state
-            .config_path
-            .parent()
-            .unwrap_or_else(|| FsPath::new(".")),
-        cfg.data_dir.as_path(),
-        cfg.import_source_dir.as_path(),
-    ]
-}
-async fn migration_status(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let cfg = latest_config(&s);
-    let report = Config::inspect_legacy_files(&legacy_roots(&s, &cfg));
-    Json(
-        serde_json::json!({"ok":true,"source_available":!report.files_found.is_empty(),"target_exists":cfg.data_dir.join("rextto_config.db").is_file(),"can_migrate":!report.files_found.is_empty(),"files":report.files_found}),
-    )
-}
-async fn migrate_config(State(s): State<AppState>) -> impl IntoResponse {
-    let cfg = latest_config(&s);
-    let roots = legacy_roots(&s, &cfg);
-    match Config::migrate_legacy_files(&cfg.data_dir, &roots) {
-        Ok(report) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"report":report})),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-        ),
-    }
-}
-async fn rename_old_config(State(s): State<AppState>) -> impl IntoResponse {
-    let cfg = latest_config(&s);
-    match Config::rename_legacy_files(&legacy_roots(&s, &cfg)) {
-        Ok(report) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"report":report})),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-        ),
-    }
 }
 async fn tag_dir_rules(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
@@ -2116,7 +2067,7 @@ async fn series_info(State(s): State<AppState>, Path(name): Path<String>) -> imp
         );
     };
     let tmdb = TmdbClient::with_language(cfg.tmdb_api_key.clone(), cfg.tmdb_language());
-    let tmdb_id = (!series.tmdb_id.trim().is_empty()).then(|| series.tmdb_id.as_str());
+    let tmdb_id = (!series.tmdb_id.trim().is_empty()).then_some(series.tmdb_id.as_str());
     match tmdb.series_info(&series.name, tmdb_id).await {
         Ok(Some(value)) => {
             let poster = value
@@ -3750,10 +3701,11 @@ async fn db_prune(State(s): State<AppState>, Json(input): Json<PruneInput>) -> i
         let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
         let error_age = input.error_age_days.unwrap_or(7).max(1);
         let seen_days = input.seen_retention_days.unwrap_or(0);
-        return match (|| -> anyhow::Result<crate::database::PrunePreview> {
+        let preview_result = {
             let db = s.db.lock().unwrap();
             db.prune_preview(retain, error_age, seen_days)
-        })() {
+        };
+        return match preview_result {
             Ok(preview) => (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -3778,12 +3730,13 @@ async fn db_prune(State(s): State<AppState>, Json(input): Json<PruneInput>) -> i
     let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
     let error_age = input.error_age_days.unwrap_or(7).max(1);
     let seen_days = input.seen_retention_days.unwrap_or(0);
-    let result = (|| -> anyhow::Result<(crate::database::MaintenanceReport, usize)> {
+    let result = {
         let db = s.db.lock().unwrap();
-        let report = db.cleanup(retain, error_age)?;
-        let seen_removed = db.prune_seen_older_than(seen_days)?;
-        Ok((report, seen_removed))
-    })();
+        db.cleanup(retain, error_age).and_then(|report| {
+            db.prune_seen_older_than(seen_days)
+                .map(|seen_removed| (report, seen_removed))
+        })
+    };
     match result {
         Ok((report, seen_removed)) => (
             StatusCode::OK,
@@ -3805,10 +3758,10 @@ async fn db_prune_preview(
     let retain = input.retain_cycles.unwrap_or(50).clamp(1, 10000);
     let error_age = input.error_age_days.unwrap_or(7).max(1);
     let seen_days = input.seen_retention_days.unwrap_or(0);
-    let result = (|| -> anyhow::Result<crate::database::PrunePreview> {
+    let result = {
         let db = s.db.lock().unwrap();
         db.prune_preview(retain, error_age, seen_days)
-    })();
+    };
     match result {
         Ok(preview) => (
             StatusCode::OK,
@@ -4613,15 +4566,11 @@ fn save_provider_settings(
         Json(serde_json::json!({"ok":true,"saved":saved})),
     )
 }
-fn collect_watchlist_entries(
-    value: &serde_json::Value,
-    kind: &str,
-    out: &mut Vec<(String, String)>,
-) {
+fn collect_watchlist_entries(value: &serde_json::Value, out: &mut Vec<(String, String)>) {
     match value {
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_watchlist_entries(item, kind, out);
+                collect_watchlist_entries(item, out);
             }
         }
         serde_json::Value::Object(map) => {
@@ -4634,7 +4583,7 @@ fn collect_watchlist_entries(
                 out.push((title.to_string(), year));
             } else {
                 for child in map.values() {
-                    collect_watchlist_entries(child, kind, out);
+                    collect_watchlist_entries(child, out);
                 }
             }
         }
@@ -4660,7 +4609,7 @@ fn collect_watchlist(value: &serde_json::Value, out: &mut Vec<(String, String, S
                 if let Some(kind) = kind {
                     typed = true;
                     let mut entries = Vec::new();
-                    collect_watchlist_entries(child, kind, &mut entries);
+                    collect_watchlist_entries(child, &mut entries);
                     for (title, year) in entries {
                         out.push((kind.to_string(), title, year));
                     }
@@ -7106,7 +7055,7 @@ async fn torrent_history(
     let query = query.q.unwrap_or_default();
     match s.db.lock().unwrap().completed_torrents(offset, limit, &query) {
         Ok((items, total)) => {
-            let pages = ((total as usize + limit - 1) / limit).max(1);
+            let pages = (total as usize).div_ceil(limit).max(1);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok":true,"items":items,"total":total,"page":page,"pages":pages})),
@@ -7181,7 +7130,7 @@ async fn delete_archive_entry(
             .lock()
             .unwrap()
             .delete(input.magnet.trim())
-            .map(|deleted| usize::from(deleted))
+            .map(usize::from)
     };
     match result {
         Ok(deleted) if deleted > 0 => (
@@ -7589,7 +7538,7 @@ fn seen_grouped(
     };
     match result {
         Ok((groups, total)) => {
-            let pages = ((total as usize + limit - 1) / limit).max(1);
+            let pages = (total as usize).div_ceil(limit).max(1);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok":true,"groups":groups,"total":total,"page":page,"pages":pages})),
@@ -8682,9 +8631,7 @@ async fn ipfilter_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let target = cfg.libtorrent.ip_filter_path.trim().to_string();
     let cached = cfg.data_dir.join("ipfilter.dat");
     let is_url = target.starts_with("http://") || target.starts_with("https://");
-    let path = if is_url {
-        cached.clone()
-    } else if target.is_empty() {
+    let path = if is_url || target.is_empty() {
         cached.clone()
     } else {
         std::path::PathBuf::from(&target)
@@ -9309,6 +9256,23 @@ async fn services_status(State(s): State<AppState>) -> impl IntoResponse {
         indexers.push(serde_json::json!({
             "name": indexer.name,
             "url": indexer.url,
+            "reachable": status.is_some(),
+            "status": status,
+        }));
+    }
+    if let Some(url) = cfg
+        .flaresolverr_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    {
+        let status = match client.get(url).send().await {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+        indexers.push(serde_json::json!({
+            "kind": "flaresolverr",
+            "name": "FlareSolverr",
+            "url": url,
             "reachable": status.is_some(),
             "status": status,
         }));
@@ -10750,8 +10714,8 @@ fn needs_infinite_seed_resume(torrent: &crate::models::TorrentView) -> bool {
 ///   sorgente è ridondante (copia verificata via `processed_path`) e va rimossa;
 /// - con `auto_remove_completed` attivo, qualsiasi completato che ha raggiunto
 ///   ratio/tempo esce dalla sessione.
-/// I file si cancellano solo se esiste una copia archiviata fuori dallo storage
-/// del torrent: nessun dato viene mai perso. Il seed infinito esplicito resta.
+///   I file si cancellano solo se esiste una copia archiviata fuori dallo storage
+///   del torrent: nessun dato viene mai perso. Il seed infinito esplicito resta.
 fn remove_seeded_completed(
     cfg: &Config,
     torrents: &LibtorrentClient,
@@ -11358,6 +11322,7 @@ fn discard_completed_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_torrent_event(
     cfg: &Config,
     torrents: &LibtorrentClient,

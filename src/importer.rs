@@ -36,10 +36,12 @@ fn snapshot_database(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+type Snapshots = (PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>);
+
 fn make_snapshots(
     source_dir: &Path,
     _destination_dir: &Path,
-) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)> {
+) -> Result<Snapshots> {
     let snapshot_dir = std::env::temp_dir().join(format!("rextto-import-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&snapshot_dir)?;
     let series = source_dir.join("extto_series.db");

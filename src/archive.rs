@@ -133,7 +133,7 @@ impl Archive {
         let page = page.max(1);
         let (includes, excludes) = parse_archive_filter(query);
         let page_of = |total: i64| {
-            let pages = ((total as usize + limit - 1) / limit).max(1);
+            let pages = (total as usize).div_ceil(limit).max(1);
             (pages, ((page - 1).min(pages - 1) * limit) as i64)
         };
 

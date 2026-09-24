@@ -738,10 +738,11 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
             if !links.torrents.contains(&href) {
                 links.torrents.push(href);
             }
-        } else if text.contains("download") && !text.contains("how to") {
-            if !links.direct.contains(&href) {
-                links.direct.push(href);
-            }
+        } else if text.contains("download")
+            && !text.contains("how to")
+            && !links.direct.contains(&href)
+        {
+            links.direct.push(href);
         }
     }
     Ok(links)
