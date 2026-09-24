@@ -573,13 +573,7 @@ pub async fn fetch_feed(
         "TorrentGalaxy"
     } else {
         let body = fetch_body(client, url, flaresolverr).await?;
-        return match parse_feed_body(&body, url) {
-            Ok(items) => Ok(items),
-            Err(error) => {
-                tracing::warn!(feed_url = %url, %error, "feed is not valid RSS");
-                Ok(Vec::new())
-            }
-        };
+        return parse_feed_body(&body, url);
     };
     let body = fetch_body(client, url, flaresolverr).await?;
     let label = source_label(kind, url);

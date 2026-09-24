@@ -81,6 +81,7 @@ impl Engine {
                 let client = self.client.clone();
                 let flaresolverr = flaresolverr.clone();
                 let feed = feed_label(&url);
+                let source = feed_source_name(&url);
                 set.spawn(async move {
                     let result = match tokio::time::timeout(
                         FEED_FETCH_BUDGET,
@@ -103,7 +104,7 @@ impl Engine {
                     };
                     match &result {
                         Ok(items) => {
-                            crate::logging::source_ok("feed", &feed, items.len());
+                            crate::logging::source_ok("feed", &source, items.len());
                             tracing::debug!(feed = %feed, items = items.len(), "RSS feed analyzed")
                         }
                         Err(error) => {
@@ -115,7 +116,7 @@ impl Engine {
                             } else {
                                 message.clone()
                             };
-                            crate::logging::source_fail("feed", &feed, &friendly);
+                            crate::logging::source_fail("feed", &source, &friendly);
                             tracing::warn!("⚠️ RSS feed unavailable — {feed}: {friendly}")
                         }
                     }
@@ -136,21 +137,10 @@ impl Engine {
         }
         // One readable summary instead of one line per feed.
         let feeds_releases = all.len();
-        let mut by_source: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for release in &all {
-            let raw = release.source.split(" - ").next().unwrap_or("feed");
-            // Generic RSS feeds carry the whole URL as source: show just the host.
-            let label = url::Url::parse(raw)
-                .ok()
-                .and_then(|parsed| parsed.host_str().map(str::to_owned))
-                .unwrap_or_else(|| raw.to_string());
-            *by_source.entry(label).or_default() += 1;
-        }
-        let breakdown = by_source
-            .iter()
-            .map(|(label, count)| format!("{label}: {count}"))
-            .collect::<Vec<_>>()
-            .join(" | ");
+        // Keep the feed outcomes, including failures, for both the readable
+        // summary and the detailed debug report printed after indexer searches.
+        let feed_stats = crate::logging::take_source_stats();
+        let breakdown = source_breakdown(&feed_stats);
         let breakdown = if breakdown.is_empty() {
             "none".to_string()
         } else {
@@ -345,7 +335,9 @@ impl Engine {
         }
         all = kept;
         tracing::info!("✅ Scraping: {} unique releases after filters", all.len());
-        print_source_report();
+        let mut source_stats = feed_stats;
+        source_stats.extend(crate::logging::take_source_stats());
+        print_source_report(source_stats);
         crate::cache::save();
         Ok(all)
     }
@@ -505,8 +497,7 @@ fn _indexer_name(indexer: &IndexerConfig) -> &str {
 /// One readable line per source (feed, indexer, web engine) telling the user
 /// whether it worked and how many releases it produced. Aggregated per cycle:
 /// attempts are repeated for every query, so a raw per-attempt log would flood.
-fn print_source_report() {
-    let stats = crate::logging::take_source_stats();
+fn print_source_report(stats: Vec<(String, String, crate::logging::SourceStat)>) {
     if stats.is_empty() {
         return;
     }
@@ -536,6 +527,73 @@ fn print_source_report() {
                 stat.last_error.as_deref().unwrap_or("unknown error")
             );
         }
+    }
+}
+
+fn source_breakdown(stats: &[(String, String, crate::logging::SourceStat)]) -> String {
+    stats
+        .iter()
+        .filter(|(kind, _, _)| kind == "feed")
+        .map(|(_, name, stat)| {
+            if stat.fail > 0 && stat.ok == 0 {
+                format!("{name}: error")
+            } else if stat.fail > 0 {
+                format!("{name}: {} ({} error)", stat.results, stat.fail)
+            } else {
+                format!("{name}: {}", stat.results)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn feed_source_name(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("ext.to") || lower.contains("extto") {
+        "ExtTo".to_string()
+    } else if lower.contains("torrentgalaxy") || lower.contains("tgx") {
+        "TGx".to_string()
+    } else if lower.contains("torrentleech") {
+        "TorrentLeech".to_string()
+    } else if lower.contains("knaben") {
+        "Knaben".to_string()
+    } else if lower.contains("eztv") {
+        "EZTV".to_string()
+    } else if let Ok(parsed) = url::Url::parse(url) {
+        parsed.host_str().unwrap_or("feed").to_string()
+    } else {
+        feed_label(url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{feed_source_name, source_breakdown};
+    use crate::logging::SourceStat;
+
+    #[test]
+    fn names_known_feed_hosts() {
+        assert_eq!(feed_source_name("https://rss.knaben.org/ita/feed"), "Knaben");
+        assert_eq!(feed_source_name("https://torrentgalaxy.to/rss"), "TGx");
+        assert_eq!(
+            feed_source_name("https://rss.torrentleech.org/feed"),
+            "TorrentLeech"
+        );
+    }
+
+    #[test]
+    fn source_breakdown_includes_failed_feeds() {
+        let mut failed = SourceStat::default();
+        failed.fail = 1;
+        let mut successful = SourceStat::default();
+        successful.ok = 1;
+        successful.results = 650;
+        let stats = vec![
+            ("feed".into(), "Knaben".into(), failed),
+            ("feed".into(), "TGx".into(), successful),
+        ];
+
+        assert_eq!(source_breakdown(&stats), "Knaben: error | TGx: 650");
     }
 }
 
