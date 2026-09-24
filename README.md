@@ -229,13 +229,17 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | `↑↓` | select a torrent in the Torrents tab |
 | `PgUp/PgDn`, `Home/End` | page through torrents and logs |
 | `Enter` | open the selected torrent details (`Enter`/`Esc` to go back) |
-| `r` | refresh · `c` run a cycle · `q` quit |
-| `a` | **add a magnet link** |
+| `r` | refresh · `c` run a cycle (full/series/movies/comics) · `q` quit |
+| `s` / `e` | manual search / recent torrent events |
+| `a` | **add a magnet link or `.torrent` URL** |
 | `t` | **add a `.torrent` file** (path) |
-| `p` | pause/resume the selected torrent |
+| `p` / `b` | pause/resume · restart the selected torrent |
 | `d` | remove it (asks whether to delete the files) |
+| `X` | remove completed torrents that reached their seed limits |
 | `k` / `R` | recheck / reannounce |
-| `n` | toggle "do not rename" for it |
+| `n` / `i` / `u` | toggle no-rename · pin · unpin |
+| `L` | set global download/upload limits (KiB/s) |
+| Details: `1-4` | general / trackers / files / peers |
 | `x` | on the Health tab, clean the trash (asks for confirmation) |
 | `/` / `f` | on the Logs tab, filter / toggle follow mode |
 

@@ -229,13 +229,17 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | `↑↓` | seleziona un torrent nella scheda Torrents |
 | `PgUp/PgDn`, `Home/End` | naviga a pagine nei torrent e nei log |
 | `Invio` | apre i dettagli del torrent selezionato (`Invio`/`Esc` per tornare) |
-| `r` | aggiorna · `c` avvia un ciclo · `q` esci |
-| `a` | **aggiungi un magnet** |
+| `r` | aggiorna · `c` avvia un ciclo (full/serie/film/fumetti) · `q` esci |
+| `s` / `e` | ricerca manuale / eventi recenti torrent |
+| `a` | **aggiungi un magnet o URL `.torrent`** |
 | `t` | **aggiungi un file `.torrent`** (percorso) |
-| `p` | pausa/riprendi il torrent selezionato |
+| `p` / `b` | pausa/riprendi · riavvia il torrent selezionato |
 | `d` | rimuovilo (chiede se eliminare anche i file) |
+| `X` | rimuove i completati che hanno raggiunto i limiti di seed |
 | `k` / `R` | recheck / reannounce |
-| `n` | attiva/disattiva "non rinominare" |
+| `n` / `i` / `u` | non rinominare · pin · unpin |
+| `L` | imposta i limiti globali download/upload (KiB/s) |
+| Dettagli: `1-4` | generale / tracker / contenuto / peer |
 | `x` | nella scheda Health, pulisce il trash (chiede conferma) |
 | `/` / `f` | nella scheda Logs, filtra / attiva-disattiva il follow |
 

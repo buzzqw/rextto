@@ -9,8 +9,9 @@ install:
 
 Tabs: Status · Torrents · Logs · Health.
 Keys: 1-4/Tab switch · ↑↓ select · Enter details · ? help · r refresh · q quit.
-Global: a add magnet · t add .torrent file · c run cycle.
-Torrents tab: p pause/resume · d remove · k recheck · R reannounce · n no-rename.
+Global: a add magnet/URL · t add .torrent file · c run cycle · s search · e events.
+Torrents tab: p pause/resume · b restart · d remove · X clean completed · k recheck
+· R reannounce · n no-rename · i/u pin/unpin · L speed limits.
 Logs tab: / filter · f follow · ↑↓/PgUp/PgDn scroll · Home/End.
 Health tab: x empty trash.
 
@@ -22,8 +23,8 @@ from __future__ import annotations
 import curses
 import json
 import os
-import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -70,11 +71,65 @@ def fetch_snapshot():
         ),
     )
     logs = (api("/api/logs?limit=200") or {}).get("items", [])
-    return status, torrents, logs, systemd_service_uptime()
+    return status, torrents, logs
 
 
 def fetch_health():
     return api("/api/health") or {}
+
+
+class LogStream:
+    """Consumes the daemon SSE log stream without blocking the curses loop."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, name="rextto-log-stream", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                request = urllib.request.Request(
+                    f"{BASE}/api/logs/stream?limit=500",
+                    headers={"Accept": "text/event-stream", **({"x-rextto-token": TOKEN} if TOKEN else {})},
+                )
+                with urllib.request.urlopen(request, timeout=35) as response:
+                    self.app.log_stream_connected = True
+                    data_lines = []
+                    while not self.stop_event.is_set():
+                        raw_line = response.readline()
+                        if not raw_line:
+                            break
+                        line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                        elif not line and data_lines:
+                            self._event("\n".join(data_lines))
+                            data_lines = []
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                pass
+            self.app.log_stream_connected = False
+            self.stop_event.wait(2.0)
+
+    def _event(self, payload: str) -> None:
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        if isinstance(value, dict) and isinstance(value.get("snapshot"), list):
+            with self.app.log_lock:
+                self.app.logs = [str(line) for line in value["snapshot"]]
+        elif isinstance(value, dict) and "line" in value:
+            with self.app.log_lock:
+                self.app.logs.append(str(value["line"]))
+                self.app.logs = self.app.logs[-500:]
 
 
 def human_bytes(value: float) -> str:
@@ -118,27 +173,44 @@ class App:
         self.logs = []
         self.health = {}
         self.detail = None
-        self.service_uptime = None
         self.help_visible = False
         self.log_filter = ""
         self.log_scroll = 0
         self.log_follow = True
         self.loading = False
         self.health_error = ""
+        self.log_lock = threading.Lock()
+        self.log_stream_connected = False
+        self.log_stream = LogStream(self)
+        self.events = []
+        self.events_visible = False
+        self.search_results = []
+        self.search_query = ""
+        self.search_selected = 0
+        self.search_visible = False
+        self.detail_view = "general"
+        self.detail_items = []
+        self.detail_scroll = 0
+        self.log_stream.start()
 
     def refresh(self) -> None:
         selected_hash = self.selected_hash()
         try:
-            status, torrents, logs, service_uptime = fetch_snapshot()
+            status, torrents, logs = fetch_snapshot()
             self.status = status
             self.torrents = torrents
-            self.logs = logs
-            self.service_uptime = service_uptime
+            if not self.log_stream_connected:
+                with self.log_lock:
+                    self.logs = logs
             self.error = ""
-            self.health = fetch_health()
-            self.health_error = ""
         except RuntimeError as error:
             self.error = str(error)
+        try:
+            health = fetch_health()
+            self.health = health
+            self.health_error = ""
+        except RuntimeError as error:
+            self.health_error = str(error)
         self.loading = False
         self.last_refresh = time.time()
         self._restore_selection(selected_hash)
@@ -160,7 +232,7 @@ class App:
         return
 
     def close(self) -> None:
-        return
+        self.log_stream.stop()
 
     def selected_hash(self):
         if not self.torrents:
@@ -168,10 +240,12 @@ class App:
         return text(self.torrents[self.selected], "hash") or None
 
     def filtered_logs(self):
+        with self.log_lock:
+            logs = list(self.logs)
         if not self.log_filter:
-            return self.logs
+            return logs
         needle = self.log_filter.casefold()
-        return [line for line in self.logs if needle in line.casefold()]
+        return [line for line in logs if needle in line.casefold()]
 
     def open_selected_details(self) -> None:
         hash_value = self.selected_hash()
@@ -189,7 +263,13 @@ class App:
                 "torrent": torrent,
                 "magnet": text(response, "magnet"),
                 "no_rename": bool(response.get("no_rename")),
+                "source": text(self.torrents[self.selected], "source"),
+                "reason": text(self.torrents[self.selected], "reason"),
+                "archived": bool(self.torrents[self.selected].get("archived")),
             }
+            self.detail_view = "general"
+            self.detail_items = []
+            self.detail_scroll = 0
             self.message = ""
         except RuntimeError as error:
             self.message = f"details failed: {error}"
@@ -199,12 +279,117 @@ class App:
 
     # --- actions ---------------------------------------------------------
 
-    def run_cycle(self) -> None:
+    def run_cycle(self, domain="full") -> None:
+        if domain not in ("full", "series", "movies", "comics"):
+            self.message = "invalid cycle domain"
+            return
         try:
-            api("/api/run-now", "POST")
-            self.message = "cycle requested"
+            path = "/api/run-now" if domain == "full" else f"/api/run-now?domain={domain}"
+            result = api(path, "POST")
+            if isinstance(result, dict) and result.get("queued"):
+                self.message = f"{domain} cycle queued (another cycle is running)"
+            else:
+                self.message = f"{domain} cycle started"
         except RuntimeError as error:
             self.message = f"cycle failed: {error}"
+
+    def restart_selected(self) -> None:
+        hash_value = self.selected_hash()
+        if hash_value:
+            self._act(f"/api/torrents/{hash_value}/restart", "restart requested")
+
+    def pin_selected(self) -> None:
+        hash_value = self.selected_hash()
+        if hash_value:
+            self._act("/api/torrents/pin", "torrent pinned", {"hash": hash_value})
+
+    def unpin(self) -> None:
+        self._act("/api/torrents/unpin", "torrent unpinned")
+
+    def clean_completed(self, delete_files: bool) -> None:
+        try:
+            result = api("/api/torrents/remove_completed", "POST",
+                         {"delete_files": delete_files}, timeout=120)
+            removed = result.get("removed", 0) if isinstance(result, dict) else 0
+            skipped = result.get("skipped", 0) if isinstance(result, dict) else 0
+            self.message = f"completed removed: {removed}, skipped: {skipped}"
+        except RuntimeError as error:
+            self.message = f"cleanup failed: {error}"
+
+    def set_global_speed_limits(self, download: str, upload: str) -> None:
+        try:
+            dl = max(0, int(download))
+            ul = max(0, int(upload))
+        except ValueError:
+            self.message = "limits must be KiB/s numbers"
+            return
+        try:
+            api("/api/set-speed-limits", "POST",
+                {"download_kib": dl, "upload_kib": ul})
+            self.message = f"global limits set: {dl}/{ul} KiB/s"
+        except RuntimeError as error:
+            self.message = f"limits failed: {error}"
+
+    def search(self, query: str) -> None:
+        if not query:
+            return
+        try:
+            result = api("/api/search", "POST", {"query": query}, timeout=120)
+            self.search_results = result.get("results", []) if isinstance(result, dict) else []
+            self.search_query = query
+            self.search_selected = 0
+            self.search_visible = True
+            self.message = f"search: {len(self.search_results)} results"
+        except RuntimeError as error:
+            self.message = f"search failed: {error}"
+
+    def add_search_result(self) -> None:
+        if not self.search_results:
+            self.message = "no search result selected"
+            return
+        release = self.search_results[self.search_selected]
+        try:
+            api("/api/search/add", "POST", {"release": release}, timeout=120)
+            self.message = "search result queued"
+            self.search_visible = False
+            self.refresh()
+        except RuntimeError as error:
+            self.message = f"queue failed: {error}"
+
+    def load_events(self) -> None:
+        try:
+            result = api("/api/torrent-events")
+            self.events = result if isinstance(result, list) else []
+            self.events_visible = True
+            self.message = f"events: {len(self.events)}"
+        except RuntimeError as error:
+            self.message = f"events failed: {error}"
+
+    def load_detail_view(self, view: str) -> None:
+        if view == "general":
+            self.detail_view = view
+            self.detail_scroll = 0
+            return
+        hash_value = self.selected_hash()
+        if not hash_value:
+            return
+        endpoint = {
+            "trackers": "trackers",
+            "files": "files",
+            "peers": "peers",
+        }.get(view)
+        if endpoint is None:
+            return
+        try:
+            result = api(f"/api/torrents/{hash_value}/{endpoint}")
+            self.detail_items = result.get(endpoint, []) if isinstance(result, dict) else []
+            self.detail_view = view
+            self.detail_scroll = 0
+        except RuntimeError as error:
+            self.message = f"{view} failed: {error}"
+
+    def move_detail_scroll(self, amount: int) -> None:
+        self.detail_scroll = max(0, self.detail_scroll + amount)
 
     def clean_trash(self) -> None:
         try:
@@ -217,12 +402,14 @@ class App:
     def add_magnet(self, magnet: str) -> None:
         if not magnet:
             return
-        if not magnet.startswith("magnet:"):
-            self.message = "not a magnet link"
+        if not (magnet.startswith("magnet:") or
+                magnet.startswith("http://") or
+                magnet.startswith("https://")):
+            self.message = "not a magnet or torrent URL"
             return
         try:
             api("/api/send-magnet", "POST", {"magnet": magnet})
-            self.message = "magnet added"
+            self.message = "magnet/URL added"
         except RuntimeError as error:
             self.message = f"add failed: {error}"
 
@@ -357,10 +544,13 @@ def draw(app: "App", win, colors: dict) -> None:
     name = text(app.status, "name", "rextto")
     version = text(app.status, "version")
     active = app.status.get("active") if isinstance(app.status, dict) else None
-    activity_label = "ACTIVE" if active is True else (
-        "PAUSED" if active is False else "LOADING")
-    activity_attr = colors["ok"] if active is True else (
-        colors["warn"] if active is False else colors["muted"])
+    dry_run = app.status.get("dry_run") if isinstance(app.status, dict) else None
+    activity_label = "DRY-RUN" if dry_run is True else (
+        "ACTIVE" if active is True else (
+            "STANDBY" if active is False else "LOADING"))
+    activity_attr = colors["warn"] if dry_run is True else (
+        colors["ok"] if active is True else (
+            colors["warn"] if active is False else colors["muted"]))
     add(win, 0, 1, f"{name} v{version}  ", colors["header"] | curses.A_BOLD)
     add(win, 0, 14, activity_label, activity_attr)
 
@@ -387,13 +577,13 @@ def draw(app: "App", win, colors: dict) -> None:
     else:
         draw_health(app, win, top, bottom, width, colors)
 
-    hints = " q quit · ? help · r refresh · a magnet · t file · c cycle"
+    hints = " q quit · ? help · r refresh · a magnet/URL · t file · c cycle · s search · e events"
     if app.loading:
         hints += " · loading..."
     if app.detail is not None:
-        hints += " · Enter/Esc back"
+        hints += " · 1 general · 2 trackers · 3 files · 4 peers · ↑↓ scroll · Enter/Esc back"
     elif app.tab == 1:
-        hints += " · ↑↓/PgUp/PgDn select · Enter details · p pause/resume · d remove · k recheck · R reannounce · n no-rename"
+        hints += " · ↑↓/PgUp/PgDn select · Enter details · p pause/resume · b restart · d remove · X clean completed · k recheck · R reannounce · n no-rename · i/u pin/unpin · L limits"
     elif app.tab == 2:
         hints += " · ↑↓/PgUp/PgDn scroll · / filter · f follow · Home/End"
     elif app.tab == 3:
@@ -401,7 +591,11 @@ def draw(app: "App", win, colors: dict) -> None:
     add(win, height - 1, 1, hints, colors["muted"])
     if app.message:
         add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
-    if app.help_visible:
+    if app.search_visible:
+        draw_search(app, win, colors)
+    elif app.events_visible:
+        draw_events(app, win, colors)
+    elif app.help_visible:
         draw_help(win, colors)
     win.refresh()
 
@@ -427,7 +621,7 @@ def draw_logs(app: App, win, top, bottom, width, colors) -> None:
     if app.log_filter:
         label += f" · filter '{app.log_filter}'"
     if app.log_follow:
-        label += " · FOLLOW"
+        label += " · LIVE SSE" if app.log_stream_connected else " · FOLLOW"
     add(win, top, 2, shorten(label, max(1, width - 4)), colors["header"] | curses.A_BOLD)
     draw_lines(lines[start:end], win, top + 1, bottom, colors)
 
@@ -438,10 +632,11 @@ def draw_help(win, colors) -> None:
         "Rextto TUI - keyboard help",
         "",
         "Global:  1-4/Tab tabs · r refresh · ? close help · q quit",
-        "         a add magnet · t add .torrent · c run cycle",
+        "         a add magnet/URL · t add .torrent · c cycle · s search · e events",
         "Torrents: ↑↓ or PgUp/PgDn select · Home/End · Enter details",
-        "          p pause/resume · d remove · k recheck · R reannounce",
-        "          n no-rename",
+        "          p pause/resume · b restart · d remove · X clean completed",
+        "          k recheck · R reannounce · n no-rename · i/u pin/unpin · L limits",
+        "Details:  1 general · 2 trackers · 3 files · 4 peers · ↑↓ scroll",
         "Logs:     ↑↓ or PgUp/PgDn scroll · Home/End · / filter · f follow",
         "Health:   x empty trash (confirmation required)",
         "",
@@ -466,11 +661,15 @@ def draw_status(app, win, top, colors) -> None:
     torrents = status.get("torrent_stats", {})
     cycle = status.get("last_cycle", {})
     seen = status.get("seen", {})
+    mode = "dry-run" if status.get("dry_run") else (
+        "active" if status.get("active") else "stand-by")
     lines = [
+        f"Mode: {mode}",
         f"Torrents: {text(torrents,'count')} ({text(torrents,'downloading')} downloading, "
         f"{text(torrents,'queued')} queued, {text(torrents,'seeding')} seeding)",
         f"Last cycle: scraped {text(cycle,'scraped')} | candidates {text(cycle,'candidates')} "
-        f"| downloads {text(cycle,'downloads_started')} | errors {text(cycle,'errors')}",
+        f"| downloads {text(cycle,'downloads_started')} | gaps {text(cycle,'gaps_filled')} "
+        f"| errors {text(cycle,'errors')}",
         f"Seen in feeds: groups {text(seen,'groups')} · movies {text(seen,'movies')} "
         f"· series {text(seen,'series')}",
     ]
@@ -511,6 +710,10 @@ def draw_torrent_details(app: App, win, top, bottom, width, colors) -> None:
         add(win, top, 2, "invalid torrent details", colors["err"])
         return
 
+    if app.detail_view != "general":
+        draw_detail_collection(app, win, top, bottom, width, colors)
+        return
+
     ratio = torrent.get("seed_ratio")
     days = torrent.get("seed_days")
     if ratio == 0 or days == 0:
@@ -539,6 +742,9 @@ def draw_torrent_details(app: App, win, top, bottom, width, colors) -> None:
         ("Torrent version", text(torrent, "torrent_version", "-")),
         ("Auto-managed", "yes" if torrent.get("auto_managed") else "no"),
         ("No rename", "yes" if detail.get("no_rename") else "no"),
+        ("Archived", "yes" if detail.get("archived") else "no"),
+        ("Source", detail.get("source") or "-"),
+        ("Reason", detail.get("reason") or "-"),
         ("Save path", text(torrent, "save_path", "-")),
         ("Magnet", detail.get("magnet") or "-"),
     ]
@@ -548,6 +754,80 @@ def draw_torrent_details(app: App, win, top, bottom, width, colors) -> None:
         if y >= bottom:
             break
         add(win, y, 2, f"{label:<18} {shorten(str(value), value_width)}", colors["normal"])
+
+
+def draw_detail_collection(app: App, win, top, bottom, width, colors) -> None:
+    labels = {"trackers": "Trackers", "files": "Files", "peers": "Peers"}
+    title = labels.get(app.detail_view, app.detail_view)
+    add(win, top, 2, f"{title}: {len(app.detail_items)}", colors["header"] | curses.A_BOLD)
+    visible = max(1, bottom - top - 1)
+    start = min(app.detail_scroll, max(0, len(app.detail_items) - visible))
+    for offset, item in enumerate(app.detail_items[start:start + visible]):
+        if not isinstance(item, dict):
+            line = str(item)
+        elif app.detail_view == "trackers":
+            line = f"tier {text(item, 'tier', '-'):>3}  {text(item, 'url', '-')}"
+        elif app.detail_view == "files":
+            size = human_bytes(item.get("size") or 0)
+            downloaded = human_bytes(item.get("downloaded") or 0)
+            line = f"{downloaded:>10} / {size:<10}  {text(item, 'path', '-')}"
+        else:
+            line = (f"{text(item, 'address', '-'):>22}  {text(item, 'client', '-'):<24} "
+                    f"down {human_bytes(item.get('download_rate') or 0)}/s  "
+                    f"up {human_bytes(item.get('upload_rate') or 0)}/s  "
+                    f"{'seed' if item.get('seed') else ''}")
+        add(win, top + 1 + offset, 2, shorten(line, max(1, width - 4)), colors["normal"])
+
+
+def draw_search(app: App, win, colors) -> None:
+    height, width = win.getmaxyx()
+    results = app.search_results
+    box_width = min(width - 4, max(50, min(width - 4, 100)))
+    box_height = min(height - 2, max(7, len(results) + 5))
+    left = max(1, (width - box_width) // 2)
+    top = max(0, (height - box_height) // 2)
+    for row in range(box_height):
+        add(win, top + row, left, " " * box_width, curses.A_REVERSE)
+    add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + box_height - 1, left,
+        "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + 1, left + 2, shorten(
+        f"Search '{app.search_query}' — {len(results)} results · Enter/a queue · Esc close",
+        max(1, box_width - 4)), curses.A_BOLD | curses.A_REVERSE)
+    visible = max(1, box_height - 4)
+    start = min(app.search_selected, max(0, len(results) - visible))
+    for offset, result in enumerate(results[start:start + visible]):
+        title = text(result, "title", "untitled")
+        source = text(result, "source", "-")
+        quality = result.get("quality", {}) if isinstance(result, dict) else {}
+        quality_text = text(quality, "resolution") or text(quality, "source")
+        line = f"{title} · {source} · {quality_text}"
+        attr = curses.A_REVERSE | (curses.A_BOLD if start + offset == app.search_selected else 0)
+        add(win, top + 3 + offset, left + 2, shorten(line, max(1, box_width - 4)), attr)
+
+
+def draw_events(app: App, win, colors) -> None:
+    height, width = win.getmaxyx()
+    box_width = min(width - 4, max(50, min(width - 4, 100)))
+    box_height = min(height - 2, max(7, len(app.events) + 4))
+    left = max(1, (width - box_width) // 2)
+    top = max(0, (height - box_height) // 2)
+    for row in range(box_height):
+        add(win, top + row, left, " " * box_width, curses.A_REVERSE)
+    add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + box_height - 1, left,
+        "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + 1, left + 2, "Recent torrent events · Esc close",
+        curses.A_BOLD | curses.A_REVERSE)
+    for offset, event in enumerate(app.events[-max(1, box_height - 4):]):
+        kind = text(event, "kind", "event")
+        name = text(event, "name", text(event, "hash", "-"))
+        save_path = text(event, "save_path", "")
+        line = f"{kind:<22} {name}"
+        if save_path:
+            line += f" · {save_path}"
+        add(win, top + 3 + offset, left + 2, shorten(line, max(1, box_width - 4)),
+            curses.A_REVERSE)
 
 
 def optional_number(value, suffix="", decimals=0) -> str:
@@ -577,31 +857,14 @@ def human_duration(value) -> str:
     return f"{minutes}m"
 
 
-def systemd_service_uptime(service="rextto.service"):
-    """Returns the local systemd service uptime in seconds, if available."""
-    try:
-        result = subprocess.run(
-            ["systemctl", "show", service, "-p", "ActiveEnterTimestampMonotonic", "--value"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=True,
-        )
-        started_us = int(result.stdout.strip())
-        if started_us <= 0:
-            return None
-        # systemd's monotonic timestamp and time.monotonic() share the same
-        # CLOCK_MONOTONIC origin on Linux.
-        return max(0.0, time.monotonic() - started_us / 1_000_000.0)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-
-
 def draw_health(app: App, win, top, bottom, width, colors) -> None:
     health = app.health if isinstance(app.health, dict) else {}
     status = text(health, "status", "offline")
     status_attr = colors["ok"] if status.lower() == "ok" else colors["warn"]
-    add(win, top, 2, f"Health: {status.upper()}", status_attr | curses.A_BOLD)
+    health_label = f"Health: {status.upper()}"
+    if app.health_error:
+        health_label += " (refresh failed)"
+    add(win, top, 2, shorten(health_label, max(1, width - 4)), status_attr | curses.A_BOLD)
 
     total_memory = health.get("memory_total_bytes") or 0
     available_memory = health.get("memory_available_bytes") or 0
@@ -609,7 +872,7 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
     disk_free = health.get("disk_free_bytes") or 0
     writable = "yes" if health.get("data_dir_writable") else "no"
     summary = [
-        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(app.service_uptime)} · CPU {optional_number(health.get('process_cpu_percent'), '%', 1)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
+        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(health.get('uptime_seconds'))} · CPU {optional_number(health.get('process_cpu_percent'), '%', 1)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
         f"System: CPU {optional_number(health.get('cpu_percent'), '%')} · load {optional_number(health.get('load_average'), '', 2)} · RAM free {human_bytes(available_memory)} / {human_bytes(total_memory)}",
         f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
         f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",
@@ -685,6 +948,22 @@ def main(stdscr) -> None:
     while True:
         draw(app, stdscr, colors)
         key = stdscr.getch()
+        if app.search_visible:
+            if key in (27, ord("q")):
+                app.search_visible = False
+            elif key in (curses.KEY_UP, curses.KEY_LEFT):
+                app.search_selected = max(0, app.search_selected - 1)
+            elif key in (curses.KEY_DOWN, curses.KEY_RIGHT):
+                app.search_selected = min(app.search_selected + 1, max(0, len(app.search_results) - 1))
+            elif key in (10, 13, curses.KEY_ENTER, ord("a")):
+                app.add_search_result()
+            continue
+        if app.events_visible:
+            if key in (27, ord("q")):
+                app.events_visible = False
+            elif key == ord("r"):
+                app.load_events()
+            continue
         if app.help_visible:
             if key in (27, 10, 13, curses.KEY_ENTER, ord("?"), ord("q")):
                 app.help_visible = False
@@ -700,6 +979,16 @@ def main(stdscr) -> None:
             elif key == ord("r"):
                 app.refresh()
                 app.open_selected_details()
+            elif ord("1") <= key <= ord("4"):
+                app.load_detail_view(("general", "trackers", "files", "peers")[key - ord("1")])
+            elif key == curses.KEY_UP:
+                app.move_detail_scroll(-1)
+            elif key == curses.KEY_DOWN:
+                app.move_detail_scroll(1)
+            elif key == curses.KEY_PPAGE:
+                app.move_detail_scroll(-max(1, stdscr.getmaxyx()[0] - 7))
+            elif key == curses.KEY_NPAGE:
+                app.move_detail_scroll(max(1, stdscr.getmaxyx()[0] - 7))
         elif key == 27:
             break
         elif key in (9, curses.KEY_RIGHT):
@@ -712,17 +1001,24 @@ def main(stdscr) -> None:
             app.refresh()
             app.message = "refreshed"
         elif key == ord("c"):
-            app.run_cycle()
+            domain = prompt_input(stdscr, "Cycle [full/series/movies/comics] (full): ").lower() or "full"
+            app.run_cycle(domain)
+        elif key == ord("s"):
+            app.search(prompt_input(stdscr, "Search: "))
+        elif key == ord("e"):
+            app.load_events()
         elif app.tab == 3 and key == ord("x"):
             if confirm(stdscr, "Delete all trash files now?"):
                 app.clean_trash()
                 app.refresh()
         elif key == ord("a"):
-            app.add_magnet(prompt_input(stdscr, "Magnet: "))
+            app.add_magnet(prompt_input(stdscr, "Magnet/URL: "))
         elif key == ord("t"):
             app.add_torrent_file(prompt_input(stdscr, "File .torrent: "))
         elif app.tab == 1 and key == ord("p"):
             app.toggle_selected()
+        elif app.tab == 1 and key == ord("b"):
+            app.restart_selected()
         elif app.tab == 1 and key == ord("d"):
             name = text(app.torrents[app.selected], "name") if app.torrents else "?"
             if app.torrents and confirm(stdscr, f"Remove '{shorten(name, 40)}'?"):
@@ -735,6 +1031,22 @@ def main(stdscr) -> None:
             app.reannounce_selected()
         elif app.tab == 1 and key == ord("n"):
             app.toggle_no_rename()
+        elif app.tab == 1 and key == ord("i"):
+            app.pin_selected()
+        elif app.tab == 1 and key == ord("u"):
+            app.unpin()
+        elif app.tab == 1 and key == ord("X"):
+            if confirm(stdscr, "Remove completed torrents that reached seed limits?"):
+                delete_files = confirm(stdscr, "Also delete downloaded files?")
+                app.clean_completed(delete_files)
+                app.refresh()
+        elif app.tab == 1 and key == ord("L"):
+            limits = prompt_input(stdscr, "Global DL UL limits KiB/s (0 0): ")
+            values = limits.split()
+            if len(values) == 2:
+                app.set_global_speed_limits(values[0], values[1])
+            elif limits:
+                app.message = "enter two values: download upload"
         elif app.tab == 1 and key in (10, 13, curses.KEY_ENTER):
             app.open_selected_details()
         elif app.tab == 1:
