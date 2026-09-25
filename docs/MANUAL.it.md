@@ -127,6 +127,10 @@ la barra “Salva tutte”.
   aggiornamenti. In *Sicurezza, proxy e rete* l'**interfaccia VPN (killswitch)**
   vincola ascolto e traffico in uscita a una scheda scelta (es. `tun0`, `wg0`);
   l'elenco è letto dal server e la modifica si applica dopo il riavvio.
+  Nella sezione RAM disk Rextto mostra i `tmpfs`/`ramfs` disponibili e consente
+  di sceglierne uno. Se non c'è un percorso configurato, il pulsante dedicato
+  crea `/dev/shm/rextto` e lo configura automaticamente. Il contenuto di
+  `/dev/shm` è temporaneo e viene perso al riavvio della macchina.
 - **Punteggi** — pesi per categoria, gruppi custom e simulatore live. Il punteggio
   effettivo è unico per acquisizione, ricerche, upgrade, post-processing,
   archivio e rescore; comprende anche bonus dimensione e, per i film, sottotitoli
@@ -148,7 +152,8 @@ la barra “Salva tutte”.
   e il **backfill MediaInfo** automatico (file per volta e intervallo
   configurabili), oltre al pulsante in Manutenzione per una scansione immediata.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
-  per tag.
+  per tag. Il percorso RAM disk selezionato resta configurato, ma la directory
+  creata sotto `/dev/shm` va ricreata dopo un riavvio.
 
 I controlli di sanità delle release sono **automatici** e non configurabili:
 sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione

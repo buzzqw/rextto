@@ -122,6 +122,10 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   button, FlareSolverr URL + test, web engines, content filters, blacklist.
 - **libtorrent** — connections/performance, protocols/trackers, security/proxy,
   RAM disk and ports, speed limits and scheduler; apply/optimise/update check.
+  The RAM disk section lists available `tmpfs`/`ramfs` mounts and lets you
+  choose one. If no path is configured, its button creates and configures
+  `/dev/shm/rextto`. The contents of `/dev/shm` are temporary and are lost
+  when the machine reboots.
   Under *Security, proxy and network* the **VPN killswitch interface** binds
   listening and outgoing traffic to a chosen interface (e.g. `tun0`, `wg0`);
   the list is read from the server, and the change applies after a restart.
@@ -146,6 +150,8 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   **MediaInfo backfill** (configurable files-per-run and interval), plus a
   Maintenance button for an immediate scan.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
+  A selected RAM-disk path remains configured, but a directory created under
+  `/dev/shm` must be recreated after a reboot.
 
 Release sanity checks are **automatic** and not configurable: hardcoded
 subtitles (`HC`) and absurd sizes (a per-resolution floor derived from a real

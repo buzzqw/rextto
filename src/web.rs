@@ -29,6 +29,7 @@ use axum::{
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    ffi::CString,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -60,6 +61,151 @@ fn cache_put(key: &str, value: &serde_json::Value) {
         .unwrap()
         .insert(key.to_string(), (Instant::now(), value.clone()));
 }
+
+/// Decode the octal escaping used for mount points in /proc/self/mountinfo.
+fn decode_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\134", "\\")
+}
+
+/// Return mounted tmpfs/ramfs roots visible to the daemon. This deliberately
+/// does not try to mount anything: mounting is a privileged system operation.
+fn detected_ramdisk_mounts() -> Vec<(PathBuf, String)> {
+    let mut mounts = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in contents.lines() {
+            let Some((left, right)) = line.split_once(" - ") else {
+                continue;
+            };
+            let left = left.split_whitespace().collect::<Vec<_>>();
+            let Some(raw_path) = left.get(4) else {
+                continue;
+            };
+            let Some(filesystem) = right.split_whitespace().next() else {
+                continue;
+            };
+            if !matches!(filesystem, "tmpfs" | "ramfs") {
+                continue;
+            }
+            let path = PathBuf::from(decode_mount_field(raw_path));
+            if path.is_dir() {
+                mounts.push((path, filesystem.to_string()));
+            }
+        }
+    }
+    // /dev/shm is the conventional user-writable tmpfs and is useful even on
+    // systems where mountinfo is restricted by a container.
+    let shm = PathBuf::from("/dev/shm");
+    if shm.is_dir() && !mounts.iter().any(|(path, _)| path == &shm) {
+        mounts.push((shm, "tmpfs".into()));
+    }
+    mounts.sort_by(|left, right| left.0.cmp(&right.0));
+    mounts.dedup_by(|left, right| left.0 == right.0);
+    mounts
+}
+
+fn directory_writable(path: &FsPath) -> bool {
+    let Ok(raw) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(raw.as_ptr(), libc::W_OK) == 0 }
+}
+
+fn ramdisk_entry(
+    path: &FsPath,
+    filesystem: &str,
+    configured: Option<&FsPath>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "filesystem": filesystem,
+        "exists": path.is_dir(),
+        "writable": path.is_dir() && directory_writable(path),
+        "free_bytes": crate::libtorrent::free_space_bytes(path),
+        "configured": configured.is_some_and(|value| value == path),
+    })
+}
+
+async fn ramdisk_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = latest_config(&s);
+    let configured = cfg.ramdisk_dir();
+    let mut items = detected_ramdisk_mounts()
+        .into_iter()
+        .map(|(path, filesystem)| ramdisk_entry(&path, &filesystem, configured.as_deref()))
+        .collect::<Vec<_>>();
+    if let Some(path) = configured.as_deref() {
+        let path_string = path.display().to_string();
+        if !items.iter().any(|item| {
+            item.get("path").and_then(serde_json::Value::as_str) == Some(path_string.as_str())
+        }) {
+            items.push(ramdisk_entry(path, "configured", Some(path)));
+        }
+    }
+    let create_root = FsPath::new("/dev/shm");
+    let create_path = create_root.join("rextto");
+    Json(serde_json::json!({
+        "ok": true,
+        "enabled": cfg.ramdisk_enabled(),
+        "configured": configured.map(|path| path.display().to_string()),
+        "paths": items,
+        "create_path": create_path.display().to_string(),
+        "create_available": create_root.is_dir() && directory_writable(create_root),
+        "warning": "Il contenuto di /dev/shm e degli altri tmpfs non sopravvive al riavvio della macchina.",
+    }))
+}
+
+async fn create_ramdisk(
+    State(s): State<AppState>,
+    Json(input): Json<RamDiskCreateInput>,
+) -> impl IntoResponse {
+    let default_path = FsPath::new("/dev/shm/rextto");
+    let requested = input.path.unwrap_or_else(|| default_path.display().to_string());
+    let target = FsPath::new(&requested);
+    if target != default_path || target.parent() != Some(FsPath::new("/dev/shm")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"il RAM disk automatico può essere creato solo in /dev/shm/rextto"})),
+        );
+    }
+    if let Err(error) = std::fs::create_dir_all(target) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":format!("creazione RAM disk fallita: {error}")})),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(
+            target,
+            std::fs::Permissions::from_mode(0o700),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":format!("permessi RAM disk non impostati: {error}")})),
+            );
+        }
+    }
+    if let Err(error) = Config::save_setting(&s.cfg.data_dir, "libtorrent_ramdisk_dir", &requested)
+        .and_then(|_| Config::save_setting(&s.cfg.data_dir, "libtorrent_ramdisk_enabled", "yes"))
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":format!("RAM disk creato ma configurazione non salvata: {error}")})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "path": requested,
+            "warning": "Il contenuto di /dev/shm non sopravvive al riavvio della macchina.",
+        })),
+    )
+}
+
 use tower_http::services::ServeDir;
 use tracing_subscriber::{reload, EnvFilter};
 
@@ -173,6 +319,13 @@ pub struct ComicEnabled {
 pub struct SettingInput {
     pub key: String,
     pub value: String,
+}
+#[derive(serde::Deserialize, Default)]
+pub struct RamDiskCreateInput {
+    /// The UI currently uses the safe default. Keep this optional so the API
+    /// cannot be used to create arbitrary directories outside /dev/shm.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 #[derive(serde::Deserialize)]
 pub struct AuthCode {
@@ -683,6 +836,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/movies", post(save_movies_config))
         .route("/api/config/settings", post(save_setting))
         .route("/api/config/settings/{key}", delete(delete_setting))
+        .route("/api/ramdisk", get(ramdisk_view))
+        .route("/api/ramdisk/create", post(create_ramdisk))
         .route(
             "/api/config/source-filters",
             get(source_filters_view).post(save_source_filters),

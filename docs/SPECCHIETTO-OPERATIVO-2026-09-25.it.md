@@ -132,3 +132,18 @@ Per controllare il commit e il working tree:
 git log -1 --oneline
 git status --short --branch
 ```
+
+## 7. RAM disk libtorrent
+
+In *Configurazione → libtorrent → RAM disk e porte* Rextto mostra i percorsi
+`tmpfs`/`ramfs` disponibili, con spazio libero e permessi di scrittura. Scegliere
+un percorso e premere **Usa questo percorso**.
+
+Se non è configurato alcun percorso e `/dev/shm` è disponibile, premere
+**Crea in /dev/shm**: Rextto crea `/dev/shm/rextto`, imposta i permessi privati,
+lo salva nella configurazione e abilita il RAM disk.
+
+> `/dev/shm` è volatile: il contenuto e la directory creata non sopravvivono al
+> riavvio della macchina. Dopo il riavvio usare nuovamente il pulsante di
+> creazione. Un percorso `tmpfs` già montato dal sistema non viene montato o
+> modificato da Rextto.

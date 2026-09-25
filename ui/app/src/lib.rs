@@ -6351,9 +6351,10 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                             <TextSetting label="Interfacce listen" setting_key="libtorrent_listen_interfaces" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "listen_interfaces", "")) placeholder="0.0.0.0:6881-6891" />
                             <NetworkInterfaceSetting data />
                         </SettingGroup>
-                        <SettingGroup title="RAM disk e porte">
-                            <BooleanSetting label="Usa il RAM disk" setting_key="libtorrent_ramdisk_enabled" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_enabled", "true")) />
-                            <TextSetting label="Dimensione massima per torrent (GB)" setting_key="libtorrent_ramdisk_threshold_gb" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_threshold_gb", "3.5")) placeholder="3.5" />
+                         <SettingGroup title="RAM disk e porte">
+                             <BooleanSetting label="Usa il RAM disk" setting_key="libtorrent_ramdisk_enabled" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_enabled", "true")) />
+                             <RamDiskControl />
+                             <TextSetting label="Dimensione massima per torrent (GB)" setting_key="libtorrent_ramdisk_threshold_gb" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_threshold_gb", "3.5")) placeholder="3.5" />
                             <TextSetting label="Margine libero da mantenere (GB)" setting_key="libtorrent_ramdisk_margin_gb" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_margin_gb", "0.5")) placeholder="0.5" />
                             <TextSetting label="Spazio minimo libero (byte, 0 = dal margine)" setting_key="libtorrent_ramdisk_min_free_bytes" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_min_free_bytes", "")) placeholder="0" />
                             <TextSetting label="Porta minima" setting_key="libtorrent_port_min" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "port_min", "6881")) placeholder="6881" />
@@ -6440,6 +6441,109 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
             <Show when=move || tab.get() == "i18n">
                 <TranslationTools />
             </Show>
+        </div>
+    }
+}
+
+fn load_ramdisk_info(
+    paths: RwSignal<Vec<Value>>,
+    configured: RwSignal<String>,
+    create_path: RwSignal<String>,
+    create_available: RwSignal<bool>,
+    message: RwSignal<String>,
+) {
+    spawn_local(async move {
+        match get("/api/ramdisk").await {
+            Ok(value) => {
+                paths.set(value.get("paths").and_then(Value::as_array).cloned().unwrap_or_default());
+                configured.set(text(&value, "configured", ""));
+                create_path.set(text(&value, "create_path", "/dev/shm/rextto"));
+                create_available.set(value.get("create_available").and_then(Value::as_bool).unwrap_or(false));
+                message.set(String::new());
+            }
+            Err(error) => message.set(error),
+        }
+    });
+}
+
+#[component]
+fn RamDiskControl() -> impl IntoView {
+    let paths = RwSignal::new(Vec::<Value>::new());
+    let configured = RwSignal::new(String::new());
+    let selected = RwSignal::new(String::new());
+    let create_path = RwSignal::new("/dev/shm/rextto".to_string());
+    let create_available = RwSignal::new(false);
+    let message = RwSignal::new(String::new());
+    let loaded_configured = configured;
+    Effect::new(move |_| {
+        load_ramdisk_info(paths, loaded_configured, create_path, create_available, message);
+    });
+    Effect::new(move |_| {
+        let current = configured.get();
+        if !current.is_empty() {
+            selected.set(current);
+        }
+    });
+    view! {
+        <div class="field span-full" style="margin-top:8px">
+            <span>{ctx_tr("Percorso RAM disk")}</span>
+            <select prop:value=selected on:change=move |event| selected.set(event_target_value(&event))>
+                <option value="">{ctx_tr("Seleziona un RAM disk disponibile")}</option>
+                <For
+                    each=move || paths.get()
+                    key=|item: &Value| text(item, "path", "")
+                    children=move |item| {
+                        let path = text(&item, "path", "");
+                        let filesystem = text(&item, "filesystem", "tmpfs");
+                        let writable = item.get("writable").and_then(Value::as_bool).unwrap_or(false);
+                        let label = if writable {
+                            format!("{path} · {filesystem} · {} liberi", size(&item, "free_bytes"))
+                        } else {
+                            format!("{path} · {filesystem} · non scrivibile")
+                        };
+                        view! { <option value=path disabled=!writable>{label}</option> }
+                    }
+                />
+            </select>
+            <div class="form-actions">
+                <button class="btn sm primary" type="button" on:click=move |_| {
+                    let path = selected.get();
+                    let message = message;
+                    spawn_local(async move {
+                        if path.trim().is_empty() {
+                            message.set("Seleziona prima un percorso RAM disk.".into());
+                            return;
+                        }
+                        match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_dir","value":path.clone()}))).await {
+                            Ok(_) => match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_enabled","value":"yes"}))).await {
+                                Ok(_) => { message.set(format!("RAM disk configurato: {path}")); trigger_refresh(); }
+                                Err(error) => message.set(error),
+                            },
+                            Err(error) => message.set(error),
+                        }
+                    });
+                }>{ctx_tr("Usa questo percorso")}</button>
+                <Show when=move || create_available.get() && configured.get().is_empty()>
+                    <button class="btn sm" type="button" on:click=move |_| {
+                        let message = message;
+                        spawn_local(async move {
+                            match send("POST", "/api/ramdisk/create", Some(json!({}))).await {
+                                Ok(value) => {
+                                    let path = text(&value, "path", "/dev/shm/rextto");
+                                    configured.set(path.clone());
+                                    selected.set(path);
+                                    message.set("RAM disk creato. Ricorda: il contenuto di /dev/shm si perde al riavvio.".into());
+                                    load_ramdisk_info(paths, configured, create_path, create_available, message);
+                                    trigger_refresh();
+                                }
+                                Err(error) => message.set(error),
+                            }
+                        });
+                    }>{ctx_tr("Crea in /dev/shm")}</button>
+                </Show>
+                <small class="muted">{message}</small>
+            </div>
+            <p class="hint">{ctx_tr("Rextto mostra i tmpfs/ramfs disponibili. Se non ne hai uno configurato puoi creare /dev/shm/rextto; il contenuto di /dev/shm non sopravvive al riavvio della macchina.")}</p>
         </div>
     }
 }
