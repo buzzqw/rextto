@@ -637,6 +637,19 @@ fn feed_source_name(url: &str) -> String {
     }
 }
 
+fn feed_label(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.split('?').next().unwrap_or(url).to_string();
+    };
+    let host = parsed.host_str().unwrap_or("feed");
+    let path = parsed.path().trim_end_matches('/');
+    if path.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}{path}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{feed_source_name, source_breakdown};
@@ -654,29 +667,20 @@ mod tests {
 
     #[test]
     fn source_breakdown_includes_failed_feeds() {
-        let mut failed = SourceStat::default();
-        failed.fail = 1;
-        let mut successful = SourceStat::default();
-        successful.ok = 1;
-        successful.results = 650;
+        let failed = SourceStat {
+            fail: 1,
+            ..Default::default()
+        };
+        let successful = SourceStat {
+            ok: 1,
+            results: 650,
+            ..Default::default()
+        };
         let stats = vec![
             ("feed".into(), "Knaben".into(), failed),
             ("feed".into(), "TGx".into(), successful),
         ];
 
         assert_eq!(source_breakdown(&stats), "Knaben: error | TGx: 650");
-    }
-}
-
-fn feed_label(url: &str) -> String {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return url.split('?').next().unwrap_or(url).to_string();
-    };
-    let host = parsed.host_str().unwrap_or("feed");
-    let path = parsed.path().trim_end_matches('/');
-    if path.is_empty() {
-        host.to_string()
-    } else {
-        format!("{host}{path}")
     }
 }
