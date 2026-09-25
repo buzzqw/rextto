@@ -661,15 +661,30 @@ impl Database {
             if manual {
                 return Ok((false, "duplicate".into()));
             }
-            let db_score = db_row
+            // Il nome finale resta la fonte principale. Il titolo originale
+            // del torrent nel DB completa soltanto i tag che il rename ha
+            // perso, per esempio la sorgente WEB-DL/WEBRip.
+            let (comparison_quality, comparison_score) = db_row
                 .as_ref()
-                .map(|(_, value, _, _, _)| *value)
-                .unwrap_or(i64::MIN);
-            if *disk_score > db_score
-                && release
-                    .quality
-                    .upgrade_reason(disk_quality, score, *disk_score, min_score_diff)
-                    .is_none()
+                .map(|(_, db_score, title, _, _)| {
+                    (
+                        crate::parser::merge_quality(
+                            disk_quality.clone(),
+                            parse_quality(title),
+                        ),
+                        (*disk_score).max(*db_score),
+                    )
+                })
+                .unwrap_or_else(|| (disk_quality.clone(), *disk_score));
+            if release
+                .quality
+                .upgrade_reason(
+                    &comparison_quality,
+                    score,
+                    comparison_score,
+                    min_score_diff,
+                )
+                .is_none()
             {
                 return Ok((false, "duplicate".into()));
             }
@@ -846,9 +861,13 @@ impl Database {
                     }
                     // Confronta col migliore tra la riga DB e il file su disco.
                     let (mut old_quality, old_score) = match context.archive.best_for(season, *episode) {
-                        Some((disk_quality, disk_score)) if *disk_score > existing_score => {
-                            (disk_quality.clone(), *disk_score)
-                        }
+                        Some((disk_quality, disk_score)) => (
+                            crate::parser::merge_quality(
+                                disk_quality.clone(),
+                                parse_quality(&existing_title),
+                            ),
+                            (*disk_score).max(existing_score),
+                        ),
                         _ => (parse_quality(&existing_title), existing_score),
                     };
                     enrich_quality_with_media_info(Some(&existing_media), &mut old_quality);

@@ -170,10 +170,34 @@ impl Quality {
         {
             return Some("repack");
         }
+        // I nomi normalizzati dell'archivio possono non conservare la sorgente
+        // (`WEB-DL`/`WEBRip`). In quel caso non trattare il solo riempimento di
+        // `unknown` come un upgrade: altrimenti ogni file già presente sembra
+        // inferiore alla stessa release con il tag della sorgente nel titolo.
+        if old.source == "unknown"
+            && self.source != "unknown"
+            && self.same_non_source_quality(old)
+        {
+            return None;
+        }
         if new_score > old_score && new_score - old_score >= min_score_diff {
             return Some("score");
         }
         None
+    }
+
+    /// Confronta i campi che contribuiscono alla qualità ma non la sorgente.
+    /// La sorgente viene esclusa intenzionalmente perché può essere assente
+    /// soltanto dal nome file archiviato, non dal file video reale.
+    fn same_non_source_quality(&self, other: &Quality) -> bool {
+        self.resolution == other.resolution
+            && self.codec == other.codec
+            && self.audio == other.audio
+            && self.hdr == other.hdr
+            && self.is_dv == other.is_dv
+            && self.is_repack == other.is_repack
+            && self.is_proper == other.is_proper
+            && self.is_real == other.is_real
     }
 
     pub fn score_with_settings(
@@ -519,6 +543,25 @@ mod tests {
         assert_eq!(
             base.upgrade_reason(&base, base.score() + 500, base.score(), 200),
             Some("score")
+        );
+    }
+
+    #[test]
+    fn missing_archived_source_does_not_create_upgrade() {
+        let archived = Quality {
+            resolution: "1080p".into(),
+            source: "unknown".into(),
+            codec: "h264".into(),
+            audio: "ddp".into(),
+            ..Default::default()
+        };
+        let candidate = Quality {
+            source: "webrip".into(),
+            ..archived.clone()
+        };
+        assert_eq!(
+            candidate.upgrade_reason(&archived, candidate.score(), archived.score(), 200),
+            None
         );
     }
 
