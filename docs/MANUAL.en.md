@@ -34,19 +34,32 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
 The daemon is normally run by the systemd service. When invoked directly it
 understands:
 
-- `rexttod --version` — print the installed version, the release marker and the
+- `rexttod --version` — installed version, build number, release marker and
   bundled libtorrent;
 - `rexttod --help` — usage summary;
-- `rexttod --update` — download and install the latest daemon and web UI;
-- `rexttod --config <file>` and `rexttod --dry-run` — as used by the service and
-  by local tests.
+- `rexttod --update` — download and install the latest payload;
+- `rexttod --config <file>` and `rexttod --dry-run` — used by the service and for
+  local tests.
 
-`--update` downloads the official `rextto-linux-<arch>.tar.gz`, verifies its
-checksum when published, and swaps in the executable and UI atomically. It never
-touches `REXTTO_DATA_DIR`. Options: `--channel stable`, `--release <tag>`,
-`--install-dir <dir>`, `--archive <file>` (offline), `--no-restart`, `--force`.
-It restarts `rextto.service` when run as root. The same payload can be used
-manually as a standalone package (see the README, *Standalone Linux package*).
+**Updating.** The installer and `rexttod --update` install the same release
+payload. `--update` downloads `rextto-linux-<arch>.tar.gz`, verifies the
+published `.sha256` when present, stages the files, then swaps the executable,
+the web UI, the bundled `lib/` and `run.sh` with atomic renames. Data and
+configuration in `REXTTO_DATA_DIR` (default `/var/lib/rextto`) are never touched:
+a failed download, checksum or extraction leaves the running installation
+untouched, and a failed swap is rolled back. The `VERSION` marker next to the
+executable is updated and shown by `--version`.
+
+- `--channel stable` / `--release <tag>` — choose the release to install;
+- `--install-dir <dir>` — install elsewhere (default: the binary's directory);
+- `--archive <file>` — install from a local archive (offline);
+- `--force` — reinstall even if the version is unchanged;
+- `--no-restart` — do not restart `rextto.service`.
+
+Run it as root to restart `rextto.service` automatically; otherwise the exact
+`systemctl` command is printed. The systemd unit is not overwritten, so local
+customisations (user, ports, paths) are preserved. The same payload is the
+standalone Linux package described in the README (*Standalone Linux package*).
 
 ## 2. Dashboard
 
@@ -195,6 +208,8 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
    `key: value` map, for example `"Testa porte": "Test ports"`.
    Import updates or adds keys present in the file and does not delete missing
    keys. It does not change the active language; use the selector at the top.
+   The interface translates strings at runtime and falls back to the Italian
+   source when a translation is missing.
 
 Release sanity checks are **automatic** and not configurable: hardcoded
 subtitles (`HC`) and absurd sizes (a per-resolution floor derived from a real

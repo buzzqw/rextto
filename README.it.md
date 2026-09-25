@@ -23,6 +23,9 @@ o disco locale).
 
 - **Un demone, nessun orchestratore esterno** — scraping, download, rinomina,
   archiviazione e UI vivono nello stesso processo.
+- **Autonomo e auto-aggiornante** — un unico archivio di release (demone, UI web,
+  libtorrent inclusa) che `rexttod --update` installa in modo atomico,
+  preservando database e configurazione.
 - **Sorgenti multiple** — feed RSS generici, listing HTML (con fallback
   FlareSolverr per Cloudflare), indexer Torznab (Jackett/Prowlarr) e motori web.
 - **Punteggio qualità** — risoluzione, sorgente, codec, audio, HDR/Dolby Vision,
@@ -42,8 +45,9 @@ o disco locale).
   tracker, super seeding ed export `.torrent`/magnet nel dettaglio torrent.
 - **Fumetti** — monitoraggio GetComics e weekly pack.
 - **Integrazioni** — Trakt, Simkl, Jellyfin, Plex, notifiche Telegram/e-mail/webhook.
-- **UI web** — single-page responsive, tema chiaro/scuro, **italiano e inglese**,
-  con log viewer, salute, grafici e manutenzione.
+- **UI web** — single-page responsive, tema chiaro/scuro, completamente in
+  **italiano e inglese** (traduzione a runtime con import/export YAML), con log
+  viewer, salute, grafici e manutenzione.
 - **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo,
   consultabile anche per ciò che non è monitorato.
 - **Regole di sanità automatiche** — sottotitoli hardcoded e dimensioni assurde
@@ -92,8 +96,9 @@ curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | \
 ```
 
 Esegui lo stesso comando una seconda volta per cercare aggiornamenti e riavviare
-Rextto con la nuova versione. Database, configurazione, download, archivi e log
-restano in `/var/lib/rextto`; programma e UI sono in `/opt/rextto`.
+Rextto con la nuova versione, oppure lascia che sia il demone installato ad
+aggiornarsi (vedi *Aggiornamento di Rextto*). Database, configurazione, download,
+archivi e log restano in `/var/lib/rextto`; programma e UI sono in `/opt/rextto`.
 
 Variabili opzionali:
 
@@ -109,11 +114,63 @@ sudo systemctl status rextto.service
 sudo journalctl -u rextto.service -f
 ```
 
+### Aggiornamento di Rextto
+
+Ci sono due modi supportati per aggiornare. Entrambi installano lo stesso
+payload e lasciano **intatti dati e configurazione**: tutto ciò che sta in
+`/var/lib/rextto` (database, log, download, percorsi archivio) sopravvive
+all'aggiornamento.
+
+| Metodo | Comando | Note |
+|---|---|---|
+| Installer | riesegui il comando `install.sh` qui sopra | aggiorna anche dipendenze e unità systemd |
+| Demone | `sudo rexttod --update` | aggiorna solo il payload: `rexttod`, `ui/`, `lib/`, `run.sh` |
+
+Il programma installato vive in `/opt/rextto`:
+
+```
+rexttod     il demone (rpath $ORIGIN/lib)
+ui/         la UI web compilata
+lib/        la libtorrent inclusa
+run.sh      launcher (imposta LD_LIBRARY_PATH e REXTTO_UI_DIR)
+VERSION     il marker di release mostrato da --version
+```
+
+`rexttod --update` scarica `rextto-linux-<arch>.tar.gz`, verifica il `.sha256`
+pubblicato quando la release lo fornisce e prepara il nuovo payload prima di
+toccare l'installazione corrente. Se il download, il checksum o l'estrazione
+falliscono, l'installazione in esecuzione resta invariata; se uno swap fallisce,
+i file precedenti vengono ripristinati. Il servizio viene riavviato
+automaticamente quando il comando gira come root, altrimenti viene stampato il
+comando `systemctl` esatto.
+
+```bash
+rexttod --version                       # versione, build number e libtorrent
+sudo rexttod --update                   # ultima build continua
+sudo rexttod --update --channel stable  # ultima release con tag
+sudo rexttod --update --release v0.2.0  # un tag specifico
+```
+
+L'unità systemd **non** viene sovrascritta da `--update`: le personalizzazioni
+locali (utente, porte, percorsi) restano. Per rigenerarla usa l'installer. Il
+marker `VERSION` scritto accanto all'eseguibile è il nome della release
+(`continuous`, un tag, oppure `source-main`); il numero di build numerico è
+compilato nel binario e identifica la build esatta.
+
 ### Pacchetto Linux autonomo
 
 Ogni push su `main` (e ogni tag di release) pubblica
-`rextto-linux-x86_64.tar.gz`, un archivio autonomo con il demone `rexttod`, la
-UI web compilata e libtorrent incluso. Si estrae e si esegue senza compilatore:
+`rextto-linux-x86_64.tar.gz` (con il relativo `.sha256`) contenente:
+
+```
+rexttod     il demone, linkato con rpath $ORIGIN/lib
+ui/         la UI web compilata
+lib/        la libreria libtorrent inclusa
+run.sh      launcher (imposta LD_LIBRARY_PATH e REXTTO_UI_DIR)
+README.md   avvio rapido e prerequisiti
+```
+
+Si estrae e si esegue senza compilatore:
 
 ```bash
 mkdir rextto && tar -xzf rextto-linux-x86_64.tar.gz -C rextto
@@ -122,10 +179,12 @@ cd rextto
 REXTTO_DATA_DIR="$PWD/data" REXTTO_DRY_RUN=1 REXTTO_ACTIVE=0 ./run.sh
 ```
 
-L'archivio è prodotto da [`scripts/package-linux.sh`](scripts/package-linux.sh)
-ed è quello che `rexttod --update` installa. Richiede un Linux 64 bit recente
-(glibc, libstdc++, OpenSSL 3, zlib, libzstd); `ffprobe` è opzionale. Per
-un'installazione gestita come servizio usa l'installer descritto sopra.
+Poiché l'archivio include libtorrent e il demone trova da sé la `ui/` accanto a
+sé, non serve alcuna libtorrent di sistema. L'archivio è prodotto da
+[`scripts/package-linux.sh`](scripts/package-linux.sh) ed è quello che
+`rexttod --update` installa. Richiede un Linux 64 bit recente (glibc, libstdc++,
+OpenSSL 3, zlib, libzstd); `ffprobe` è opzionale. Per un'installazione gestita
+come servizio usa l'installer descritto sopra.
 
 ### Compila da un checkout (sviluppo)
 
@@ -288,30 +347,42 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 ### Riga di comando
 
 Il demone parte normalmente come servizio systemd. Eseguito direttamente,
-`rexttod` accetta anche alcune opzioni:
+`rexttod` accetta anche queste opzioni:
 
-| Comando | Cosa fa |
+| Opzione | Cosa fa |
 |---|---|
-| `rexttod --version` | mostra la versione installata e la libtorrent inclusa |
-| `rexttod --help` | mostra il riepilogo d'uso |
-| `rexttod --update` | scarica e installa l'ultima versione di demone e UI web |
-| `rexttod --config <file>` | usa un file di configurazione specifico |
-| `rexttod --dry-run` | avvia senza download reali |
+| `-h`, `--help` | mostra il riepilogo d'uso |
+| `-V`, `--version` | mostra versione installata, build number e libtorrent inclusa |
+| `--config <file>` | usa un file di configurazione specifico (default `rextto.json`) |
+| `--dry-run` | avvia senza download reali |
+| `--update` | scarica e installa l'ultimo payload (vedi *Aggiornamento di Rextto*) |
 
-`rexttod --update` riusa gli stessi asset dell'installer: scarica
-`rextto-linux-<arch>.tar.gz`, verifica il `.sha256` pubblicato e sostituisce
-eseguibile e UI web con rename atomici. Configurazione, database e download in
-`REXTTO_DATA_DIR` non vengono toccati, e un download o un checksum fallito
-lascia intatta l'installazione corrente. Opzioni utili:
+Opzioni di `--update`:
+
+| Opzione | Cosa fa |
+|---|---|
+| `--repo <owner/name>` | repository GitHub da cui scaricare (default `buzzqw/rextto`) |
+| `--channel <name>` | `continuous` (default) o `stable` |
+| `--release <tag>` | installa un tag di release specifico |
+| `--install-dir <dir>` | directory di installazione (default: quella del binario) |
+| `--archive <file>` | installa da un archivio locale invece di scaricare |
+| `--force` | reinstalla anche se la versione è invariata |
+| `--no-restart` | non riavviare `rextto.service` dopo l'installazione |
+
+Esempi:
 
 ```bash
-rexttod --update --channel stable      # ultima release con tag
-rexttod --update --release v0.2.0      # installa un tag specifico
-rexttod --update --install-dir /opt/rextto --no-restart
+rexttod --version                          # cosa è installato ora
+sudo rexttod --update                      # ultima build continua
+sudo rexttod --update --channel stable     # ultima release con tag
+sudo rexttod --update --release v0.2.0     # un tag specifico
+rexttod --update --install-dir /srv/rextto --no-restart
 rexttod --update --archive ./rextto-linux-x86_64.tar.gz   # offline
 ```
 
-Il servizio viene riavviato automaticamente quando il comando gira come root.
+Per provare un aggiornamento senza toccare un'installazione reale, combina
+`--install-dir` con una directory usa e getta e `--no-restart`; `--archive` evita
+del tutto la rete.
 
 ### Dove trovare i dettagli
 
@@ -320,7 +391,8 @@ schermata. Indice rapido:
 
 | Argomento | README | Manuale |
 |---|---|---|
-| Installazione, aggiornamento, servizio | *Installazione*, *Riga di comando* | — |
+| Installazione e servizio | *Installazione* | [1. Primo avvio](docs/MANUAL.it.md#1-primo-avvio) |
+| Aggiornamento, versione, pacchetto | *Aggiornamento di Rextto*, *Riga di comando* | [1. Primo avvio](docs/MANUAL.it.md#1-primo-avvio) |
 | Primo avvio e modalità | *Primo avvio* | [1. Primo avvio](docs/MANUAL.it.md#1-primo-avvio) |
 | Dashboard, cicli, statistiche | *Cicli e download* | [2. Dashboard](docs/MANUAL.it.md#2-dashboard) |
 | Torrent, stalled, storico | *Cicli e download* | [3. Scarico](docs/MANUAL.it.md#3-scarico) |
@@ -397,6 +469,17 @@ launcher `run.sh` e un breve README. Il demone è linkato con rpath `$ORIGIN/lib
 e cerca una `ui/` accanto a sé, quindi parte direttamente dall'archivio
 estratto; `install.sh` copia lo stesso payload in `/opt/rextto`.
 
+Per provare l'updater in locale senza sostituire il binario del checkout,
+puntalo a una directory usa e getta usando l'archivio appena creato:
+
+```bash
+scripts/package-linux.sh --output /tmp/rextto-linux-x86_64.tar.gz
+mkdir -p /tmp/rextto-install
+target/release/rexttod --update --archive /tmp/rextto-linux-x86_64.tar.gz \
+  --install-dir /tmp/rextto-install --no-restart
+/tmp/rextto-install/rexttod --version
+```
+
 ### Come sono fatte le parti
 
 | Componente / risorsa | Ruolo | Funzioni che abilita |
@@ -413,7 +496,8 @@ estratto; `install.sh` copia lo stesso payload in `/opt/rextto`.
 | FTP / cloud / Telegram (`src/backup.rs`, suppaftp) | backup programmati | snapshot di database e configurazione |
 | zip, flate2, sha1/hmac/sha2 | utilità | gestione archivi, hashing, firma webhook |
 | parser + rules + scoring (`src/parser.rs`, `src/rules.rs`, `src/config.rs`) | logica di dominio | parsing release, punteggio qualità, controlli di sanità, upgrade |
-| installer + packaging + systemd | operazioni | install da sorgente/release, self-update, servizio, archivio autonomo |
+| CLI + self-update (`src/cli.rs`, `src/update.rs`) | operazioni | `--version`/`--help`, download release con checksum, swap atomico del payload e rollback |
+| installer + packaging + systemd | operazioni | install da sorgente/release, unità di servizio, archivio autonomo |
 | importatore legacy (`src/importer.rs`) | CLI di migrazione | import una tantum dei database di un'installazione precedente |
 
 Le build di sviluppo restano piccole e non crescono all'infinito:

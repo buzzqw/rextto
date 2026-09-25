@@ -34,20 +34,32 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
 Il demone gira normalmente nel servizio systemd. Eseguito direttamente
 comprende:
 
-- `rexttod --version` — mostra la versione installata, il marker di release e la
+- `rexttod --version` — versione installata, build number, marker di release e
   libtorrent inclusa;
 - `rexttod --help` — riepilogo d'uso;
-- `rexttod --update` — scarica e installa l'ultima versione di demone e UI web;
+- `rexttod --update` — scarica e installa l'ultimo payload;
 - `rexttod --config <file>` e `rexttod --dry-run` — usati dal servizio e per le
   prove locali.
 
-`--update` scarica `rextto-linux-<arch>.tar.gz`, verifica il checksum quando
-pubblicato e sostituisce eseguibile e UI con rename atomici. Non tocca mai
-`REXTTO_DATA_DIR`. Opzioni: `--channel stable`, `--release <tag>`,
-`--install-dir <dir>`, `--archive <file>` (offline), `--no-restart`, `--force`.
-Riavvia `rextto.service` quando eseguito come root. Lo stesso payload si può
-usare manualmente come pacchetto autonomo (vedi il README, *Pacchetto Linux
-autonomo*).
+**Aggiornamento.** L'installer e `rexttod --update` installano lo stesso
+payload. `--update` scarica `rextto-linux-<arch>.tar.gz`, verifica il `.sha256`
+pubblicato quando presente, prepara i file e poi sostituisce eseguibile, UI web,
+`lib/` inclusa e `run.sh` con rename atomici. Dati e configurazione in
+`REXTTO_DATA_DIR` (default `/var/lib/rextto`) non vengono mai toccati: un
+download, un checksum o un'estrazione falliti lasciano l'installazione in
+esecuzione invariata, e uno swap fallito viene ripristinato. Il marker `VERSION`
+accanto all'eseguibile viene aggiornato ed è mostrato da `--version`.
+
+- `--channel stable` / `--release <tag>` — scelgono la release da installare;
+- `--install-dir <dir>` — installa altrove (default: la directory del binario);
+- `--archive <file>` — installa da un archivio locale (offline);
+- `--force` — reinstalla anche se la versione è invariata;
+- `--no-restart` — non riavviare `rextto.service`.
+
+Eseguito come root riavvia `rextto.service` automaticamente; altrimenti stampa il
+comando `systemctl` esatto. L'unità systemd non viene sovrascritta, così le
+personalizzazioni locali (utente, porte, percorsi) restano. Lo stesso payload è
+il pacchetto Linux autonomo descritto nel README (*Pacchetto Linux autonomo*).
 
 ## 2. Dashboard
 
@@ -203,7 +215,8 @@ la barra “Salva tutte”.
    mappa `chiave: valore`, ad esempio `"Testa porte": "Test ports"`.
    L'importazione aggiorna o aggiunge le chiavi presenti e non cancella quelle
    assenti dal file. Non cambia la lingua attiva: quella si sceglie dal
-   selettore in alto.
+   selettore in alto. La UI traduce le stringhe a runtime e, se manca una
+   traduzione, mostra la sorgente italiana.
 
 I controlli di sanità delle release sono **automatici** e non configurabili:
 sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione

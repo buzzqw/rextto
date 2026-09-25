@@ -24,6 +24,9 @@ disk).
 
 - **One daemon, no external orchestrator** — scraping, downloading, renaming,
   archiving and the UI live in the same process.
+- **Self-contained and self-updating** — one release archive (daemon, web UI,
+  bundled libtorrent) that `rexttod --update` installs atomically, keeping
+  databases and configuration intact.
 - **Multiple sources** — generic RSS feeds, HTML listings (with FlareSolverr
   fallback for Cloudflare), Torznab indexers (Jackett/Prowlarr) and web engines.
 - **Quality scoring** — resolution, source, codec, audio, HDR/Dolby Vision,
@@ -45,8 +48,9 @@ disk).
 - **Comics** — GetComics monitoring and weekly packs.
 - **Integrations** — Trakt, Simkl, Jellyfin, Plex, Telegram/e-mail/webhook
   notifications.
-- **Web UI** — responsive single-page app, dark/light theme, **Italian and
-  English**, with log viewer, health, charts and maintenance tools.
+- **Web UI** — responsive single-page app, dark/light theme, fully **Italian and
+  English** (runtime translation layer with YAML import/export), with log viewer,
+  health, charts and maintenance tools.
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
 - **Automatic sanity rules** — hardcoded subtitles and absurd file sizes
@@ -88,8 +92,9 @@ curl -fsSL https://raw.githubusercontent.com/buzzqw/rextto/main/install.sh | bas
 ```
 
 Run the same command again to check for updates and restart Rextto with the new
-version. Existing databases, configuration, downloads, archive paths and logs
-are kept in `/var/lib/rextto`; the program and web UI live in `/opt/rextto`.
+version, or let the installed daemon update itself (see *Updating Rextto*).
+Existing databases, configuration, downloads, archive paths and logs are kept in
+`/var/lib/rextto`; the program and web UI live in `/opt/rextto`.
 
 To install the latest stable tagged release instead of the continuous build:
 
@@ -112,12 +117,62 @@ sudo systemctl status rextto.service
 sudo journalctl -u rextto.service -f
 ```
 
+### Updating Rextto
+
+There are two supported update paths. Both install the same release payload and
+both leave **data and configuration untouched** — everything in
+`/var/lib/rextto` (databases, logs, downloads, archive paths) survives an
+update.
+
+| Method | Command | Notes |
+|---|---|---|
+| Installer | re-run the `install.sh` command above | also refreshes dependencies and the systemd unit |
+| Daemon | `sudo rexttod --update` | updates only the payload: `rexttod`, `ui/`, `lib/`, `run.sh` |
+
+The installed program lives in `/opt/rextto`:
+
+```
+rexttod     the daemon (rpath $ORIGIN/lib)
+ui/         the compiled web interface
+lib/        the bundled libtorrent
+run.sh      launcher (sets LD_LIBRARY_PATH and REXTTO_UI_DIR)
+VERSION     the release marker shown by --version
+```
+
+`rexttod --update` downloads `rextto-linux-<arch>.tar.gz`, verifies the
+published `.sha256` when the release provides one, and stages the new payload
+before touching the current installation. If the download, the checksum or the
+extraction fails, the running installation is left as it was; if a swap fails,
+the previous files are restored. The service is restarted automatically when
+the command runs as root, otherwise the exact `systemctl` command is printed.
+
+```bash
+rexttod --version                       # version, build number and libtorrent
+sudo rexttod --update                   # latest continuous build
+sudo rexttod --update --channel stable  # latest tagged release
+sudo rexttod --update --release v0.2.0  # a specific tag
+```
+
+The systemd unit is intentionally **not** overwritten by `--update`: local
+customisations (user, ports, paths) are preserved. Use the installer to
+regenerate the unit. The `VERSION` marker written next to the executable is the
+release name (`continuous`, a tag, or `source-main`); the numeric build number
+is compiled in and identifies the exact build.
+
 ### Standalone Linux package
 
 Every push to `main` (and every release tag) publishes a self-contained
-`rextto-linux-x86_64.tar.gz` containing the `rexttod` daemon, the compiled web
-UI and the bundled libtorrent. Extract it and run it directly, without a
-compiler:
+`rextto-linux-x86_64.tar.gz` (with a `.sha256` next to it) containing:
+
+```
+rexttod     the daemon, linked with rpath $ORIGIN/lib
+ui/         the compiled web interface
+lib/        the bundled libtorrent shared library
+run.sh      launcher (sets LD_LIBRARY_PATH and REXTTO_UI_DIR)
+README.md   quick start and prerequisites
+```
+
+Extract it and run it directly, without a compiler:
 
 ```bash
 mkdir rextto && tar -xzf rextto-linux-x86_64.tar.gz -C rextto
@@ -126,10 +181,12 @@ cd rextto
 REXTTO_DATA_DIR="$PWD/data" REXTTO_DRY_RUN=1 REXTTO_ACTIVE=0 ./run.sh
 ```
 
-The archive is built by [`scripts/package-linux.sh`](scripts/package-linux.sh)
-and is what `rexttod --update` installs. It requires a modern 64-bit Linux
-(glibc, libstdc++, OpenSSL 3, zlib, libzstd); `ffprobe` is optional. For a
-managed service install use the installer above.
+Because the archive bundles libtorrent and the daemon resolves its sibling
+`ui/` automatically, no system libtorrent is required. The archive is built by
+[`scripts/package-linux.sh`](scripts/package-linux.sh) and is what
+`rexttod --update` installs. It needs a modern 64-bit Linux (glibc, libstdc++,
+OpenSSL 3, zlib, libzstd); `ffprobe` is optional. For a managed service install
+use the installer above.
 
 ### Build from a checkout (development)
 
@@ -290,30 +347,42 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 ### Command line
 
 The daemon is normally started by the systemd service. When you run `rexttod`
-directly it also accepts a few options:
+directly it also accepts these options:
 
-| Command | What it does |
+| Option | What it does |
 |---|---|
-| `rexttod --version` | print the installed version and the bundled libtorrent |
-| `rexttod --help` | print the usage summary |
-| `rexttod --update` | download and install the latest daemon + web UI |
-| `rexttod --config <file>` | use a specific configuration file |
-| `rexttod --dry-run` | start without real downloads |
+| `-h`, `--help` | print the usage summary |
+| `-V`, `--version` | print the installed version, build number and bundled libtorrent |
+| `--config <file>` | use a specific configuration file (default `rextto.json`) |
+| `--dry-run` | start without real downloads |
+| `--update` | download and install the latest payload (see *Updating Rextto*) |
 
-`rexttod --update` reuses the same assets as the installer: it downloads
-`rextto-linux-<arch>.tar.gz`, verifies the published `.sha256`, and replaces the
-executable and web UI with atomic swaps. Your configuration, databases and
-downloads in `REXTTO_DATA_DIR` are never touched, and a failed download or
-checksum leaves the current installation working. Useful flags:
+`--update` options:
+
+| Option | What it does |
+|---|---|
+| `--repo <owner/name>` | GitHub repository to download from (default `buzzqw/rextto`) |
+| `--channel <name>` | `continuous` (default) or `stable` |
+| `--release <tag>` | install a specific release tag |
+| `--install-dir <dir>` | installation directory (default: the binary's directory) |
+| `--archive <file>` | install from a local archive instead of downloading |
+| `--force` | reinstall even if the version is unchanged |
+| `--no-restart` | do not restart `rextto.service` after installing |
+
+Examples:
 
 ```bash
-rexttod --update --channel stable      # use the latest tagged release
-rexttod --update --release v0.2.0      # install a specific tag
-rexttod --update --install-dir /opt/rextto --no-restart
+rexttod --version                          # what is installed now
+sudo rexttod --update                      # latest continuous build
+sudo rexttod --update --channel stable     # latest tagged release
+sudo rexttod --update --release v0.2.0     # a specific tag
+rexttod --update --install-dir /srv/rextto --no-restart
 rexttod --update --archive ./rextto-linux-x86_64.tar.gz   # offline
 ```
 
-The service is restarted automatically when the command runs as root.
+When testing an update without touching a real installation, combine
+`--install-dir` with a throwaway directory and `--no-restart`; `--archive`
+avoids the network entirely.
 
 ### Where to find the details
 
@@ -322,7 +391,8 @@ every screen. Quick index:
 
 | Topic | README | Manual |
 |---|---|---|
-| Install, update, service | *Installation*, *Command line* | — |
+| Install and service | *Installation* | [1. First start](docs/MANUAL.en.md#1-first-start) |
+| Update, version, package | *Updating Rextto*, *Command line* | [1. First start](docs/MANUAL.en.md#1-first-start) |
 | First run and modes | *First run* | [1. First start](docs/MANUAL.en.md#1-first-start) |
 | Dashboard, cycles, stats | *Cycles and downloads* | [2. Dashboard](docs/MANUAL.en.md#2-dashboard) |
 | Torrents, stalled, history | *Cycles and downloads* | [3. Downloads](docs/MANUAL.en.md#3-downloads) |
@@ -400,6 +470,17 @@ The archive contains `rexttod`, the compiled `ui/`, the bundled libtorrent in
 from the extracted archive; `install.sh` copies the same payload into
 `/opt/rextto`.
 
+To exercise the updater locally without replacing your checkout binary, point it
+at a throwaway directory and use the freshly built archive:
+
+```bash
+scripts/package-linux.sh --output /tmp/rextto-linux-x86_64.tar.gz
+mkdir -p /tmp/rextto-install
+target/release/rexttod --update --archive /tmp/rextto-linux-x86_64.tar.gz \
+  --install-dir /tmp/rextto-install --no-restart
+/tmp/rextto-install/rexttod --version
+```
+
 ### How the pieces fit
 
 | Component / resource | Role | Functions it powers |
@@ -416,7 +497,8 @@ from the extracted archive; `install.sh` copies the same payload into
 | FTP / cloud / Telegram (`src/backup.rs`, suppaftp) | scheduled backups | database and configuration snapshots |
 | zip, flate2, sha1/hmac/sha2 | utilities | archive handling, hashing, webhook signing |
 | parser + rules + scoring (`src/parser.rs`, `src/rules.rs`, `src/config.rs`) | domain logic | release parsing, quality scoring, sanity checks, upgrades |
-| installer + packaging + systemd | operations | source/release install, self-update, service, standalone archive |
+| CLI + self-update (`src/cli.rs`, `src/update.rs`) | operations | `--version`/`--help`, release download with checksum, atomic payload swap and rollback |
+| installer + packaging + systemd | operations | source/release install, service unit, standalone archive |
 | legacy importer (`src/importer.rs`) | migration CLI | one-off import of an older installation's databases |
 
 Development builds stay small and never accumulate forever:
