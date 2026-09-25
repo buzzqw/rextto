@@ -12200,7 +12200,7 @@ fn enforce_seed_policy(
                 // also protects packs with stale or invalid processed_path data.
                 if !completed_source_disposable(db, &torrent.hash, &torrent.save_path) {
                     if seed_copy_warning_due(seed_copy_warnings, &torrent.hash) {
-                        tracing::warn!(
+                        tracing::debug!(
                             hash = %torrent.hash,
                             name = %torrent.name,
                             "seed limit reached but archived copy is not verified; keeping torrent files"

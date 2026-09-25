@@ -24,6 +24,7 @@ import curses
 import json
 import os
 import sys
+import textwrap
 import threading
 import time
 import urllib.error
@@ -502,6 +503,34 @@ def add(win, y: int, x: int, value: str, attr: int = 0) -> None:
         pass
 
 
+def wrapped_lines(value, width: int) -> list[str]:
+    """Return terminal-sized lines, including hard-wrapped long words."""
+    if width <= 0:
+        return []
+    paragraphs = str(value).splitlines() or [""]
+    result = []
+    for paragraph in paragraphs:
+        result.extend(textwrap.wrap(
+            paragraph,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+        ) or [""])
+    return result
+
+
+def add_wrapped(win, y: int, x: int, value, attr: int = 0, max_lines=None) -> int:
+    """Draw a value on consecutive rows and return the number of rows used."""
+    _, width = win.getmaxyx()
+    lines = wrapped_lines(value, max(1, width - x - 1))
+    if max_lines is not None:
+        lines = lines[:max_lines]
+    for offset, line in enumerate(lines):
+        add(win, y + offset, x, line, attr)
+    return len(lines)
+
+
 def prompt_input(stdscr, label: str) -> str:
     """Single-line input on the last row; Esc cancels, Enter confirms."""
     curses.curs_set(1)
@@ -536,7 +565,7 @@ def confirm(stdscr, label: str) -> bool:
 def draw(app: "App", win, colors: dict) -> None:
     win.erase()
     height, width = win.getmaxyx()
-    if height < 6 or width < 40:
+    if height < 6 or width < 12:
         add(win, 0, 0, "terminal too small", curses.A_BOLD)
         win.refresh()
         return
@@ -561,22 +590,6 @@ def draw(app: "App", win, colors: dict) -> None:
         x += len(label) + 6
     add(win, 1, x, "  (Tab/1-4)", colors["muted"])
 
-    top = 3
-    bottom = height - 2
-    if app.error:
-        add(win, top, 2, f"cannot reach daemon: {app.error}", colors["err"])
-        add(win, top + 2, 2, "set REXTTO_URL / REXTTO_API_TOKEN", colors["muted"])
-    elif app.detail is not None:
-        draw_torrent_details(app, win, top, bottom, width, colors)
-    elif app.tab == 0:
-        draw_status(app, win, top, colors)
-    elif app.tab == 1:
-        draw_torrents(app, win, top, bottom, width, colors)
-    elif app.tab == 2:
-        draw_logs(app, win, top, bottom, width, colors)
-    else:
-        draw_health(app, win, top, bottom, width, colors)
-
     hints = " q quit · ? help · r refresh · a magnet/URL · t file · c cycle · s search · e events"
     if app.loading:
         hints += " · loading..."
@@ -588,9 +601,30 @@ def draw(app: "App", win, colors: dict) -> None:
         hints += " · ↑↓/PgUp/PgDn scroll · / filter · f follow · Home/End"
     elif app.tab == 3:
         hints += " · x empty trash"
-    add(win, height - 1, 1, hints, colors["muted"])
-    if app.message:
-        add(win, height - 1, min(width - 2, len(hints) + 3), f"| {app.message}", colors["ok"])
+    footer = hints + (f" | {app.message}" if app.message else "")
+    footer_lines = wrapped_lines(footer, max(1, width - 2))
+    top = 3
+    footer_top = max(top + 1, height - max(1, len(footer_lines)))
+    bottom = max(top + 1, footer_top - 1)
+    if app.error:
+        add_wrapped(win, top, 2, f"cannot reach daemon: {app.error}", colors["err"],
+                    max(0, bottom - top))
+        add_wrapped(win, top + 2, 2, "set REXTTO_URL / REXTTO_API_TOKEN", colors["muted"],
+                    max(0, bottom - top - 2))
+    elif app.detail is not None:
+        draw_torrent_details(app, win, top, bottom, width, colors)
+    elif app.tab == 0:
+        draw_status(app, win, top, bottom, colors)
+    elif app.tab == 1:
+        draw_torrents(app, win, top, bottom, width, colors)
+    elif app.tab == 2:
+        draw_logs(app, win, top, bottom, width, colors)
+    else:
+        draw_health(app, win, top, bottom, width, colors)
+
+    for offset, line in enumerate(footer_lines[-max(1, height - footer_top):]):
+        add(win, footer_top + offset, 1, line,
+            colors["ok"] if app.message and offset == len(footer_lines[-max(1, height - footer_top):]) - 1 else colors["muted"])
     if app.search_visible:
         draw_search(app, win, colors)
     elif app.events_visible:
@@ -612,6 +646,7 @@ def draw_lines(lines, win, top, bottom, colors) -> None:
 
 def draw_logs(app: App, win, top, bottom, width, colors) -> None:
     lines = app.filtered_logs()
+    lines = [wrapped for line in lines for wrapped in wrapped_lines(line, max(1, width - 4))]
     visible = max(1, bottom - top - 1)
     max_scroll = max(0, len(lines) - visible)
     app.log_scroll = min(max(app.log_scroll, 0), max_scroll)
@@ -642,8 +677,10 @@ def draw_help(win, colors) -> None:
         "",
         "Press Esc, Enter or ? to close",
     ]
-    box_width = min(width - 4, max(44, max(len(line) for line in lines) + 4))
-    box_height = min(height - 2, len(lines) + 2)
+    box_width = min(width - 4, max(20, max(len(line) for line in lines) + 4))
+    inner_width = max(1, box_width - 4)
+    rendered = [wrapped for line in lines for wrapped in wrapped_lines(line, inner_width)]
+    box_height = min(height - 2, max(3, len(rendered) + 2))
     left = max(1, (width - box_width) // 2)
     top = max(0, (height - box_height) // 2)
     attr = curses.A_REVERSE
@@ -652,11 +689,11 @@ def draw_help(win, colors) -> None:
     add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
     add(win, top + box_height - 1, left,
         "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
-    for offset, line in enumerate(lines[: max(0, box_height - 2)], 1):
-        add(win, top + offset, left + 2, shorten(line, max(1, box_width - 4)), attr)
+    for offset, line in enumerate(rendered[: max(0, box_height - 2)], 1):
+        add(win, top + offset, left + 2, line, attr)
 
 
-def draw_status(app, win, top, colors) -> None:
+def draw_status(app, win, top, bottom, colors) -> None:
     status = app.status
     torrents = status.get("torrent_stats", {})
     cycle = status.get("last_cycle", {})
@@ -673,13 +710,46 @@ def draw_status(app, win, top, colors) -> None:
         f"Seen in feeds: groups {text(seen,'groups')} · movies {text(seen,'movies')} "
         f"· series {text(seen,'series')}",
     ]
-    for offset, line in enumerate(lines):
-        add(win, top + offset, 2, line, colors["normal"])
+    y = top
+    for line in lines:
+        if y >= bottom:
+            break
+        y += add_wrapped(win, y, 2, line, colors["normal"], bottom - y)
 
 
 def draw_torrents(app, win, top, bottom, width, colors) -> None:
     selected_label = f"Torrents: {app.selected + 1}/{len(app.torrents)}  " if app.torrents else "Torrents: 0  "
     add(win, top, 2, selected_label, colors["header"] | curses.A_BOLD)
+    if width < 80:
+        add(win, top + 1, 2, "STATE   PROGRESS  NAME / HASH", colors["header"])
+        visible = max(1, bottom - top - 2)
+        blocks = []
+        for torrent in app.torrents:
+            progress = float(torrent.get("progress") or 0.0)
+            first = f"{text(torrent, 'state', '-')} {progress:.1f}%  {text(torrent, 'name', '-')}"
+            second = (f"{text(torrent, 'hash', '-')} · done {human_bytes(torrent.get('total_done') or 0)} · "
+                      f"down {human_bytes(torrent.get('download_rate') or 0)}/s · "
+                      f"up {human_bytes(torrent.get('upload_rate') or 0)}/s")
+            block = wrapped_lines(first, max(1, width - 4))
+            block.extend(wrapped_lines(second, max(1, width - 4)))
+            blocks.append(block)
+        start = min(app.selected, max(0, len(blocks) - 1))
+        used = len(blocks[start]) if blocks else 0
+        while start > 0 and used + len(blocks[start - 1]) <= visible:
+            start -= 1
+            used += len(blocks[start])
+        y = top + 2
+        for index in range(start, len(blocks)):
+            block = blocks[index]
+            if y >= bottom:
+                break
+            attr = colors["tab_active"] if index == app.selected else colors["normal"]
+            for line_offset, line in enumerate(block[:bottom - y]):
+                add(win, y + line_offset, 1,
+                    ">" if index == app.selected and line_offset == 0 else " ", attr)
+                add(win, y + line_offset, 2, line, attr)
+            y += min(len(block), bottom - y)
+        return
     add(win, top + 1, 2, f"{'HASH':<9} {'STATE':<12} {'PROG':>6} {'DONE':>10} "
                      f"{'DOWN':>10} {'UP':>10}  NAME", colors["header"])
     name_width = max(10, width - 64)
@@ -748,21 +818,19 @@ def draw_torrent_details(app: App, win, top, bottom, width, colors) -> None:
         ("Save path", text(torrent, "save_path", "-")),
         ("Magnet", detail.get("magnet") or "-"),
     ]
-    value_width = max(1, width - 23)
-    for offset, (label, value) in enumerate(rows):
-        y = top + offset
+    y = top
+    for label, value in rows:
         if y >= bottom:
             break
-        add(win, y, 2, f"{label:<18} {shorten(str(value), value_width)}", colors["normal"])
+        y += add_wrapped(win, y, 2, f"{label:<18} {value}", colors["normal"], bottom - y)
 
 
 def draw_detail_collection(app: App, win, top, bottom, width, colors) -> None:
     labels = {"trackers": "Trackers", "files": "Files", "peers": "Peers"}
     title = labels.get(app.detail_view, app.detail_view)
     add(win, top, 2, f"{title}: {len(app.detail_items)}", colors["header"] | curses.A_BOLD)
-    visible = max(1, bottom - top - 1)
-    start = min(app.detail_scroll, max(0, len(app.detail_items) - visible))
-    for offset, item in enumerate(app.detail_items[start:start + visible]):
+    rendered = []
+    for item in app.detail_items:
         if not isinstance(item, dict):
             line = str(item)
         elif app.detail_view == "trackers":
@@ -776,14 +844,30 @@ def draw_detail_collection(app: App, win, top, bottom, width, colors) -> None:
                     f"down {human_bytes(item.get('download_rate') or 0)}/s  "
                     f"up {human_bytes(item.get('upload_rate') or 0)}/s  "
                     f"{'seed' if item.get('seed') else ''}")
-        add(win, top + 1 + offset, 2, shorten(line, max(1, width - 4)), colors["normal"])
+        rendered.extend(wrapped_lines(line, max(1, width - 4)))
+    visible = max(1, bottom - top - 1)
+    start = min(app.detail_scroll, max(0, len(rendered) - visible))
+    for offset, line in enumerate(rendered[start:start + visible]):
+        add(win, top + 1 + offset, 2, line, colors["normal"])
 
 
 def draw_search(app: App, win, colors) -> None:
     height, width = win.getmaxyx()
     results = app.search_results
     box_width = min(width - 4, max(50, min(width - 4, 100)))
-    box_height = min(height - 2, max(7, len(results) + 5))
+    inner_width = max(1, box_width - 4)
+    heading = wrapped_lines(
+        f"Search '{app.search_query}' — {len(results)} results · Enter/a queue · Esc close",
+        inner_width,
+    )
+    blocks = []
+    for result in results:
+        title = text(result, "title", "untitled")
+        source = text(result, "source", "-")
+        quality = result.get("quality", {}) if isinstance(result, dict) else {}
+        quality_text = text(quality, "resolution") or text(quality, "source")
+        blocks.append(wrapped_lines(f"{title} · {source} · {quality_text}", inner_width))
+    box_height = min(height - 2, max(7, len(heading) + sum(map(len, blocks)) + 4))
     left = max(1, (width - box_width) // 2)
     top = max(0, (height - box_height) // 2)
     for row in range(box_height):
@@ -791,43 +875,52 @@ def draw_search(app: App, win, colors) -> None:
     add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
     add(win, top + box_height - 1, left,
         "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
-    add(win, top + 1, left + 2, shorten(
-        f"Search '{app.search_query}' — {len(results)} results · Enter/a queue · Esc close",
-        max(1, box_width - 4)), curses.A_BOLD | curses.A_REVERSE)
-    visible = max(1, box_height - 4)
-    start = min(app.search_selected, max(0, len(results) - visible))
-    for offset, result in enumerate(results[start:start + visible]):
-        title = text(result, "title", "untitled")
-        source = text(result, "source", "-")
-        quality = result.get("quality", {}) if isinstance(result, dict) else {}
-        quality_text = text(quality, "resolution") or text(quality, "source")
-        line = f"{title} · {source} · {quality_text}"
-        attr = curses.A_REVERSE | (curses.A_BOLD if start + offset == app.search_selected else 0)
-        add(win, top + 3 + offset, left + 2, shorten(line, max(1, box_width - 4)), attr)
+    for offset, line in enumerate(heading[:max(0, box_height - 2)], 1):
+        add(win, top + offset, left + 2, line, curses.A_BOLD | curses.A_REVERSE)
+    start = min(app.search_selected, max(0, len(results) - 1))
+    y = top + 1 + len(heading) + 1
+    for index in range(start, len(blocks)):
+        if y >= top + box_height - 1:
+            break
+        attr = curses.A_REVERSE | (curses.A_BOLD if index == app.search_selected else 0)
+        for line in blocks[index]:
+            if y >= top + box_height - 1:
+                break
+            add(win, y, left + 2, line, attr)
+            y += 1
 
 
 def draw_events(app: App, win, colors) -> None:
     height, width = win.getmaxyx()
     box_width = min(width - 4, max(50, min(width - 4, 100)))
-    box_height = min(height - 2, max(7, len(app.events) + 4))
-    left = max(1, (width - box_width) // 2)
-    top = max(0, (height - box_height) // 2)
-    for row in range(box_height):
-        add(win, top + row, left, " " * box_width, curses.A_REVERSE)
-    add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
-    add(win, top + box_height - 1, left,
-        "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
-    add(win, top + 1, left + 2, "Recent torrent events · Esc close",
-        curses.A_BOLD | curses.A_REVERSE)
-    for offset, event in enumerate(app.events[-max(1, box_height - 4):]):
+    inner_width = max(1, box_width - 4)
+    blocks = []
+    for event in app.events:
         kind = text(event, "kind", "event")
         name = text(event, "name", text(event, "hash", "-"))
         save_path = text(event, "save_path", "")
         line = f"{kind:<22} {name}"
         if save_path:
             line += f" · {save_path}"
-        add(win, top + 3 + offset, left + 2, shorten(line, max(1, box_width - 4)),
-            curses.A_REVERSE)
+        blocks.append(wrapped_lines(line, inner_width))
+    box_height = min(height - 2, max(7, sum(map(len, blocks)) + 4))
+    left = max(1, (width - box_width) // 2)
+    top = max(0, (height - box_height) // 2)
+    for row in range(box_height):
+        add(win, top + row, left, " " * box_width, curses.A_REVERSE)
+    add(win, top, left, "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    add(win, top + box_height - 1, left,
+        "+" + "-" * max(0, box_width - 2) + "+", curses.A_BOLD)
+    heading = wrapped_lines("Recent torrent events · Esc close", inner_width)
+    for offset, line in enumerate(heading, 1):
+        add(win, top + offset, left + 2, line, curses.A_BOLD | curses.A_REVERSE)
+    y = top + 1 + len(heading) + 1
+    for block in blocks[-max(1, box_height - 3):]:
+        for line in block:
+            if y >= top + box_height - 1:
+                break
+            add(win, y, left + 2, line, curses.A_REVERSE)
+            y += 1
 
 
 def optional_number(value, suffix="", decimals=0) -> str:
@@ -877,12 +970,13 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
         f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
         f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",
     ]
-    for offset, line in enumerate(summary, 1):
-        if top + offset >= bottom:
+    y = top + 1
+    for line in summary:
+        if y >= bottom:
             return
-        add(win, top + offset, 2, shorten(line, max(1, width - 4)), colors["normal"])
+        y += add_wrapped(win, y, 2, line, colors["normal"], bottom - y)
 
-    y = top + len(summary) + 1
+    y += 1
     if y < bottom:
         add(win, y, 2, "Paths", colors["header"] | curses.A_BOLD)
         y += 1
@@ -895,10 +989,9 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
         good = exists and path_writable
         state = "OK" if good else "FAIL"
         label = text(path, "label", "-")
-        path_name = shorten(text(path, "path", "-"), max(1, width - 25))
-        add(win, y, 2, f"{state:<4} {label:<14} {path_name}",
-            colors["ok"] if good else colors["err"])
-        y += 1
+        path_name = text(path, "path", "-")
+        y += add_wrapped(win, y, 2, f"{state:<4} {label:<14} {path_name}",
+                         colors["ok"] if good else colors["err"], bottom - y)
 
     disks = health.get("disks", [])
     if y < bottom:
@@ -913,17 +1006,16 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
             used = max(0.0, min(100.0, (1.0 - float(free) / float(total)) * 100.0)) if total else 0.0
         except (TypeError, ValueError):
             used = 0.0
-        mount = shorten(text(disk, "mount", "-"), max(1, width - 48))
+        mount = text(disk, "mount", "-")
         line = f"{mount:<18} {human_bytes(free)} free / {human_bytes(total)} · {used:.0f}% used"
-        add(win, y, 2, shorten(line, max(1, width - 4)), colors["normal"])
-        y += 1
+        y += add_wrapped(win, y, 2, line, colors["normal"], bottom - y)
 
     ramdisk = health.get("ramdisk")
     if isinstance(ramdisk, dict) and y < bottom:
-        add(win, y, 2,
-            shorten(f"RAM disk: {text(ramdisk, 'path', '-')} · {human_bytes(ramdisk.get('free_bytes') or 0)} free / {human_bytes(ramdisk.get('total_bytes') or 0)}",
-                    max(1, width - 4)), colors["normal"])
-        y += 1
+        y += add_wrapped(
+            win, y, 2,
+            f"RAM disk: {text(ramdisk, 'path', '-')} · {human_bytes(ramdisk.get('free_bytes') or 0)} free / {human_bytes(ramdisk.get('total_bytes') or 0)}",
+            colors["normal"], bottom - y)
 
     errors = health.get("last_errors", [])
     if isinstance(errors, list) and errors and y < bottom:
@@ -932,8 +1024,7 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
         for error in errors[-2:]:
             if y >= bottom:
                 break
-            add(win, y, 2, shorten(str(error), max(1, width - 4)), colors["err"])
-            y += 1
+            y += add_wrapped(win, y, 2, str(error), colors["err"], bottom - y)
 
 
 def main(stdscr) -> None:
