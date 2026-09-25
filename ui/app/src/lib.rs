@@ -5593,7 +5593,10 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                  };
                                  view! {
                                      <tr>
-                                         <td>{text(&item, "title", "Comics")}</td>
+                                         <td title=text(&item, "title", "Comics")>{
+                                             let latest = text(&item, "latest_downloaded_title", "");
+                                             if latest.is_empty() { text(&item, "title", "Comics") } else { latest }
+                                         }</td>
                                          <td class="truncate muted" title=source_url.clone()>
                                              <a href=source_url.clone() target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">{friendly_slug(&source_url)}</a>
                                          </td>

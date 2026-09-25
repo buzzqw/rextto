@@ -24,6 +24,7 @@ pub struct ComicMonitored {
     pub save_path: String,
     pub enabled: bool,
     pub last_checked: Option<String>,
+    pub latest_downloaded_title: String,
 }
 
 pub struct ComicsDb {
@@ -972,9 +973,9 @@ impl ComicsDb {
     pub fn list_monitored(&self, enabled_only: bool) -> Result<Vec<ComicMonitored>> {
         let conn = self.conn.lock().unwrap();
         let sql = if enabled_only {
-            "SELECT id,title,tag_url,post_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored WHERE enabled=1 ORDER BY title COLLATE NOCASE"
+            "SELECT m.id,m.title,m.tag_url,m.post_url,m.cover_url,m.publisher,m.description,m.from_date,m.save_path,m.enabled,m.last_checked,COALESCE((SELECT h.title FROM comics_history h WHERE h.monitored_id=m.id ORDER BY h.id DESC LIMIT 1),'') FROM comics_monitored m WHERE m.enabled=1 ORDER BY m.title COLLATE NOCASE"
         } else {
-            "SELECT id,title,tag_url,post_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored ORDER BY title COLLATE NOCASE"
+            "SELECT m.id,m.title,m.tag_url,m.post_url,m.cover_url,m.publisher,m.description,m.from_date,m.save_path,m.enabled,m.last_checked,COALESCE((SELECT h.title FROM comics_history h WHERE h.monitored_id=m.id ORDER BY h.id DESC LIMIT 1),'') FROM comics_monitored m ORDER BY m.title COLLATE NOCASE"
         };
         let mut statement = conn.prepare(sql)?;
         let rows = statement.query_map([], |row| {
@@ -990,6 +991,7 @@ impl ComicsDb {
                 save_path: row.get(8)?,
                 enabled: row.get::<_, i64>(9)? != 0,
                 last_checked: row.get(10)?,
+                latest_downloaded_title: row.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
