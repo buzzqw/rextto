@@ -86,6 +86,27 @@ pub fn parse_source_filters(raw: &str) -> Vec<SourceFilter> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+/// A named, reusable quality profile (Sonarr/Radarr). Titles reference it with
+/// `profile:<name>` in their `quality` field. `allowed` is an ordered list of
+/// resolution buckets (best first); empty means every resolution. `cutoff` is
+/// the resolution at which upgrades stop and `upgrade_allowed` turns upgrades
+/// off entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QualityProfile {
+    pub name: String,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub cutoff: String,
+    #[serde(default = "default_enabled")]
+    pub upgrade_allowed: bool,
+}
+
+/// Parses the `quality_profiles` setting (a JSON array); bad input yields none.
+pub fn parse_quality_profiles(raw: &str) -> Vec<QualityProfile> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibtorrentSettings {
     pub port_min: u16,
@@ -266,6 +287,8 @@ pub struct Config {
     pub size_rules: Vec<crate::policy::SizeRule>,
     #[serde(default)]
     pub min_custom_format_score: Option<i64>,
+    #[serde(default)]
+    pub quality_profiles: Vec<QualityProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -655,6 +678,7 @@ impl Default for Config {
             custom_formats: Vec::new(),
             size_rules: Vec::new(),
             min_custom_format_score: None,
+            quality_profiles: Vec::new(),
         }
     }
 }
@@ -668,6 +692,39 @@ impl Config {
             .filter(|value| !value.is_empty())
             .unwrap_or("it-IT")
             .to_string()
+    }
+
+    /// Opt-in smart episode guard (autobrr): refuse a new episode when a later
+    /// one is already archived. Off by default because it trades off backfill.
+    pub fn smart_episode_guard(&self) -> bool {
+        self.settings
+            .get("smart_episode_guard")
+            .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
+            .unwrap_or(false)
+    }
+
+    /// Delay profile: minutes a series (`series`) or movie (`movie`) release is
+    /// held before grabbing. `0` disables the delay.
+    pub fn delay_minutes(&self, kind: &str) -> i64 {
+        let key = if kind == "movie" {
+            "delay_movies_minutes"
+        } else {
+            "delay_torrent_minutes"
+        };
+        self.settings
+            .get(key)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// A release scoring at least this is grabbed immediately, bypassing the
+    /// delay profile. `0` disables the bypass.
+    pub fn delay_bypass_score(&self) -> i64 {
+        self.settings
+            .get("delay_bypass_score")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0)
     }
 
     /// Default language for acquisitions and rename fallback (e.g. `ita`).
@@ -1003,12 +1060,7 @@ impl Config {
         })
     }
 
-    pub fn quality_allowed(
-        quality: &crate::models::Quality,
-        requirement: &str,
-        language: &str,
-        subtitle: &str,
-    ) -> bool {
+    fn resolution_allowed(quality: &crate::models::Quality, requirement: &str) -> bool {
         let requirement = requirement.to_ascii_lowercase();
         let resolution = |value: &str| {
             ["2160p", "1080p", "720p", "576p", "480p"]
@@ -1024,12 +1076,15 @@ impl Config {
         } else {
             (resolution(&requirement), None)
         };
-        if minimum.is_some_and(|minimum| actual_resolution.is_none_or(|actual| actual < minimum))
-            || maximum
-                .is_some_and(|maximum| actual_resolution.is_none_or(|actual| actual > maximum))
-        {
-            return false;
-        }
+        !(minimum.is_some_and(|minimum| actual_resolution.is_none_or(|actual| actual < minimum))
+            || maximum.is_some_and(|maximum| actual_resolution.is_none_or(|actual| actual > maximum)))
+    }
+
+    fn language_subtitle_allowed(
+        quality: &crate::models::Quality,
+        language: &str,
+        subtitle: &str,
+    ) -> bool {
         let requested = language
             .split(',')
             .map(normalize_language_code)
@@ -1049,15 +1104,85 @@ impl Config {
                 return false;
             }
         }
-        if matches!(subtitle.to_ascii_lowercase().as_str(), "yes" | "true" | "1")
-            && !quality.has_subtitle
-        {
-            return false;
-        }
-        true
+        !(matches!(subtitle.to_ascii_lowercase().as_str(), "yes" | "true" | "1")
+            && !quality.has_subtitle)
     }
 
-    pub fn movie_release_allowed(movie: &MovieConfig, quality: &crate::models::Quality) -> bool {
+    /// Legacy resolution-range semantics, kept static for compatibility with
+    /// tests and callers that have no `Config`.
+    pub fn quality_allowed(
+        quality: &crate::models::Quality,
+        requirement: &str,
+        language: &str,
+        subtitle: &str,
+    ) -> bool {
+        Self::resolution_allowed(quality, requirement)
+            && Self::language_subtitle_allowed(quality, language, subtitle)
+    }
+
+    /// Resolves a named quality profile from a `profile:<name>` requirement, or
+    /// `None` when the requirement is a plain resolution range.
+    pub fn quality_profile(&self, requirement: &str) -> Option<&QualityProfile> {
+        let name = requirement.trim().strip_prefix("profile:")?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.quality_profiles
+            .iter()
+            .find(|profile| profile.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Profile-aware quality gate. A `profile:<name>` requirement enforces the
+    /// profile's ordered allowed resolutions; anything else keeps the legacy
+    /// range/language/subtitle behaviour.
+    fn quality_allowed_with(
+        &self,
+        quality: &crate::models::Quality,
+        requirement: &str,
+        language: &str,
+        subtitle: &str,
+    ) -> bool {
+        if let Some(profile) = self.quality_profile(requirement) {
+            if !profile.allowed.is_empty() {
+                let actual = quality.resolution.trim().trim_end_matches('p');
+                let allowed = profile.allowed.iter().any(|item| {
+                    let item = item.trim().trim_end_matches('p');
+                    item.eq_ignore_ascii_case(actual)
+                });
+                if !allowed {
+                    return false;
+                }
+            }
+            return Self::language_subtitle_allowed(quality, language, subtitle);
+        }
+        Self::quality_allowed(quality, requirement, language, subtitle)
+    }
+
+    /// Whether upgrades are permitted for a title/profile. Defaults to true.
+    pub fn upgrade_allowed(&self, requirement: &str) -> bool {
+        self.quality_profile(requirement)
+            .map(|profile| profile.upgrade_allowed)
+            .unwrap_or(true)
+    }
+
+    /// Resolution rank at which the profile stops upgrading, if configured.
+    pub fn upgrade_cutoff_rank(&self, requirement: &str) -> Option<i32> {
+        let cutoff = self.quality_profile(requirement)?.cutoff.trim().to_ascii_lowercase();
+        if cutoff.is_empty() {
+            return None;
+        }
+        Some(match cutoff.as_str() {
+            "2160p" | "2160" => 6,
+            "1080p" | "1080" => 5,
+            "720p" | "720" => 4,
+            "576p" | "576" => 3,
+            "480p" | "480" => 2,
+            "360p" | "360" => 1,
+            _ => 0,
+        })
+    }
+
+    pub fn movie_release_allowed(&self, movie: &MovieConfig, quality: &crate::models::Quality) -> bool {
         let required_languages = parse_language_requirements(&movie.language_requirements);
         let language = if required_languages.is_empty() {
             parse_language_requirements(&movie.language)
@@ -1065,7 +1190,7 @@ impl Config {
             required_languages
         }
         .join(",");
-        if !Self::quality_allowed(quality, &movie.quality, &language, "") {
+        if !self.quality_allowed_with(quality, &movie.quality, &language, "") {
             return false;
         }
         // "Requisiti sottotitoli" è obbligatorio: una release senza quei
@@ -1127,11 +1252,12 @@ impl Config {
     }
 
     pub fn series_release_allowed(
+        &self,
         series: &SeriesConfig,
         quality: &crate::models::Quality,
         title: &str,
     ) -> bool {
-        if !Self::quality_allowed(quality, &series.quality, &series.language, &series.subtitle) {
+        if !self.quality_allowed_with(quality, &series.quality, &series.language, &series.subtitle) {
             return false;
         }
         series
@@ -1323,6 +1449,9 @@ impl Config {
             } else {
                 value.parse::<i64>().ok()
             };
+        }
+        if let Some(value) = self.settings.get("quality_profiles") {
+            self.quality_profiles = parse_quality_profiles(value);
         }
         if let Some(value) = self.settings.get("_migrated_series") {
             self.series = serde_json::from_str(value).unwrap_or_default();
@@ -2185,11 +2314,11 @@ mod tests {
         let mut italian = crate::models::Quality::default();
         italian.languages = vec!["ita".into()];
         italian.language = "ita".into();
-        assert!(Config::movie_release_allowed(&movie, &italian));
+        assert!(Config::default().movie_release_allowed(&movie, &italian));
         let mut english = crate::models::Quality::default();
         english.languages = vec!["eng".into()];
         english.language = "eng".into();
-        assert!(!Config::movie_release_allowed(&movie, &english));
+        assert!(!Config::default().movie_release_allowed(&movie, &english));
     }
 
     #[test]
@@ -2203,7 +2332,7 @@ mod tests {
         let mut english = crate::models::Quality::default();
         english.languages = vec!["eng".into()];
         english.language = "eng".into();
-        assert!(Config::movie_release_allowed(&movie, &english));
+        assert!(Config::default().movie_release_allowed(&movie, &english));
     }
 
     #[test]
@@ -2221,7 +2350,7 @@ mod tests {
             subtitle: "ita".into(),
             ..Default::default()
         };
-        assert!(Config::movie_release_allowed(&preferred, &base));
+        assert!(Config::default().movie_release_allowed(&preferred, &base));
         assert_eq!(Config::movie_subtitle_bonus(&preferred, &base), 0);
         let mut with_sub = base.clone();
         with_sub.has_subtitle = true;
@@ -2237,8 +2366,8 @@ mod tests {
             subtitle_requirements: "ita".into(),
             ..Default::default()
         };
-        assert!(!Config::movie_release_allowed(&strict, &base));
-        assert!(Config::movie_release_allowed(&strict, &with_sub));
+        assert!(!Config::default().movie_release_allowed(&strict, &base));
+        assert!(Config::default().movie_release_allowed(&strict, &with_sub));
     }
 
     #[test]
@@ -2356,7 +2485,7 @@ mod tests {
             subtitle_requirements: "ita".into(),
             ..Default::default()
         };
-        assert!(Config::movie_release_allowed(
+        assert!(Config::default().movie_release_allowed(
             &movie,
             &crate::models::Quality {
                 language: "eng".into(),
@@ -2366,7 +2495,7 @@ mod tests {
                 ..Default::default()
             }
         ));
-        assert!(!Config::movie_release_allowed(
+        assert!(!Config::default().movie_release_allowed(
             &movie,
             &crate::models::Quality {
                 language: "eng".into(),
@@ -2643,5 +2772,72 @@ mod tests {
         assert_eq!(cfg.series[0].ignored_seasons, vec![2]);
         assert_eq!(cfg.series[0].exclude, "cam");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quality_profiles_gate_resolutions_and_cutoff() {
+        let mut cfg = Config::default();
+        cfg.quality_profiles = vec![QualityProfile {
+            name: "HD".into(),
+            allowed: vec!["1080p".into(), "720p".into()],
+            cutoff: "1080p".into(),
+            upgrade_allowed: true,
+        }];
+        let series = SeriesConfig {
+            name: "Show".into(),
+            quality: "profile:HD".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let hd = crate::models::Quality {
+            resolution: "1080p".into(),
+            ..Default::default()
+        };
+        let uhd = crate::models::Quality {
+            resolution: "2160p".into(),
+            ..Default::default()
+        };
+        assert!(cfg.series_release_allowed(&series, &hd, "Show.S01E01.1080p"));
+        assert!(!cfg.series_release_allowed(&series, &uhd, "Show.S01E01.2160p"));
+        assert!(cfg.upgrade_allowed("profile:HD"));
+        assert_eq!(cfg.upgrade_cutoff_rank("profile:HD"), Some(5));
+        // Unknown profile names fall back to the legacy range behaviour.
+        assert!(Config::quality_allowed(&hd, "1080p", "", ""));
+    }
+
+    #[test]
+    fn quality_profile_can_disable_upgrades() {
+        let mut cfg = Config::default();
+        cfg.quality_profiles = vec![QualityProfile {
+            name: "no-upgrade".into(),
+            allowed: Vec::new(),
+            cutoff: String::new(),
+            upgrade_allowed: false,
+        }];
+        let movie = MovieConfig {
+            name: "Film".into(),
+            year: "2020".into(),
+            quality: "profile:no-upgrade".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(!cfg.upgrade_allowed("profile:no-upgrade"));
+        assert!(cfg.movie_release_allowed(
+            &movie,
+            &crate::models::Quality {
+                resolution: "2160p".into(),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn quality_profiles_load_from_settings() {
+        let raw = r#"[{"name":"4K","allowed":["2160p"],"cutoff":"2160p","upgrade_allowed":false}]"#;
+        let profiles = parse_quality_profiles(raw);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "4K");
+        assert!(!profiles[0].upgrade_allowed);
+        assert!(parse_quality_profiles("not json").is_empty());
     }
 }

@@ -13,6 +13,9 @@ use std::{sync::Arc, time::Duration};
 #[derive(Clone)]
 pub struct Engine {
     client: Client,
+    /// Optional archive DB used to persist the escalating provider backoff.
+    /// `None` in unit tests and read-only tools that never touch a database.
+    db: Option<Arc<std::sync::Mutex<crate::database::Database>>>,
 }
 
 /// A title search fans out again to every configured indexer and web engine.
@@ -43,6 +46,16 @@ impl Engine {
                 .timeout(std::time::Duration::from_secs(75))
                 .build()
                 .expect("http client"),
+            db: None,
+        }
+    }
+
+    /// Engine bound to the archive database so provider backoff survives
+    /// restarts and is shared with the rest of the daemon.
+    pub fn with_db(db: Arc<std::sync::Mutex<crate::database::Database>>) -> Self {
+        Self {
+            db: Some(db),
+            ..Self::new()
         }
     }
 
@@ -75,14 +88,27 @@ impl Engine {
         );
         let mut feed_set = tokio::task::JoinSet::new();
         let mut feed_iter = cfg.feed_urls.clone().into_iter();
+        let provider_db = self.db.clone();
         let schedule_feed = |set: &mut tokio::task::JoinSet<Result<Vec<Release>>>,
                              iter: &mut std::vec::IntoIter<String>| {
             if let Some(url) = iter.next() {
                 let client = self.client.clone();
                 let flaresolverr = flaresolverr.clone();
+                let db = provider_db.clone();
                 let feed = feed_label(&url);
                 let source = feed_source_name(&url);
                 set.spawn(async move {
+                    // Skip sources inside their backoff window instead of
+                    // hammering them once more every cycle.
+                    let blocked = db
+                        .as_ref()
+                        .and_then(|db| db.lock().ok().map(|db| db.provider_blocked("feed", &source)))
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                    if blocked {
+                        tracing::debug!(feed = %feed, "feed skipped (backoff)");
+                        return Ok(Vec::new());
+                    }
                     let result = match tokio::time::timeout(
                         FEED_FETCH_BUDGET,
                         fetch_feed(
@@ -102,10 +128,16 @@ impl Engine {
                             FEED_FETCH_BUDGET.as_secs()
                         )),
                     };
-                    match &result {
+                    let failure = match &result {
                         Ok(items) => {
                             crate::logging::source_ok("feed", &source, items.len());
-                            tracing::debug!(feed = %feed, items = items.len(), "RSS feed analyzed")
+                            tracing::debug!(feed = %feed, items = items.len(), "RSS feed analyzed");
+                            if let Some(db) = db.as_ref() {
+                                if let Ok(db) = db.lock() {
+                                    let _ = db.provider_success("feed", &source);
+                                }
+                            }
+                            None
                         }
                         Err(error) => {
                             let message = crate::utils::redact_url_secrets(&error.to_string());
@@ -117,7 +149,13 @@ impl Engine {
                                 message.clone()
                             };
                             crate::logging::source_fail("feed", &source, &friendly);
-                            tracing::warn!("⚠️ RSS feed unavailable — {feed}: {friendly}")
+                            tracing::warn!("⚠️ RSS feed unavailable — {feed}: {friendly}");
+                            Some(friendly)
+                        }
+                    };
+                    if let (Some(db), Some(error)) = (db.as_ref(), failure) {
+                        if let Ok(db) = db.lock() {
+                            let _ = db.provider_failure("feed", &source, &error);
                         }
                     }
                     result
@@ -184,11 +222,19 @@ impl Engine {
             if let Some((query, ids)) = iter.next() {
                 let client = self.client.clone();
                 let cfg = cfg.clone();
+                let provider_db = provider_db.clone();
                 set.spawn(async move {
                     let started = std::time::Instant::now();
                     let items = match tokio::time::timeout(
                         AUTOMATIC_SEARCH_TIMEOUT,
-                        search_one(&client, &cfg, &query, &ids, None),
+                        search_one_with_db(
+                            &client,
+                            &cfg,
+                            &query,
+                            &ids,
+                            None,
+                            provider_db,
+                        ),
                     )
                     .await
                     {
@@ -225,7 +271,7 @@ impl Engine {
                     .iter()
                     .filter(|release| {
                         cfg.release_allowed(release)
-                            && Config::series_release_allowed(
+                            && cfg.series_release_allowed(
                                 series,
                                 &release.quality,
                                 &release.title,
@@ -241,7 +287,7 @@ impl Engine {
                     .iter()
                     .filter(|release| {
                         cfg.release_allowed(release)
-                            && Config::movie_release_allowed(movie, &release.quality)
+                            && cfg.movie_release_allowed(movie, &release.quality)
                     })
                     .count()
             } else {
@@ -355,7 +401,15 @@ impl Engine {
     /// Ricerca interattiva: gli indexer Torznab restano disponibili per tutta
     /// la loro ricerca, mentre i motori web hanno un budget complessivo breve.
     pub async fn search_query_manual(&self, cfg: &Config, query: &str) -> Vec<Release> {
-        search_one(&self.client, cfg, query, &[], Some(MANUAL_SEARCH_TIMEOUT)).await
+        search_one_with_db(
+            &self.client,
+            cfg,
+            query,
+            &[],
+            Some(MANUAL_SEARCH_TIMEOUT),
+            self.db.clone(),
+        )
+        .await
     }
 
     pub async fn search_query_ids(
@@ -368,7 +422,7 @@ impl Engine {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        search_one(&self.client, cfg, query, &owned, None).await
+        search_one_with_db(&self.client, cfg, query, &owned, None, self.db.clone()).await
     }
 }
 
@@ -378,20 +432,31 @@ impl Default for Engine {
     }
 }
 
-async fn search_one(
+async fn search_one_with_db(
     client: &Client,
     cfg: &Config,
     query: &str,
     external_ids: &[(String, String)],
     web_timeout: Option<Duration>,
+    provider_db: Option<Arc<std::sync::Mutex<crate::database::Database>>>,
 ) -> Vec<Release> {
     let mut all = Vec::new();
+    // Load the disabled set once, then exclude those providers from the fan-out.
+    let blocked = provider_db
+        .as_ref()
+        .and_then(|db| db.lock().ok().map(|db| db.blocked_providers()))
+        .and_then(Result::ok)
+        .unwrap_or_default();
     let indexers = cfg
         .indexers
         .iter()
-        .filter(|indexer| indexer.enabled)
+        .filter(|indexer| {
+            indexer.enabled
+                && !blocked.contains(&("indexer".to_string(), indexer.name.clone()))
+        })
         .cloned()
         .collect::<Vec<_>>();
+    let db = provider_db;
     let web_engines = cfg.websearch_engines.clone();
     let flaresolverr = cfg.flaresolverr_url.clone();
     let indexer_client = client.clone();
@@ -426,12 +491,22 @@ async fn search_one(
             match joined {
                 Ok((name, query, Ok(items))) => {
                     crate::logging::source_ok("indexer", &name, items.len());
+                    if let Some(db) = db.as_ref() {
+                        if let Ok(db) = db.lock() {
+                            let _ = db.provider_success("indexer", &name);
+                        }
+                    }
                     tracing::debug!(indexer = %name, results = items.len(), query, "indexer search completed");
                     results.extend(items);
                 }
                 Ok((name, query, Err(error))) => {
                     let error = crate::utils::redact_url_secrets(&error.to_string());
                     crate::logging::source_fail("indexer", &name, &error);
+                    if let Some(db) = db.as_ref() {
+                        if let Ok(db) = db.lock() {
+                            let _ = db.provider_failure("indexer", &name, &error);
+                        }
+                    }
                     tracing::warn!(indexer = %name, query, error = %error, "indexer search failed");
                 }
                 Err(error) => tracing::warn!(%error, "indexer search task failed"),

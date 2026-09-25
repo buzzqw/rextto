@@ -9,6 +9,7 @@ use std::path::Path;
 const DOWNLOAD_HISTORY_RETENTION_DAYS: i64 = 30;
 
 pub type ReadyPending = (String, String, String, i64, i64);
+pub type ReadyPendingMovie = (String, String, String, Option<i64>);
 pub type SeriesSummary = (String, i64, i64, Option<String>);
 
 pub struct Database {
@@ -58,6 +59,67 @@ pub struct MaintenanceReport {
     pub rescored: usize,
     pub old_cycles_removed: usize,
     pub stale_torrents_removed: usize,
+}
+
+/// Retention knobs for a housekeeping run. `0` disables the corresponding
+/// cleanup so the user can keep as much history as they want.
+#[derive(Debug, Clone)]
+pub struct HousekeepingParams {
+    pub retain_cycles: i64,
+    pub error_age_days: i64,
+    pub seen_days: i64,
+    pub gap_log_days: i64,
+    pub upgrade_backup_days: i64,
+    pub history_days: i64,
+}
+
+impl Default for HousekeepingParams {
+    fn default() -> Self {
+        Self {
+            retain_cycles: 200,
+            error_age_days: 7,
+            seen_days: 30,
+            gap_log_days: 30,
+            upgrade_backup_days: 30,
+            history_days: 0,
+        }
+    }
+}
+
+impl HousekeepingParams {
+    pub fn from_settings(settings: &std::collections::BTreeMap<String, String>) -> Self {
+        let number = |key: &str, default: i64| {
+            settings
+                .get(key)
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+        };
+        let defaults = Self::default();
+        Self {
+            retain_cycles: number("housekeeping_retain_cycles", defaults.retain_cycles)
+                .clamp(1, 100_000),
+            error_age_days: number("housekeeping_error_age_days", defaults.error_age_days).max(1),
+            seen_days: number("housekeeping_seen_days", defaults.seen_days).max(0),
+            gap_log_days: number("housekeeping_gap_log_days", defaults.gap_log_days).max(0),
+            upgrade_backup_days: number(
+                "housekeeping_upgrade_backup_days",
+                defaults.upgrade_backup_days,
+            )
+            .max(0),
+            history_days: number("housekeeping_history_days", defaults.history_days).max(0),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct HousekeepingReport {
+    pub old_cycles_removed: usize,
+    pub stale_torrents_removed: usize,
+    pub seen_removed: usize,
+    pub gap_logs_removed: usize,
+    pub upgrade_backups_removed: usize,
+    pub old_history_removed: usize,
+    pub stale_providers_removed: usize,
 }
 
 /// Counts of what a maintenance run *would* remove, so the UI can preview a
@@ -303,6 +365,39 @@ impl Database {
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, seasons TEXT DEFAULT '1+', quality TEXT DEFAULT '', language TEXT DEFAULT 'ita', enabled INTEGER DEFAULT 1, archive_path TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', aliases TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY, series_id INTEGER NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, title TEXT, quality_score INTEGER NOT NULL DEFAULT 0, is_repack INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, archive_path TEXT, size_bytes INTEGER DEFAULT 0, original_title TEXT, rename_verified INTEGER DEFAULT 0, UNIQUE(series_id, season, episode)); CREATE TABLE IF NOT EXISTS movies (id INTEGER PRIMARY KEY, name TEXT, year INTEGER, title TEXT, quality_score INTEGER DEFAULT 0, magnet_hash TEXT UNIQUE, magnet_link TEXT, downloaded_at TEXT, size_bytes INTEGER DEFAULT 0, removed_at TEXT); CREATE TABLE IF NOT EXISTS pending_downloads (id INTEGER PRIMARY KEY, series_id INTEGER, season INTEGER, episode INTEGER, best_magnet TEXT, best_quality_score INTEGER, ready_at TEXT); CREATE TABLE IF NOT EXISTS cycle_history (id INTEGER PRIMARY KEY, at TEXT NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS torrent_meta (hash TEXT PRIMARY KEY, tag TEXT DEFAULT '', source TEXT DEFAULT '', ui_state TEXT DEFAULT '', progress REAL DEFAULT 0, paused INTEGER DEFAULT 0, total_size INTEGER DEFAULT 0, downloaded INTEGER DEFAULT 0, name TEXT DEFAULT '', kind TEXT DEFAULT '', title TEXT DEFAULT '', series_name TEXT DEFAULT '', season INTEGER, episode INTEGER, year INTEGER, quality_score INTEGER DEFAULT 0, metadata_json TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', completed_at TEXT, processed_path TEXT, error TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_episodes_lookup ON episodes(series_id, season, episode); CREATE INDEX IF NOT EXISTS idx_episodes_magnet ON episodes(magnet_hash); CREATE INDEX IF NOT EXISTS idx_episodes_downloaded ON episodes(downloaded_at); CREATE INDEX IF NOT EXISTS idx_movies_magnet ON movies(magnet_hash); CREATE INDEX IF NOT EXISTS idx_movies_removed ON movies(removed_at); CREATE INDEX IF NOT EXISTS idx_torrent_meta_status ON torrent_meta(status); INSERT INTO schema_meta(key,value,updated_at) VALUES ('schema_version','2',datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at;")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS gap_search_log (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, last_searched_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS series_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode_count INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season)); CREATE TABLE IF NOT EXISTS episode_metadata (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, air_date TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS ignored_episodes (series_name TEXT NOT NULL, season INTEGER NOT NULL, episode INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(series_name,season,episode)); CREATE TABLE IF NOT EXISTS upgrade_backup (new_hash TEXT PRIMARY KEY, payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))); CREATE TABLE IF NOT EXISTS series_status (series_name TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT '', last_air_date TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);")?;
         self.conn.execute_batch("CREATE TABLE IF NOT EXISTS blocklist (magnet_hash TEXT PRIMARY KEY, title TEXT DEFAULT '', reason TEXT DEFAULT '', created_at TEXT NOT NULL);")?;
+        // Movies held back by a delay profile (the series equivalent lives in
+        // `pending_downloads`, extended below with a precise `due_at`).
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_movies (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                year INTEGER,
+                best_magnet TEXT,
+                best_title TEXT,
+                best_quality_score INTEGER DEFAULT 0,
+                first_seen_at TEXT,
+                delay_hours INTEGER DEFAULT 0,
+                due_at TEXT,
+                status TEXT DEFAULT 'pending',
+                downloaded_at TEXT,
+                UNIQUE(name, year)
+            );",
+        )?;
+        // Escalating provider backoff (feeds, indexers): a repeatedly failing
+        // source is disabled for a growing interval instead of retried on every
+        // cycle. Sonarr's `EscalationBackOff` is the reference behaviour.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_status (
+                provider TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                level INTEGER NOT NULL DEFAULT 0,
+                initial_failure TEXT,
+                most_recent_failure TEXT,
+                disabled_till TEXT,
+                last_error TEXT DEFAULT '',
+                PRIMARY KEY(provider, kind)
+            );",
+        )?;
         // Identità della release bloccata (come il legacy `download_blocklist`):
         // hash + serie/stagione/episodio o film/anno, per audit e UI.
         for statement in [
@@ -361,6 +456,7 @@ impl Database {
             "ALTER TABLE pending_downloads ADD COLUMN timeframe_hours INTEGER DEFAULT 0",
             "ALTER TABLE pending_downloads ADD COLUMN status TEXT DEFAULT 'pending'",
             "ALTER TABLE pending_downloads ADD COLUMN downloaded_at TEXT",
+            "ALTER TABLE pending_downloads ADD COLUMN due_at TEXT",
             "ALTER TABLE torrent_meta ADD COLUMN metadata_json TEXT DEFAULT ''",
             "ALTER TABLE torrent_meta ADD COLUMN ui_state TEXT DEFAULT ''",
             "ALTER TABLE torrent_meta ADD COLUMN progress REAL DEFAULT 0",
@@ -388,6 +484,8 @@ impl Database {
             "ALTER TABLE series ADD COLUMN subtitle TEXT DEFAULT ''",
             "ALTER TABLE series ADD COLUMN season_subfolders INTEGER DEFAULT 0",
             "ALTER TABLE series ADD COLUMN exclude TEXT DEFAULT ''",
+            "ALTER TABLE episodes ADD COLUMN media_info_json TEXT DEFAULT ''",
+            "ALTER TABLE movies ADD COLUMN media_info_json TEXT DEFAULT ''",
         ] {
             let _ = self.conn.execute(statement, []);
         }
@@ -417,6 +515,7 @@ impl Database {
             Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF,
             &crate::models::ApprovalContext::default(),
             false,
+            false,
         )
     }
 
@@ -427,7 +526,29 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
-        self.check_series_scored_inner(release, score, min_score_diff, context, false)
+        self.check_series_scored_inner(release, score, min_score_diff, context, false, false)
+    }
+
+    /// Like [`Self::check_series_scored`] but also applies the opt-in smart
+    /// episode guard: refuse a brand-new episode when a later episode/season is
+    /// already archived. Callers must pass `false` for gap-fill candidates, or
+    /// deliberate backfill would be blocked.
+    pub fn check_series_scored_guarded(
+        &self,
+        release: &Release,
+        score: i64,
+        min_score_diff: i64,
+        context: &crate::models::ApprovalContext,
+        smart_episode: bool,
+    ) -> Result<(bool, String)> {
+        self.check_series_scored_inner(
+            release,
+            score,
+            min_score_diff,
+            context,
+            false,
+            smart_episode,
+        )
     }
 
     /// Approvazione dell'azione esplicita “Accoda”. Per questa azione un
@@ -442,7 +563,7 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
-        self.check_series_scored_inner(release, score, min_score_diff, context, true)
+        self.check_series_scored_inner(release, score, min_score_diff, context, true, false)
     }
 
     fn check_series_scored_inner(
@@ -452,6 +573,7 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
         manual: bool,
+        smart_episode: bool,
     ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
@@ -485,6 +607,28 @@ impl Database {
             return Ok((false, "active_episode".into()));
         }
         if !manual && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
+        // Smart episode guard (opt-in, from autobrr): refuse a *brand-new*
+        // episode when a later episode or season is already archived. Upgrades
+        // of an already-present episode and gap-fill candidates are exempt
+        // (the caller passes `smart_episode = false` for gaps), so deliberate
+        // backfill keeps working.
+        if smart_episode {
+            let archived_here: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>''))",
+                params![sid, season, episode],
+                |row| row.get(0),
+            )?;
+            if !archived_here {
+                let later_archived: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=?1 AND (season > ?2 OR (season = ?2 AND episode > ?3)) AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>''))",
+                    params![sid, season, episode],
+                    |row| row.get(0),
+                )?;
+                if later_archived {
+                    return Ok((false, "smart_episode".into()));
+                }
+            }
+        }
         // Considera duplicato solo un episodio già scaricato/archiviato: una
         // riga placeholder (downloaded_at NULL) non deve impedire un retry.
         let same_hash_is_archived: bool = self.conn.query_row(
@@ -524,6 +668,12 @@ impl Database {
         if let Some((id, existing_score, existing_title, archive_path)) = db_row {
             if manual && !archive_path.is_empty() {
                 return Ok((false, "duplicate".into()));
+            }
+            // Quality profile cutoff reached: a real archived file is never
+            // replaced. Only enforced when the file exists on disk, so a
+            // placeholder never blocks the first download.
+            if context.forbid_upgrade && context.archive.best_for(season, episode).is_some() {
+                return Ok((false, "cutoff_reached".into()));
             }
             // legacy upgrade_reason: resolution jump, HDTV→WEB-DL, HDR, first
             // REPACK, or a score gain of at least `min_score_diff`.
@@ -691,10 +841,12 @@ impl Database {
                         }
                         _ => (parse_quality(&existing_title), existing_score),
                     };
-                    if manual || release
-                        .quality
-                        .upgrade_reason(&old_quality, score, old_score, min_score_diff)
-                        .is_some()
+                    if manual
+                        || (release
+                            .quality
+                            .upgrade_reason(&old_quality, score, old_score, min_score_diff)
+                            .is_some()
+                            && !context.forbid_upgrade)
                     {
                         let previous = tx.query_row("SELECT id,series_id,season,episode,title,quality_score,magnet_hash,magnet_link,downloaded_at,archive_path,size_bytes FROM episodes WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "series".into(), row_id: row.get(0)?, series_id: Some(row.get(1)?), series_name: Some(series_name.to_owned()), season: Some(row.get(2)?), episode: Some(row.get(3)?), name: None, year: None, title: row.get::<_, Option<String>>(4)?.unwrap_or_default(), quality_score: row.get(5)?, magnet_hash: row.get(6)?, magnet_link: row.get(7)?, downloaded_at: row.get(8)?, archive_path: row.get(9)?, size_bytes: row.get(10)? }))?;
                         self.save_upgrade_backup(hash, &previous)?;
@@ -774,6 +926,19 @@ impl Database {
         score: i64,
         min_score_diff: i64,
     ) -> Result<(bool, String)> {
+        self.check_movie_scored_with(release, score, min_score_diff, false)
+    }
+
+    /// Like [`Self::check_movie_scored`] but, when `forbid_upgrade` is set and a
+    /// real movie file is already imported, refuses to replace it (quality
+    /// profile with upgrades disabled / cutoff reached).
+    pub fn check_movie_scored_with(
+        &self,
+        release: &Release,
+        score: i64,
+        min_score_diff: i64,
+        forbid_upgrade: bool,
+    ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
             return Ok((false, "blocklisted".into()));
@@ -797,7 +962,12 @@ impl Database {
             self.conn.execute("UPDATE movies SET name=?1,year=?2,title=?1,quality_score=?3,magnet_link=?4,downloaded_at=NULL,removed_at=NULL WHERE id=?5", params![release.title, release.year, score, release.magnet, id])?;
             return Ok((true, "restored".into()));
         }
-        if let Some((id, existing_score, metadata_json)) = self.conn.query_row("SELECT m.id,m.quality_score,COALESCE(t.metadata_json,'') FROM movies m LEFT JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) WHERE m.removed_at IS NULL AND m.name=?1 AND m.year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))).optional()? {
+        if let Some((id, existing_score, metadata_json, downloaded_at)) = self.conn.query_row("SELECT m.id,m.quality_score,COALESCE(t.metadata_json,''),m.downloaded_at FROM movies m LEFT JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) WHERE m.removed_at IS NULL AND m.name=?1 AND m.year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))).optional()? {
+            // Quality profile cutoff reached on a real imported file: never
+            // replace it.
+            if forbid_upgrade && downloaded_at.is_some() {
+                return Ok((false, "cutoff_reached".into()));
+            }
             // The movies row stores the configured clean name (not the original
             // release title). When the original torrent metadata is still
             // available, apply the same hard-upgrade rules as series (4K,
@@ -872,6 +1042,208 @@ impl Database {
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Records a failed source attempt and moves it down the escalation
+    /// schedule. `kind` is `feed` or `indexer`; `provider` is the source name.
+    pub fn provider_failure(&self, kind: &str, provider: &str, error: &str) -> Result<()> {
+        let now = Utc::now();
+        let previous: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT level, most_recent_failure FROM provider_status WHERE provider=?1 AND kind=?2",
+                params![provider, kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let elapsed = previous
+            .as_ref()
+            .and_then(|(_, last)| last.as_deref())
+            .and_then(crate::utils::parse_timestamp)
+            .map(|last| (now - last).num_seconds());
+        let current = previous.map(|(level, _)| level).unwrap_or(0);
+        let level = crate::backoff::next_level(current, elapsed);
+        let disabled_till =
+            now + chrono::Duration::seconds(crate::backoff::period_secs(level));
+        self.conn.execute(
+            "INSERT INTO provider_status(provider,kind,level,initial_failure,most_recent_failure,disabled_till,last_error) \
+             VALUES (?1,?2,?3,?4,?4,?5,?6) \
+             ON CONFLICT(provider,kind) DO UPDATE SET level=excluded.level, \
+             most_recent_failure=excluded.most_recent_failure, disabled_till=excluded.disabled_till, \
+             last_error=excluded.last_error",
+            params![
+                provider,
+                kind,
+                level,
+                now.to_rfc3339(),
+                disabled_till.to_rfc3339(),
+                error
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records a source success: step the escalation level down and lift the
+    /// disabled window. The row is removed entirely once fully recovered.
+    pub fn provider_success(&self, kind: &str, provider: &str) -> Result<()> {
+        let level: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT level FROM provider_status WHERE provider=?1 AND kind=?2",
+                params![provider, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(level) = level else {
+            return Ok(());
+        };
+        let next = crate::backoff::success_level(level);
+        if next <= 0 {
+            self.conn.execute(
+                "DELETE FROM provider_status WHERE provider=?1 AND kind=?2",
+                params![provider, kind],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE provider_status SET level=?3, disabled_till=NULL WHERE provider=?1 AND kind=?2",
+                params![provider, kind, next],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// True while a source is inside its disabled window.
+    pub fn provider_blocked(&self, kind: &str, provider: &str) -> Result<bool> {
+        let disabled: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT disabled_till FROM provider_status WHERE provider=?1 AND kind=?2",
+                params![provider, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(disabled) = disabled else {
+            return Ok(false);
+        };
+        let Some(until) = disabled.and_then(|value| crate::utils::parse_timestamp(&value)) else {
+            return Ok(false);
+        };
+        Ok(until > Utc::now())
+    }
+
+    /// All currently disabled `(kind, provider)` pairs, for the search fan-out
+    /// to skip in one query instead of one per source.
+    pub fn blocked_providers(&self) -> Result<std::collections::HashSet<(String, String)>> {
+        // All timestamps are written by `to_rfc3339()` (UTC, same shape), so a
+        // lexicographic comparison is a valid instant comparison and avoids an
+        // N+1 parse per row.
+        let now = Utc::now().to_rfc3339();
+        let mut statement = self.conn.prepare(
+            "SELECT kind, provider FROM provider_status WHERE disabled_till IS NOT NULL AND disabled_till > ?1",
+        )?;
+        let rows = statement.query_map([&now], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
+    }
+
+    /// Full provider status list for the UI/API.
+    pub fn provider_statuses(&self) -> Result<Vec<crate::models::ProviderStatus>> {
+        let mut statement = self.conn.prepare(
+            "SELECT provider, kind, level, COALESCE(disabled_till,''), \
+             COALESCE(most_recent_failure,''), COALESCE(last_error,'') \
+             FROM provider_status ORDER BY disabled_till DESC, provider ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(crate::models::ProviderStatus {
+                provider: row.get(0)?,
+                kind: row.get(1)?,
+                level: row.get(2)?,
+                disabled_till: row.get(3)?,
+                most_recent_failure: row.get(4)?,
+                last_error: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Clears one provider (or every provider when `provider` is `None`).
+    pub fn clear_provider_status(&self, provider: Option<&str>) -> Result<()> {
+        match provider {
+            Some(provider) => {
+                self.conn.execute(
+                    "DELETE FROM provider_status WHERE provider=?1",
+                    [provider],
+                )?;
+            }
+            None => {
+                self.conn.execute("DELETE FROM provider_status", [])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persists the `ffprobe` result for a release's archived file. Matches the
+    /// row by series/season/episode or movie name/year.
+    pub fn set_media_info(
+        &self,
+        release: &Release,
+        info: &crate::mediainfo::MediaInfo,
+    ) -> Result<()> {
+        let json = serde_json::to_string(info)?;
+        if release.kind == "movie" {
+            self.conn.execute(
+                "UPDATE movies SET media_info_json=?1 WHERE name=?2 AND year IS ?3",
+                params![json, release.title, release.year],
+            )?;
+        } else if let (Some(series), Some(season), Some(episode)) =
+            (release.series.as_deref(), release.season, release.episode)
+        {
+            self.conn.execute(
+                "UPDATE episodes SET media_info_json=?1 WHERE series_id=(SELECT id FROM series WHERE name=?2) AND season=?3 AND episode=?4",
+                params![json, series, season, episode],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn parse_media_info(raw: Option<Option<String>>) -> Option<serde_json::Value> {
+        raw.flatten()
+            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| serde_json::from_str(&value).ok())
+    }
+
+    pub fn episode_media_info(
+        &self,
+        series: &str,
+        season: i64,
+        episode: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT media_info_json FROM episodes WHERE series_id=(SELECT id FROM series WHERE name=?1) AND season=?2 AND episode=?3",
+                params![series, season, episode],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::parse_media_info(raw))
+    }
+
+    pub fn movie_media_info(
+        &self,
+        name: &str,
+        year: Option<i64>,
+    ) -> Result<Option<serde_json::Value>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT media_info_json FROM movies WHERE name=?1 AND year IS ?2",
+                params![name, year],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::parse_media_info(raw))
     }
 
     pub fn is_blocklisted(&self, hash: &str) -> Result<bool> {
@@ -969,13 +1341,15 @@ impl Database {
     }
 
     pub fn queue_pending(&self, release: &Release, timeframe_hours: i64) -> Result<()> {
-        self.queue_pending_scored(release, timeframe_hours, release.quality.score())
+        self.queue_pending_scored(release, timeframe_hours.max(0) * 60, release.quality.score())
     }
 
+    /// Holds a series release for `delay_minutes` (a delay profile). The best
+    /// scoring candidate seen during the window is the one that will be grabbed.
     pub fn queue_pending_scored(
         &self,
         release: &Release,
-        timeframe_hours: i64,
+        delay_minutes: i64,
         quality_score: i64,
     ) -> Result<()> {
         let series_name = release.series.as_deref().unwrap_or(&release.title);
@@ -988,33 +1362,148 @@ impl Database {
             params![series_name],
             |row| row.get(0),
         )?;
+        let now = Utc::now();
+        let due_at = now + chrono::Duration::minutes(delay_minutes.max(0));
         let existing: Option<(i64, i64)> = self.conn.query_row("SELECT id,best_quality_score FROM pending_downloads WHERE series_id=?1 AND season=?2 AND episode=?3 AND status='pending'", params![series_id, release.season, release.episode], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
         if let Some((id, score)) = existing {
             if quality_score > score {
                 self.conn.execute("UPDATE pending_downloads SET best_title=?1,best_quality_score=?2,best_magnet=?3 WHERE id=?4", params![release.title, quality_score, release.magnet, id])?;
             }
         } else {
-            self.conn.execute("INSERT INTO pending_downloads(series_id,season,episode,best_magnet,best_quality_score,ready_at,best_title,first_seen_at,timeframe_hours,status) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?8,'pending')", params![series_id, release.season, release.episode, release.magnet, quality_score, Utc::now().to_rfc3339(), release.title, timeframe_hours])?;
+            self.conn.execute("INSERT INTO pending_downloads(series_id,season,episode,best_magnet,best_quality_score,ready_at,best_title,first_seen_at,timeframe_hours,due_at,status) VALUES (?1,?2,?3,?4,?5,?6,?7,?6,?8,?9,'pending')", params![series_id, release.season, release.episode, release.magnet, quality_score, now.to_rfc3339(), release.title, (delay_minutes.max(0) + 59) / 60, due_at.to_rfc3339()])?;
         }
         Ok(())
     }
 
+    /// Series releases whose delay window has elapsed. `due_at` is authoritative;
+    /// rows written before it existed fall back to `first_seen_at + timeframe_hours`.
     pub fn ready_pending(&self) -> Result<Vec<ReadyPending>> {
-        let mut statement = self.conn.prepare("SELECT s.name,p.best_title,p.best_magnet,p.season,p.episode FROM pending_downloads p JOIN series s ON s.id=p.series_id WHERE p.status='pending' AND s.enabled=1 AND datetime(COALESCE(p.first_seen_at,p.ready_at), '+' || p.timeframe_hours || ' hours') <= datetime('now')")?;
+        let now = Utc::now();
+        let mut statement = self.conn.prepare(
+            "SELECT s.name,p.best_title,p.best_magnet,p.season,p.episode,p.due_at,p.first_seen_at,p.ready_at,p.timeframe_hours \
+             FROM pending_downloads p JOIN series s ON s.id=p.series_id \
+             WHERE p.status='pending' AND s.enabled=1",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut ready = Vec::new();
+        for row in rows {
+            let (name, title, magnet, season, episode, due_at, first_seen, ready_at, hours) = row?;
+            let due = due_at
+                .as_deref()
+                .and_then(crate::utils::parse_timestamp)
+                .or_else(|| {
+                    let base = first_seen.as_deref().or(ready_at.as_deref())?;
+                    let base = crate::utils::parse_timestamp(base)?;
+                    Some(base + chrono::Duration::hours(hours.unwrap_or(0).max(0)))
+                });
+            if due.is_some_and(|due| now >= due) {
+                ready.push((name, title, magnet, season, episode));
+            }
+        }
+        Ok(ready)
     }
 
     pub fn remove_pending(&self, series_name: &str, season: i64, episode: i64) -> Result<()> {
         self.conn.execute("UPDATE pending_downloads SET status='downloaded',downloaded_at=?1 WHERE series_id=(SELECT id FROM series WHERE name=?2) AND season=?3 AND episode=?4 AND status='pending'", params![Utc::now().to_rfc3339(), series_name, season, episode])?;
+        Ok(())
+    }
+
+    /// Holds a movie release for `delay_minutes` (delay profile for movies).
+    pub fn queue_pending_movie_scored(
+        &self,
+        release: &Release,
+        delay_minutes: i64,
+        quality_score: i64,
+    ) -> Result<()> {
+        let name = release.title.clone();
+        let now = Utc::now();
+        let due_at = now + chrono::Duration::minutes(delay_minutes.max(0));
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id,best_quality_score FROM pending_movies WHERE name=?1 AND year IS ?2 AND status='pending'",
+                params![name, release.year],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, score)) = existing {
+            if quality_score > score {
+                self.conn.execute(
+                    "UPDATE pending_movies SET best_title=?1,best_quality_score=?2,best_magnet=?3 WHERE id=?4",
+                    params![release.title, quality_score, release.magnet, id],
+                )?;
+            }
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO pending_movies(name,year,best_magnet,best_quality_score,best_title,first_seen_at,delay_hours,due_at,status) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pending')",
+                params![
+                    name,
+                    release.year,
+                    release.magnet,
+                    quality_score,
+                    release.title,
+                    now.to_rfc3339(),
+                    (delay_minutes.max(0) + 59) / 60,
+                    due_at.to_rfc3339()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Movies whose delay window has elapsed.
+    pub fn ready_pending_movies(&self) -> Result<Vec<ReadyPendingMovie>> {
+        let now = Utc::now();
+        let mut statement = self.conn.prepare(
+            "SELECT name,best_title,best_magnet,year,due_at,first_seen_at,delay_hours \
+             FROM pending_movies WHERE status='pending'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+        let mut ready = Vec::new();
+        for row in rows {
+            let (name, title, magnet, year, due_at, first_seen, hours) = row?;
+            let due = due_at
+                .as_deref()
+                .and_then(crate::utils::parse_timestamp)
+                .or_else(|| {
+                    let base = crate::utils::parse_timestamp(first_seen.as_deref()?)?;
+                    Some(base + chrono::Duration::hours(hours.unwrap_or(0).max(0)))
+                });
+            if due.is_some_and(|due| now >= due) {
+                ready.push((name, title, magnet, year));
+            }
+        }
+        Ok(ready)
+    }
+
+    pub fn remove_pending_movie(&self, name: &str, year: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_movies SET status='downloaded',downloaded_at=?1 WHERE name=?2 AND year IS ?3 AND status='pending'",
+            params![Utc::now().to_rfc3339(), name, year],
+        )?;
         Ok(())
     }
 
@@ -2271,6 +2760,62 @@ impl Database {
             stale_torrents_removed,
         })
     }
+    /// Periodic data hygiene: bounded tables are trimmed and (caller-side, via
+    /// `run_db_action`) the databases are compacted. Sonarr's `HousekeepingService`
+    /// is the reference behaviour. The report is serialisable for the UI/API.
+    pub fn housekeeping(&self, params: &HousekeepingParams) -> Result<HousekeepingReport> {
+        let cleanup = self.cleanup(params.retain_cycles, params.error_age_days)?;
+        let now = Utc::now();
+        let cutoff = |days: i64| {
+            (now - chrono::Duration::days(days.max(0))).to_rfc3339()
+        };
+        let seen_removed = if params.seen_days > 0 {
+            self.prune_seen_older_than(params.seen_days)?
+        } else {
+            0
+        };
+        let gap_logs_removed = if params.gap_log_days > 0 {
+            self.conn.execute(
+                "DELETE FROM gap_search_log WHERE last_searched_at < ?1",
+                [cutoff(params.gap_log_days)],
+            )?
+        } else {
+            0
+        };
+        let upgrade_backups_removed = if params.upgrade_backup_days > 0 {
+            self.conn.execute(
+                "DELETE FROM upgrade_backup WHERE created_at < ?1",
+                [cutoff(params.upgrade_backup_days)],
+            )?
+        } else {
+            0
+        };
+        // Removed-torrent history is only trimmed when the user opts in
+        // (`history_days > 0`): it powers the UI history, so the default keeps it.
+        let old_history_removed = if params.history_days > 0 {
+            self.conn.execute(
+                "DELETE FROM torrent_meta WHERE removed_at IS NOT NULL AND removed_at < ?1",
+                [cutoff(params.history_days)],
+            )?
+        } else {
+            0
+        };
+        // Expired provider backoff rows older than a week are dead state.
+        let stale_providers_removed = self.conn.execute(
+            "DELETE FROM provider_status WHERE disabled_till IS NOT NULL AND disabled_till < ?1",
+            [cutoff(7)],
+        )?;
+        Ok(HousekeepingReport {
+            old_cycles_removed: cleanup.old_cycles_removed,
+            stale_torrents_removed: cleanup.stale_torrents_removed,
+            seen_removed,
+            gap_logs_removed,
+            upgrade_backups_removed,
+            old_history_removed,
+            stale_providers_removed,
+        })
+    }
+
     pub fn count_keyword(&self, keyword: &str) -> Result<i64> {
         self.count_keywords(&[keyword.to_string()])
     }
@@ -3200,6 +3745,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: index,
             live: crate::models::LiveDownloads::default(),
+            forbid_upgrade: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3242,6 +3788,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
+            forbid_upgrade: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3257,6 +3804,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
+            forbid_upgrade: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -4192,6 +4740,366 @@ mod tests {
         // Anche l'episodio atteso, mai materializzato, mostra la data.
         assert_eq!(by_episode(2), "2024-01-08");
         assert_eq!(db.episode_air_dates().unwrap().len(), 2);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn housekeeping_trims_bounded_tables() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-housekeeping-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        for index in 0..5 {
+            db.conn
+                .execute(
+                    "INSERT INTO cycle_history(at,payload_json) VALUES (?1,'{}')",
+                    [format!("2020-01-0{}T00:00:00+00:00", index + 1)],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO gap_search_log(series_name,season,episode,last_searched_at) VALUES ('A',1,1,'2000-01-01T00:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO gap_search_log(series_name,season,episode,last_searched_at) VALUES ('A',1,2,?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO upgrade_backup(new_hash,payload_json,created_at) VALUES ('h1','{}','2000-01-01T00:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+        let report = db
+            .housekeeping(&HousekeepingParams {
+                retain_cycles: 1,
+                error_age_days: 7,
+                seen_days: 0,
+                gap_log_days: 30,
+                upgrade_backup_days: 30,
+                history_days: 0,
+            })
+            .unwrap();
+        assert_eq!(report.old_cycles_removed, 4);
+        assert_eq!(report.gap_logs_removed, 1);
+        assert_eq!(report.upgrade_backups_removed, 1);
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM gap_search_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn media_info_roundtrips_for_episodes_and_movies() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-media-info-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        let info = crate::mediainfo::MediaInfo {
+            video_codec: "hevc".into(),
+            bit_depth: 10,
+            hdr: "HDR10".into(),
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        };
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title) VALUES (?1,1,2,'Show.S01E02')",
+                [series_id],
+            )
+            .unwrap();
+        let mut release = release();
+        release.kind = "series".into();
+        release.series = Some("Show".into());
+        release.season = Some(1);
+        release.episode = Some(2);
+        db.set_media_info(&release, &info).unwrap();
+        let stored = db.episode_media_info("Show", 1, 2).unwrap().unwrap();
+        assert_eq!(stored["hdr"], "HDR10");
+        assert_eq!(stored["bit_depth"], 10);
+
+        // A movie matches by name/year.
+        let mut movie = release.clone();
+        movie.kind = "movie".into();
+        movie.title = "The Film".into();
+        movie.year = Some(2026);
+        movie.series = None;
+        movie.season = None;
+        movie.episode = None;
+        db.conn
+            .execute(
+                "INSERT INTO movies(name,year,title) VALUES ('The Film',2026,'The Film')",
+                [],
+            )
+            .unwrap();
+        db.set_media_info(&movie, &info).unwrap();
+        let stored = db.movie_media_info("The Film", Some(2026)).unwrap().unwrap();
+        assert_eq!(stored["video_codec"], "hevc");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn delay_pending_waits_for_the_due_time() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-delay-pending-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+
+        let mut series = release();
+        series.kind = "series".into();
+        series.series = Some("Show".into());
+        series.season = Some(1);
+        series.episode = Some(1);
+
+        // Zero delay is immediately ready.
+        db.queue_pending_scored(&series, 0, 100).unwrap();
+        assert_eq!(db.ready_pending().unwrap().len(), 1);
+        db.remove_pending("Show", 1, 1).unwrap();
+        assert!(db.ready_pending().unwrap().is_empty());
+
+        // A 60-minute delay is not ready yet, and a better candidate replaces
+        // the stored magnet/score while waiting.
+        db.queue_pending_scored(&series, 60, 100).unwrap();
+        assert!(db.ready_pending().unwrap().is_empty());
+        let mut better = series.clone();
+        better.title = "Show.S01E01.better".into();
+        better.magnet = "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        db.queue_pending_scored(&better, 60, 500).unwrap();
+        let score: i64 = db
+            .conn
+            .query_row(
+                "SELECT best_quality_score FROM pending_downloads WHERE season=1 AND episode=1 AND status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(score, 500);
+
+        // Movies use their own table.
+        let mut movie = release();
+        movie.kind = "movie".into();
+        movie.title = "The Film".into();
+        movie.year = Some(2026);
+        db.queue_pending_movie_scored(&movie, 0, 200).unwrap();
+        assert_eq!(db.ready_pending_movies().unwrap().len(), 1);
+        db.remove_pending_movie("The Film", Some(2026)).unwrap();
+        assert!(db.ready_pending_movies().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn quality_profile_cutoff_blocks_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-profile-cutoff-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path) \
+                 VALUES (?1,1,1,'Show.S01E01.1080p',1000,'2024-01-01T00:00:00+00:00','/nas/e1.mkv')",
+                [series_id],
+            )
+            .unwrap();
+
+        let mut candidate = release();
+        candidate.kind = "series".into();
+        candidate.series = Some("Show".into());
+        candidate.season = Some(1);
+        candidate.episode = Some(1);
+        candidate.is_pack = false;
+        candidate.quality = Quality {
+            resolution: "2160p".into(),
+            source: "webdl".into(),
+            ..Default::default()
+        };
+        let score = candidate.quality.score();
+
+        let mut index = crate::models::ArchiveQualityIndex::default();
+        index.best.insert(
+            (1, 1),
+            (
+                Quality {
+                    resolution: "1080p".into(),
+                    ..Default::default()
+                },
+                1000,
+            ),
+        );
+        // Without the cutoff the 2160p release would be an upgrade.
+        let allowed_context = crate::models::ApprovalContext {
+            archive: index.clone(),
+            live: Default::default(),
+            forbid_upgrade: false,
+        };
+        let (approved, reason) = db
+            .check_series_scored(&candidate, score, 200, &allowed_context)
+            .unwrap();
+        assert!(approved, "expected upgrade, got {reason}");
+
+        // Reset the row to its archived 1080p state, then forbid upgrades.
+        db.conn
+            .execute(
+                "UPDATE episodes SET title='Show.S01E01.1080p', quality_score=1000, magnet_hash=NULL, downloaded_at='2024-01-01T00:00:00+00:00', archive_path='/nas/e1.mkv' WHERE series_id=?1 AND season=1 AND episode=1",
+                [series_id],
+            )
+            .unwrap();
+        let cutoff_context = crate::models::ApprovalContext {
+            archive: index,
+            live: Default::default(),
+            forbid_upgrade: true,
+        };
+        let (approved, reason) = db
+            .check_series_scored(&candidate, score, 200, &cutoff_context)
+            .unwrap();
+        assert!(!approved);
+        assert_eq!(reason, "cutoff_reached");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn smart_episode_guard_blocks_only_when_enabled() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-smart-episode-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        // A later episode is already archived on the NAS.
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path) \
+                 VALUES (?1,1,5,'Show.S01E05',1000,'2024-01-01T00:00:00+00:00','/nas/e5.mkv')",
+                [series_id],
+            )
+            .unwrap();
+
+        let mut candidate = release();
+        candidate.kind = "series".into();
+        candidate.series = Some("Show".into());
+        candidate.season = Some(1);
+        candidate.episode = Some(1);
+        candidate.is_pack = false;
+        let score = candidate.quality.score();
+
+        // Guard disabled (default): the earlier episode is approved.
+        let (approved, reason) = db
+            .check_series_scored(&candidate, score, 200, &crate::models::ApprovalContext::default())
+            .unwrap();
+        assert!(approved, "expected approval, got {reason}");
+        db.conn
+            .execute("DELETE FROM episodes WHERE series_id=?1 AND season=1 AND episode=1", [series_id])
+            .unwrap();
+
+        // Guard enabled: the earlier episode is refused because a later one
+        // is already archived.
+        let (approved, reason) = db
+            .check_series_scored_guarded(
+                &candidate,
+                score,
+                200,
+                &crate::models::ApprovalContext::default(),
+                true,
+            )
+            .unwrap();
+        assert!(!approved);
+        assert_eq!(reason, "smart_episode");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn provider_backoff_escalates_and_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-provider-status-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        assert!(!db.provider_blocked("indexer", "Prowlarr").unwrap());
+        assert!(db.blocked_providers().unwrap().is_empty());
+
+        // First failure disables the provider.
+        db.provider_failure("indexer", "Prowlarr", "HTTP 503")
+            .unwrap();
+        assert!(db.provider_blocked("indexer", "Prowlarr").unwrap());
+        assert!(db
+            .blocked_providers()
+            .unwrap()
+            .contains(&("indexer".to_string(), "Prowlarr".to_string())));
+        let statuses = db.provider_statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].level, 1);
+        assert_eq!(statuses[0].last_error, "HTTP 503");
+
+        // A success steps the level down and clears the block.
+        db.provider_success("indexer", "Prowlarr").unwrap();
+        assert!(!db.provider_blocked("indexer", "Prowlarr").unwrap());
+        assert!(db.provider_statuses().unwrap().is_empty());
+
+        // Manual reset clears everything.
+        db.provider_failure("feed", "https://example.test/rss", "timeout")
+            .unwrap();
+        db.clear_provider_status(None).unwrap();
+        assert!(db.provider_statuses().unwrap().is_empty());
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

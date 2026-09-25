@@ -6187,7 +6187,65 @@ fn ReleasePolicyView(data: RwSignal<Data>) -> impl IntoView {
             <EventHooksPanel />
 
             <WatchedFoldersPanel />
+
+            <QualityProfilesPanel />
         </div>
+    }
+}
+
+#[component]
+fn QualityProfilesPanel() -> impl IntoView {
+    let profiles = RwSignal::new(Vec::<Value>::new());
+    let message = RwSignal::new(String::new());
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(value) = get("/api/quality-profiles").await {
+                profiles.set(array(&value, "items"));
+            }
+        });
+    });
+    view! {
+        <Panel title="Profili qualità">
+            <p class="hint">{ctx_tr("Profili di qualità riutilizzabili. In un titolo, scrivi profile:Nome nel campo qualità per usare un profilo. \"Consentite\" è una lista ordinata di risoluzioni (es. 2160p, 1080p, 720p); vuota = tutte. Il cutoff è la risoluzione oltre cui non si aggiorna più.")}</p>
+            <div class="stack">
+                {move || profiles.get().iter().enumerate().map(|(index, profile)| {
+                    let upgrade_allowed = flag(profile, "upgrade_allowed", true);
+                    view! {
+                        <section class="setting-group">
+                            <h4>{raw(profile, "name", "Profilo")}</h4>
+                            <div class="setting-group-body">
+                                <div class="field"><span>{ctx_tr("Nome")}</span>
+                                    <input prop:value=raw(profile, "name", "") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["name"] = Value::String(value); } }); } />
+                                </div>
+                                <div class="field"><span>{ctx_tr("Risoluzioni consentite (separate da virgola)")}</span>
+                                    <input prop:value=policy_csv(profile, "allowed") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { policy_set_csv(item, "allowed", &value); } }); } />
+                                </div>
+                                <div class="field"><span>{ctx_tr("Cutoff (risoluzione, vuoto = nessuno)")}</span>
+                                    <input prop:value=raw(profile, "cutoff", "") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["cutoff"] = Value::String(value); } }); } />
+                                </div>
+                                <label class="check-inline"><input type="checkbox" prop:checked=upgrade_allowed on:change=move |event| { let value = event_target_checked(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["upgrade_allowed"] = Value::Bool(value); } }); } />{ctx_tr("Consenti aggiornamenti")}</label>
+                                <div class="toolbar">
+                                    <button class="btn sm danger" on:click=move |_| profiles.update(|items| { if index < items.len() { items.remove(index); } })>{ctx_tr("Rimuovi profilo")}</button>
+                                </div>
+                            </div>
+                        </section>
+                    }
+                }).collect_view()}
+            </div>
+            <div class="toolbar">
+                <button class="btn sm" on:click=move |_| profiles.update(|items| items.push(json!({"name":"Nuovo profilo","allowed":[],"cutoff":"","upgrade_allowed":true})))>{ctx_tr("Aggiungi profilo")}</button>
+                <button class="btn primary" on:click=move |_| {
+                    let payload = Value::Array(profiles.get());
+                    spawn_local(async move {
+                        match send("POST", "/api/quality-profiles", Some(payload)).await {
+                            Ok(_) => message.set("Profili salvati".into()),
+                            Err(error) => message.set(error),
+                        }
+                    });
+                }>{ctx_tr("Salva profili")}</button>
+                <small class="muted">{move || message.get()}</small>
+            </div>
+        </Panel>
     }
 }
 
@@ -6351,7 +6409,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
         <div class="view">
             <SettingsSaveBar />
             <div class="tabs">
-                {[("daemon","Daemon"),("sources","Sorgenti"),("libtorrent","Libtorrent"),("scores","Punteggi"),("rename","Rinomina"),("advanced","Avanzate"),("notify","Notifiche"),("paths","Percorsi"),("i18n","Traduzioni")].into_iter().map(|(id, label)| view! {
+                {[("daemon","Daemon"),("sources","Sorgenti"),("libtorrent","Libtorrent"),("scores","Punteggi"),("rename","Rinomina"),("advanced","Avanzate"),("acquisition","Acquisizione"),("notify","Notifiche"),("paths","Percorsi"),("i18n","Traduzioni")].into_iter().map(|(id, label)| view! {
                     <button class="tab" class:active=move || tab.get() == id on:click=move |_| tab.set(id.into())>{ctx_tr(label)}</button>
                 }).collect_view()}
             </div>
@@ -6379,6 +6437,24 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                     <TextSetting label="Verifica rinomina (ore)" setting_key="rename_verify_interval" value=Signal::derive(move || raw(&data.get().config, "rename_verify_interval", "6")) placeholder="6" />
                     <BooleanSetting label="Sposta gli episodi/pack in archivio (non copiare)" setting_key="move_episodes" value=Signal::derive(move || raw(&data.get().config, "move_episodes", "false")) />
                     <BooleanSetting label="Debug (log dettagliati)" setting_key="debug_enabled" value=Signal::derive(move || raw(&data.get().config, "debug_enabled", "false")) />
+                </Panel>
+            </Show>
+            <Show when=move || tab.get() == "acquisition">
+                <Panel title="Acquisizione automatica">
+                    <p class="muted">{ctx_tr("Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. I profili qualità e le regole release si gestiscono nella pagina Automazione.")}</p>
+                    <TextSetting label="Delay serie (minuti, 0 = nessuno)" setting_key="delay_torrent_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_torrent_minutes", "0")) placeholder="0" />
+                    <TextSetting label="Delay film (minuti, 0 = nessuno)" setting_key="delay_movies_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_movies_minutes", "0")) placeholder="0" />
+                    <TextSetting label="Bypassa il delay sopra questo punteggio (0 = mai)" setting_key="delay_bypass_score" value=Signal::derive(move || raw(&data.get().config, "delay_bypass_score", "0")) placeholder="0" />
+                    <BooleanSetting label="Smart episode: non riscaricare un episodio se ne esiste uno successivo" setting_key="smart_episode_guard" value=Signal::derive(move || raw(&data.get().config, "smart_episode_guard", "false")) />
+                    <BooleanSetting label="Housekeeping periodico attivo" setting_key="housekeeping_enabled" value=Signal::derive(move || raw(&data.get().config, "housekeeping_enabled", "true")) />
+                    <TextSetting label="Housekeeping — intervallo (ore)" setting_key="housekeeping_interval_hours" value=Signal::derive(move || raw(&data.get().config, "housekeeping_interval_hours", "24")) placeholder="24" />
+                    <TextSetting label="Housekeeping — cicli conservati" setting_key="housekeeping_retain_cycles" value=Signal::derive(move || raw(&data.get().config, "housekeeping_retain_cycles", "200")) placeholder="200" />
+                    <TextSetting label="Housekeeping — visti nel feed (giorni, 0 = mai)" setting_key="housekeeping_seen_days" value=Signal::derive(move || raw(&data.get().config, "housekeeping_seen_days", "30")) placeholder="30" />
+                    <TextSetting label="Housekeeping — storico download (giorni, 0 = conserva)" setting_key="housekeeping_history_days" value=Signal::derive(move || raw(&data.get().config, "housekeeping_history_days", "0")) placeholder="0" />
+                    <div class="toolbar" style="margin-top:12px">
+                        <button class="btn" title=ctx_tr("Esegue subito pulizia tabelle e compattazione dei database") on:click=move |_| { run_post(data, "/api/maintenance/housekeeping", None, "Housekeeping completato"); }>{ctx_tr("Esegui housekeeping ora")}</button>
+                        <button class="btn" title=ctx_tr("Azzera i periodi di disattivazione di tutte le sorgenti") on:click=move |_| { run_post(data, "/api/providers/status", Some(json!({})), "Backoff sorgenti azzerato"); }>{ctx_tr("Azzera backoff sorgenti")}</button>
+                    </div>
                 </Panel>
             </Show>
             <Show when=move || tab.get() == "sources">

@@ -34,19 +34,50 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn rextto_lt_destroy(session: *mut c_void);
     fn rextto_lt_version(output: *mut c_char, output_size: usize);
-    fn rextto_lt_add(
-        session: *mut c_void,
-        magnet: *const c_char,
-        save_path: *const c_char,
-        error: *mut c_char,
-        error_size: usize,
-    ) -> i32;
     fn rextto_lt_add_file(
         session: *mut c_void,
         torrent_path: *const c_char,
         save_path: *const c_char,
         hash: *mut c_char,
         hash_size: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_add_ex(
+        session: *mut c_void,
+        magnet: *const c_char,
+        save_path: *const c_char,
+        flags: i32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_add_file_ex(
+        session: *mut c_void,
+        torrent_path: *const c_char,
+        save_path: *const c_char,
+        flags: i32,
+        hash: *mut c_char,
+        hash_size: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_set_torrent_sequential(
+        session: *mut c_void,
+        hash: *const c_char,
+        enabled: i32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_queue_top(
+        session: *mut c_void,
+        hash: *const c_char,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_set_first_last(
+        session: *mut c_void,
+        hash: *const c_char,
+        enabled: i32,
         error: *mut c_char,
         error_size: usize,
     ) -> i32;
@@ -400,10 +431,45 @@ fn native_state(state: i32, paused: bool) -> String {
     .into()
 }
 
+/// Options applied when a torrent is added. Ported from qBittorrent's rich
+/// `AddTorrentParams`: the add pipeline used to be hard-coded to
+/// `(magnet, save_path)`, which kept several features out of reach.
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    /// Add the torrent in pause (no data transfer until resumed).
+    pub paused: bool,
+    /// Per-torrent sequential download.
+    pub sequential: bool,
+    /// Assume the data is already complete and skip the hash check
+    /// (`seed_mode`), i.e. qBittorrent's "skip hash check".
+    pub seed_mode: bool,
+    /// Move the torrent to the top of the queue.
+    pub queue_top: bool,
+    /// Prioritise the first and last piece of every file.
+    pub first_last: bool,
+    /// Pause automatically as soon as metadata is received (metadata-only add:
+    /// fetch just the `.torrent`, let Rextto decide, then resume).
+    pub stop_at_metadata: bool,
+}
+
+impl AddOptions {
+    /// Bitmask consumed by the native `*_ex` entry points.
+    pub fn flags(&self) -> i32 {
+        (self.paused as i32)
+            | (self.sequential as i32) << 1
+            | (self.seed_mode as i32) << 2
+            | (self.queue_top as i32) << 3
+    }
+}
+
 #[derive(Debug)]
 pub struct LibtorrentClient {
     torrents: RwLock<BTreeMap<String, TorrentView>>,
     stalled: RwLock<HashSet<String>>,
+    /// Torrents waiting for metadata to apply first/last piece priorities.
+    first_last_pending: RwLock<HashSet<String>>,
+    /// Torrents to pause as soon as metadata arrives (metadata-only adds).
+    stop_at_metadata: RwLock<HashSet<String>>,
     session: Option<NativeSession>,
     config_db: PathBuf,
     state_dir: PathBuf,
@@ -554,6 +620,8 @@ impl LibtorrentClient {
         let client = Self {
             torrents: RwLock::new(BTreeMap::new()),
             stalled: RwLock::new(HashSet::new()),
+            first_last_pending: RwLock::new(HashSet::new()),
+            stop_at_metadata: RwLock::new(HashSet::new()),
             session,
             config_db: cfg.data_dir.join("rextto_config.db"),
             state_dir: cfg.state_dir.clone(),
@@ -803,6 +871,17 @@ impl LibtorrentClient {
         cfg: &Config,
         preferred_path: Option<&std::path::Path>,
     ) -> Result<bool> {
+        self.add_with_options(magnet, cfg, preferred_path, &AddOptions::default())
+    }
+
+    /// Adds a magnet with explicit [`AddOptions`].
+    pub fn add_with_options(
+        &self,
+        magnet: &str,
+        cfg: &Config,
+        preferred_path: Option<&std::path::Path>,
+        options: &AddOptions,
+    ) -> Result<bool> {
         let clean = sanitize_magnet(magnet, None).context("invalid magnet")?;
         let hash = magnet_hash(&clean).context("missing info hash")?;
         if self.torrents.read().unwrap().contains_key(&hash) {
@@ -818,10 +897,11 @@ impl LibtorrentClient {
             let save_path = CString::new(save_path.to_string_lossy().as_bytes())?;
             let mut error = [0_i8; 512];
             let added = unsafe {
-                rextto_lt_add(
+                rextto_lt_add_ex(
                     session.0,
                     magnet.as_ptr(),
                     save_path.as_ptr(),
+                    options.flags(),
                     error.as_mut_ptr(),
                     error.len(),
                 )
@@ -835,6 +915,7 @@ impl LibtorrentClient {
         } else {
             bail!("libtorrent session is unavailable");
         }
+        self.register_deferred_options(&hash, &clean, options);
         self.clear_stalled(&hash);
         self.torrents.write().unwrap().insert(
             hash.clone(),
@@ -903,6 +984,41 @@ impl LibtorrentClient {
         Ok(Some(native_string(&hash)))
     }
 
+    /// Like [`Self::add_torrent_file`] but applies [`AddOptions`] at add time.
+    pub fn add_torrent_file_ex(
+        &self,
+        torrent_path: &std::path::Path,
+        save_path: &std::path::Path,
+        options: &AddOptions,
+    ) -> Result<Option<String>> {
+        let Some(session) = &self.session else {
+            return Ok(None);
+        };
+        let torrent_path = CString::new(torrent_path.to_string_lossy().as_bytes())?;
+        let save_path = CString::new(save_path.to_string_lossy().as_bytes())?;
+        let mut hash = [0_i8; 65];
+        let mut error = [0_i8; 512];
+        let added = unsafe {
+            rextto_lt_add_file_ex(
+                session.0,
+                torrent_path.as_ptr(),
+                save_path.as_ptr(),
+                options.flags(),
+                hash.as_mut_ptr(),
+                hash.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if added == 0 {
+            bail!(
+                "libtorrent torrent-file add failed: {}",
+                native_error(&error)
+            );
+        }
+        Ok(Some(native_string(&hash)))
+    }
+
     /// Aggiunge un `.torrent` da file scegliendo la cartella come
     /// [`Self::add_with_path`]. Usato dai feed RSS che espongono solo il
     /// download `.torrent`: i tracker privati richiedono il file per l'announce.
@@ -912,19 +1028,157 @@ impl LibtorrentClient {
         cfg: &Config,
         preferred_path: Option<&std::path::Path>,
     ) -> Result<bool> {
+        self.add_file_with_options(torrent_path, cfg, preferred_path, &AddOptions::default())
+    }
+
+    /// Adds a `.torrent` file with explicit [`AddOptions`].
+    pub fn add_file_with_options(
+        &self,
+        torrent_path: &std::path::Path,
+        cfg: &Config,
+        preferred_path: Option<&std::path::Path>,
+        options: &AddOptions,
+    ) -> Result<bool> {
         let save_path = preferred_path
             .filter(|path| path.is_dir())
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| Self::preferred_download_path(cfg));
         fs::create_dir_all(&save_path)?;
-        match self.add_torrent_file(torrent_path, &save_path)? {
-            Some(_) => Ok(true),
+        match self.add_torrent_file_ex(torrent_path, &save_path, options)? {
+            Some(hash) => {
+                self.register_deferred_options(&hash, "", options);
+                Ok(true)
+            }
             None if self.dry_run => {
                 tracing::info!("dry-run: torrent file accepted, not started");
                 Ok(true)
             }
             None => Ok(false),
         }
+    }
+
+    /// Records options that can only be applied once metadata is available
+    /// (first/last piece priorities) or as soon as it arrives (metadata-only
+    /// adds). `.torrent` adds have metadata immediately but the periodic
+    /// enforcement below covers both cases uniformly.
+    fn register_deferred_options(&self, hash: &str, name: &str, options: &AddOptions) {
+        let hash = hash.to_ascii_lowercase();
+        if options.first_last {
+            self.first_last_pending.write().unwrap().insert(hash.clone());
+        }
+        if options.stop_at_metadata {
+            self.stop_at_metadata.write().unwrap().insert(hash.clone());
+        }
+        if options.sequential {
+            if let Err(error) = self.set_torrent_sequential(&hash, true) {
+                tracing::debug!(%error, %name, "could not apply sequential option");
+            }
+        }
+    }
+
+    /// Applies pending first/last priorities and metadata-only pauses. Called
+    /// by the torrent event worker with the latest status snapshot.
+    pub fn enforce_deferred_options(&self, torrents: &[TorrentView]) {
+        let pending_first_last: Vec<String> = self
+            .first_last_pending
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let pending_stop: Vec<String> = self
+            .stop_at_metadata
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        if pending_first_last.is_empty() && pending_stop.is_empty() {
+            return;
+        }
+        for torrent in torrents {
+            if !torrent.has_metadata {
+                continue;
+            }
+            if pending_first_last.contains(&torrent.hash) {
+                self.first_last_pending.write().unwrap().remove(&torrent.hash);
+                if let Err(error) = self.set_first_last(&torrent.hash, true) {
+                    tracing::debug!(hash = %torrent.hash, %error, "first/last piece priorities unavailable");
+                } else {
+                    tracing::debug!(hash = %torrent.hash, "first/last piece priorities applied");
+                }
+            }
+            if pending_stop.contains(&torrent.hash) {
+                self.stop_at_metadata.write().unwrap().remove(&torrent.hash);
+                if torrent.state != "paused" {
+                    if let Err(error) = self.pause(&torrent.hash) {
+                        tracing::debug!(hash = %torrent.hash, %error, "metadata-only pause failed");
+                    } else {
+                        tracing::info!(hash = %torrent.hash, name = %torrent.name, "⏸️ metadata received, torrent paused (metadata-only add)");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-torrent sequential download (qBittorrent option).
+    pub fn set_torrent_sequential(&self, hash: &str, enabled: bool) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_set_torrent_sequential(
+                session.0,
+                hash.as_ptr(),
+                enabled as i32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent sequential failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Moves a torrent to the top of the queue.
+    pub fn queue_top(&self, hash: &str) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_queue_top(session.0, hash.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        if ok == 0 {
+            bail!("libtorrent queue top failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Prioritises the first and last piece of every file (qBittorrent option).
+    pub fn set_first_last(&self, hash: &str, enabled: bool) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_set_first_last(
+                session.0,
+                hash.as_ptr(),
+                enabled as i32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent first/last failed: {}", native_error(&error));
+        }
+        Ok(true)
     }
 
     /// Come [`Self::add_file_with_path`], ma restituisce l'infohash del torrent
@@ -1588,6 +1842,22 @@ fn effective_listen_interfaces(lt: &LibtorrentSettings) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn add_options_encode_into_native_flags() {
+        assert_eq!(AddOptions::default().flags(), 0);
+        let options = AddOptions {
+            paused: true,
+            sequential: true,
+            seed_mode: true,
+            queue_top: true,
+            first_last: true,
+            stop_at_metadata: true,
+        };
+        // paused=1, sequential=2, seed_mode=4, queue_top=8. first_last and
+        // stop_at_metadata are applied later and are not add-time flags.
+        assert_eq!(options.flags(), 1 | 2 | 4 | 8);
+    }
 
     #[test]
     fn ramdisk_capacity_respects_threshold_margin_and_reservations() {

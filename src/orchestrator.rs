@@ -209,6 +209,26 @@ pub async fn run_cycle_domain(
             releases.push(release);
         }
     }
+    // Movies held back by a delay profile.
+    for (_name, title, magnet, _year) in db.lock().unwrap().ready_pending_movies()? {
+        if let Some(release) = parse_release(&title, &magnet, "delay") {
+            if !cfg.release_allowed(&release) {
+                continue;
+            }
+            if let Some(hash) = magnet_hash(&release.magnet) {
+                if db
+                    .lock()
+                    .unwrap()
+                    .is_blocklisted(&hash)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                ready_pending.insert(hash);
+            }
+            releases.push(release);
+        }
+    }
     if domain != Some("movies") {
         refresh_series_metadata(cfg, db).await;
     }
@@ -414,7 +434,7 @@ pub async fn run_cycle_domain(
                 // Not monitored: never log these, they are pure noise.
                 continue;
             };
-            if !Config::series_release_allowed(series, &release.quality, &release.title) {
+            if !cfg.series_release_allowed(series, &release.quality, &release.title) {
                 log_candidate_rejected(
                     &release,
                     "excluded by the series quality/language/exclude rules",
@@ -427,7 +447,7 @@ pub async fn run_cycle_domain(
                 // Not monitored: never log these, they are pure noise.
                 continue;
             };
-            if !Config::movie_release_allowed(movie, &release.quality) {
+            if !cfg.movie_release_allowed(movie, &release.quality) {
                 log_candidate_rejected(
                     &release,
                     "excluded by the movie quality/language/subtitle rules",
@@ -606,23 +626,58 @@ pub async fn run_cycle_domain(
         reconcile_pack_identity_from_magnet(&mut release);
         let is_ready_pending =
             magnet_hash(&release.magnet).is_some_and(|hash| ready_pending.contains(&hash));
-        if release.kind == "series" {
+        // A candidate that fills a known archive gap, or that scores above the
+        // bypass threshold, is never held by a delay profile.
+        let is_gap = match (release.series.as_deref(), release.season, release.episode) {
+            (Some(series), Some(season), Some(episode)) => {
+                gap_targets.contains(&(series.to_string(), season, episode))
+            }
+            _ => false,
+        };
+        let bypass_delay = is_gap
+            || (cfg.delay_bypass_score() > 0
+                && cfg.release_score(&release) >= cfg.delay_bypass_score());
+        if release.kind == "series" && !is_ready_pending {
             if let Some(series) = release
                 .series
                 .as_deref()
                 .and_then(|name| cfg.find_series_match(name, release.season))
             {
-                if series.timeframe > 0 && !is_ready_pending {
+                // Per-series `timeframe` (hours) wins over the global setting.
+                let delay_minutes = if series.timeframe > 0 {
+                    series.timeframe.saturating_mul(60)
+                } else {
+                    cfg.delay_minutes("series")
+                };
+                if delay_minutes > 0 && !bypass_delay {
                     tracing::info!(
                         target = %release_target(&release),
-                        timeframe_hours = series.timeframe,
-                        "queued for timeframe"
+                        delay_minutes,
+                        "queued for delay"
                     );
-                    db.lock()
-                        .unwrap()
-                        .queue_pending_scored(&release, series.timeframe, cfg.release_score(&release))?;
+                    db.lock().unwrap().queue_pending_scored(
+                        &release,
+                        delay_minutes,
+                        cfg.release_score(&release),
+                    )?;
                     continue;
                 }
+            }
+        }
+        if release.kind == "movie" && !is_ready_pending {
+            let delay_minutes = cfg.delay_minutes("movie");
+            if delay_minutes > 0 && !bypass_delay {
+                tracing::info!(
+                    target = %release_target(&release),
+                    delay_minutes,
+                    "movie queued for delay"
+                );
+                db.lock().unwrap().queue_pending_movie_scored(
+                    &release,
+                    delay_minutes,
+                    cfg.release_score(&release),
+                )?;
+                continue;
             }
         }
         // Archive index (per series, computed once per cycle): decisions also
@@ -651,18 +706,53 @@ pub async fn run_cycle_domain(
         } else {
             empty_archive_index.clone()
         };
+        // Quality profile: upgrades can be disabled, or stop once the archived
+        // file reaches the profile cutoff resolution.
+        let requirement = if release.kind == "series" {
+            release
+                .series
+                .as_deref()
+                .and_then(|name| cfg.find_series_match(name, release.season))
+                .map(|series| series.quality.clone())
+                .unwrap_or_default()
+        } else {
+            cfg.find_movie_match(&release.title, release.year)
+                .map(|movie| movie.quality.clone())
+                .unwrap_or_default()
+        };
+        let cutoff_reached = cfg
+            .upgrade_cutoff_rank(&requirement)
+            .is_some_and(|cutoff| {
+                archive_index
+                    .best_for(release.season.unwrap_or(0), release.episode.unwrap_or(0))
+                    .is_some_and(|(quality, _)| quality.resolution_rank() >= cutoff)
+            });
+        let forbid_upgrade = !cfg.upgrade_allowed(&requirement) || cutoff_reached;
         let approval_context = crate::models::ApprovalContext {
             archive: archive_index,
             live: live_downloads.clone(),
+            forbid_upgrade,
         };
+        // The smart episode guard must never block a deliberate backfill: a
+        // candidate that fills a known archive gap is always allowed.
+        let smart_episode = release.kind == "series"
+            && !release.is_pack
+            && cfg.smart_episode_guard()
+            && !is_gap;
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
             let score = cfg.release_score(&release);
             let min_diff = cfg.upgrade_min_score_diff;
             let result = if release.kind == "series" {
-                db.check_series_scored(&release, score, min_diff, &approval_context)?
+                db.check_series_scored_guarded(
+                    &release,
+                    score,
+                    min_diff,
+                    &approval_context,
+                    smart_episode,
+                )?
             } else {
-                db.check_movie_scored(&release, score, min_diff)?
+                db.check_movie_scored_with(&release, score, min_diff, forbid_upgrade)?
             };
             (result.0, result.1, score)
         };
@@ -731,6 +821,10 @@ pub async fn run_cycle_domain(
                             (release.series.as_deref(), release.season, release.episode)
                         {
                             db.lock().unwrap().remove_pending(series, season, episode)?;
+                        } else if release.kind == "movie" {
+                            db.lock()
+                                .unwrap()
+                                .remove_pending_movie(&release.title, release.year)?;
                         }
                     }
                     stats.downloads_started += 1;

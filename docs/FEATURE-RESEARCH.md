@@ -1,6 +1,8 @@
 # Rextto — Ricerca funzionalità da Sonarr, Radarr, qBittorrent, BiglyBT e autobrr
 
-Data: 2026-09-25 · Stato: ricerca + prima integrazione
+Data: 2026-09-25 · Stato: ricerca + integrazione (policy, dimensione, hook,
+cartelle osservate, smart episode, delay, quality profile, media info,
+AddOptions, provider backoff, housekeeping)
 
 Questo documento nasce da un'analisi approfondita dei sorgenti di cinque
 progetti maturi, con l'obiettivo di trovare funzionalità utili da portare in
@@ -46,15 +48,15 @@ Terza convergenza: **ingestione da cartelle osservate** (qBittorrent
 | 2 | Inviluppi di dimensione per qualità (min/max MB) | Sonarr/Radarr | alto | S | **integrato** |
 | 3 | Hook eventi (programma esterno) con variabili | qBittorrent/Sonarr/BiglyBT/autobrr | alto | S | **integrato** |
 | 4 | Cartelle osservate | qBittorrent/BiglyBT | medio-alto | S | **integrato** |
-| 5 | Smart episode guard (monotonia episodio) | autobrr | alto | S | proposto |
-| 6 | Delay profile + coda "pending" | Sonarr/Radarr | alto | M | proposto |
-| 7 | Quality profile ordinati con cutoff/gruppi | Sonarr/Radarr | alto | L | proposto |
-| 8 | MediaInfo/ffprobe sul file reale | Sonarr/Radarr | alto | M | proposto |
+| 5 | Smart episode guard (monotonia episodio) | autobrr | alto | S | **integrato** (opt-in) |
+| 6 | Delay profile + coda "pending" | Sonarr/Radarr | alto | M | **integrato** |
+| 7 | Quality profile ordinati con cutoff/gruppi | Sonarr/Radarr | alto | L | **integrato** (cutoff su archivio) |
+| 8 | MediaInfo/ffprobe sul file reale | Sonarr/Radarr | alto | M | **integrato** |
 | 9 | Import list (Trakt/Simkl/Plex/JSON) con esclusioni e pulizia libreria | Sonarr/Radarr | medio-alto | L | proposto |
 | 10 | Duplicate profile con hash normalizzato | autobrr | alto | S-M | proposto |
 | 11 | Disponibilità minima film / date di uscita | Radarr | alto | S-M | proposto |
-| 12 | Provider backoff (indexer/client) | Sonarr | medio | S | proposto |
-| 13 | Housekeeping + VACUUM pianificato | Sonarr | medio | S | proposto |
+| 12 | Provider backoff (indexer/client) | Sonarr | medio | S | **integrato** |
+| 13 | Housekeeping + VACUUM pianificato | Sonarr | medio | S | **integrato** |
 | 14 | IRC announce (bassa latenza) | autobrr | alto | L | analizzato |
 | 15 | Remote path mapping | Sonarr/Radarr | medio | S | proposto |
 | 16 | Scene mapping / XEM (anime) | Sonarr | medio | M | proposto |
@@ -231,34 +233,36 @@ righe announce in release tramite regex, variabili e template.
 
 ---
 
-## 7. Roadmap consigliata (dopo quanto integrato)
+## 7. Scelte e roadmap rimanente
 
-1. **Smart episode guard** (autobrr) — economico, evita regressioni su batch:
-   rifiuta se esiste già un download approvato per episodio/stagione
-   successiva, gestendo PROPER/REPACK.
-2. **Delay profile + pending releases** (Sonarr/Radarr) — riusa la tabella
-   `pending_downloads` già presente; serve un motivo `Temporary` e il bypass
-   per ricerca manuale/qualità massima.
-3. **Quality profile ordinati** (Sonarr/Radarr) — refactor di
-   `SeriesConfig/MovieConfig.quality` da stringa a profilo con cutoff e gruppi;
-   abilita upgrade più espressivi.
-4. **MediaInfo/ffprobe** (Sonarr/Radarr) — verifica HDR/audio/bit depth sul
-   file reale per upgrade e rinomina.
-5. **Refactor `AddOptions` + bridge `rextto_lt_add_ex`** (qBittorrent) —
-   sblocca priorità file, layout contenuto, stop condition metadata-only,
-   first/last piece, web seed con poco sforzo incrementale.
-6. **Import list + esclusioni + pulizia libreria** (Sonarr/Radarr) — riusa i
-   client Trakt/Simkl/Plex già presenti.
-7. **Provider backoff**, **housekeeping + VACUUM**, **remote path mapping**,
-   **auto-tagging** (Sonarr/Radarr/BiglyBT).
-8. **IRC announce** (autobrr) — progetto a sé (trasporto + parser YAML); alto
-   valore ma sforzo L, da pianificare separatamente. Fragilità da evitare in
-   Rextto: la dipendenza da template Go/sprig nelle definizioni indexer.
-9. **Due diligence da non sottovalutare**: la licenza. Sonarr/Radarr sono GPLv3,
-   qBittorrent GPLv2+, BiglyBT GPLv2, autobrr MIT. In questa ricerca si sono
-   studiati *algoritmi e idee*, non copiato codice; eventuali port fedeli di
-   porzioni sostanziali vanno valutati compatibilmente con la EUPL-1.2 di
-   Rextto.
+Sono stati integrati (vedi §8): policy release, inviluppi dimensione, hook
+eventi, cartelle osservate, smart episode, delay profile, quality profile,
+MediaInfo/ffprobe, refactor `AddOptions`, provider backoff e housekeeping.
+
+**Scartati o rimandati per scelta:**
+
+- **Import list + esclusioni + pulizia libreria** (Sonarr/Radarr): rimandato.
+  Esistono già gli import manuali Trakt/Simkl; una sincronizzazione ricorrente
+  con policy e cancellazione automatica è un progetto a sé.
+- **Remote path mapping** (Sonarr/Radarr): valore reale basso perché libtorrent
+  è embedded e condivide il filesystem col daemon; serve solo con mount di rete
+  o seedbox con path divergenti.
+- **Auto-tagging** (Sonarr/Radarr/BiglyBT): rimandato finché i tag non
+  pilotano delay/release profile (dipendenza).
+- **IRC announce** (autobrr): progetto a sé (trasporto + parser definizioni),
+  sforzo L; da valutare separatamente. Fragilità da evitare: la dipendenza dai
+  template Go/sprig delle definizioni indexer.
+- **Refactor `AddOptions`**: la base è integrata (paused, sequential,
+  seed_mode, queue_top, first/last piece, metadata-only). Restano, da agganciare
+  allo stesso bridge: priorità per-file, layout contenuto all'add, web seed,
+  modifica tracker, export `.torrent`/magnet, super seeding, azioni sui limiti
+  di condivisione.
+
+**Licenze.** Sonarr/Radarr GPLv3, qBittorrent GPLv2+, BiglyBT GPLv2, autobrr
+MIT; Rextto è EUPL-1.2. In questa ricerca si sono studiati *algoritmi e idee*,
+non copiato codice. Eventuali port fedeli di porzioni sostanziali vanno
+valutati per compatibilità (le GPL non sono compatibili con EUPL per
+incorporamento diretto).
 
 ---
 
@@ -309,16 +313,77 @@ Integrazione:
 - Worker `watched_folders_worker` in `web.rs` (ogni 15 s, salta il dry-run,
   max 5 tentativi per file) registrato tra i worker di lunga durata.
 
-### 8.4 API e UI
+### 8.4 Smart episode (opt-in)
+
+`Database::check_series_scored_guarded` rifiuta un episodio **nuovo** quando uno
+successivo (o una stagione successiva) è già archiviato. È spento di default e
+l'orchestratore passa `false` per i candidati che riempiono un gap, così il
+gap-fill deliberato non viene bloccato. Settaggio `smart_episode_guard`.
+
+### 8.5 Delay profile
+
+- `pending_downloads` esteso con `due_at` preciso (minuti, non solo ore) e una
+  nuova tabella `pending_movies`.
+- `Config::delay_minutes(kind)` (`delay_torrent_minutes` /
+  `delay_movies_minutes`) e `delay_bypass_score`.
+- L'orchestratore mette in attesa serie/film e bypassa per gap-fill, ricerca
+  manuale e punteggio sopra soglia; il migliore visto durante l'attesa vince.
+
+### 8.6 Quality profile
+
+- `QualityProfile { name, allowed[], cutoff, upgrade_allowed }`, salvato in
+  `settings.quality_profiles`; un titolo lo usa scrivendo `profile:<nome>` nel
+  campo qualità (nessun cambio di schema per serie/film).
+- `allow` = lista ordinata di risoluzioni consentite; `upgrade_allowed=false`
+  disabilita gli upgrade; `cutoff` blocca l'upgrade quando il file archiviato
+  ha già raggiunto quella risoluzione (`forbid_upgrade` in `ApprovalContext`).
+- API `GET/POST /api/quality-profiles`, editor nella pagina Automazione.
+
+### 8.7 MediaInfo/ffprobe
+
+- `src/mediainfo.rs`: probe via `ffprobe` con parsing puro (bit depth, HDR
+  incluso Dolby Vision da side data, audio, sottotitoli, durata).
+- Risultato persistito in `episodes.media_info_json`/`movies.media_info_json`
+  al completamento del post-processing; API `GET /api/media-info` e
+  `POST /api/media-info/probe`.
+
+### 8.8 Refactor AddOptions (libtorrent)
+
+- `AddOptions { paused, sequential, seed_mode, queue_top, first_last,
+  stop_at_metadata }` e nuovi entry point nativi `rextto_lt_add_ex` /
+  `rextto_lt_add_file_ex` (bitmask), `set_torrent_sequential`, `queue_top`,
+  `set_first_last`.
+- Le opzioni che richiedono i metadati (first/last, metadata-only) vengono
+  applicate dal worker eventi via `enforce_deferred_options`.
+- `/api/torrents/add` accetta i nuovi campi.
+
+### 8.9 Provider backoff
+
+- `src/backoff.rs` (scala di Sonarr) + tabella `provider_status`.
+- Feed e indexer in stato di backoff vengono saltati nel fan-out; successi e
+  fallimenti aggiornano il livello. API `GET/POST /api/providers/status` e
+  pulsante di reset nella UI.
+
+### 8.10 Housekeeping
+
+- `Database::housekeeping` taglia cicli, torrent in errore, "visti nel feed",
+  log gap, backup di upgrade, storico opzionale e backoff scaduti, poi compatta
+  con VACUUM. Worker periodico (`housekeeping_interval_hours`) e trigger
+  manuale `POST /api/maintenance/housekeeping`.
+
+### 8.11 API e UI
 
 - `GET/POST /api/policy`, `POST /api/policy/preview`
 - `GET/POST /api/event-hooks`
 - `GET/POST /api/watched-folders`
-- Nuova pagina **Automazione** (Leptos): editor strutturato di regole, custom
-  format (con condizioni ripetibili), limiti dimensione, hook eventi, cartelle
-  osservate e simulatore policy dal vivo.
+- `GET/POST /api/quality-profiles`
+- `GET /api/media-info`, `POST /api/media-info/probe`
+- `GET/POST /api/providers/status`
+- `POST /api/maintenance/housekeeping`
+- Nuova pagina **Automazione** (Leptos) e tab **Acquisizione** in
+  Configurazione.
 
-### 8.5 Test
+### 8.12 Test
 
 - `policy.rs`: 14 test (term matching, reject/required/except, score, scope
   media, inviluppi dimensione e fallback `any`, semantica gruppi custom format,
@@ -330,9 +395,16 @@ Integrazione:
   lettura magnet, consume).
 - `config.rs`: 1 test di integrazione regole+format+size su
   `release_allowed`/`release_score`.
-- `web.rs`: 3 test endpoint (policy persist+validazione+preview, hook
-  reload a runtime, watched folders round-trip).
-- Suite completa: **229 test verdi** (era 200).
+- `backoff.rs`: 3 test (scala, escalation con grace, recovery).
+- `mediainfo.rs`: 4 test (HDR10 10-bit con audio/sottotitoli, Dolby Vision,
+  skip motion image, bit depth con suffissi di endianness).
+- `database.rs`: test per housekeeping, provider backoff, delay pending,
+  media info, smart episode, cutoff quality profile.
+- `config.rs`: test per profili qualità (allow-list, cutoff, upgrade disabilitato,
+  parsing).
+- `web.rs`: test endpoint (policy, hook reload, watched folders, quality
+  profiles).
+- Suite completa: **248 test verdi** (erano 200).
 
 ---
 

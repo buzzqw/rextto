@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
         &cfg.data_dir.join("rextto_archive.db"),
     )?));
     let comics = Arc::new(ComicsDb::open(&cfg.data_dir.join("rextto_comics.db"))?);
-    let engine = Arc::new(Engine::new());
+    let engine = Arc::new(Engine::with_db(db.clone()));
     let torrents = Arc::new(LibtorrentClient::new(&cfg)?);
     let i18n = Arc::new(rextto::i18n::I18nDb::open(
         &cfg.data_dir.join("rextto_config.db"),

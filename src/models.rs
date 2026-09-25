@@ -309,6 +309,10 @@ impl LiveDownloads {
 pub struct ApprovalContext {
     pub archive: ArchiveQualityIndex,
     pub live: LiveDownloads,
+    /// When true, an existing archived file is never replaced. Set from a
+    /// quality profile with `upgrade_allowed = false` or when the cutoff
+    /// resolution is already reached.
+    pub forbid_upgrade: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +408,17 @@ pub struct TorrentView {
     /// for periodic peer/seed discovery retries.
     #[serde(default)]
     pub stalled: bool,
+}
+
+/// Escalating backoff state of one source (feed, indexer or web engine).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderStatus {
+    pub provider: String,
+    pub kind: String,
+    pub level: i64,
+    pub disabled_till: String,
+    pub most_recent_failure: String,
+    pub last_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

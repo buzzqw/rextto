@@ -479,6 +479,82 @@ int rextto_lt_add_file(rextto_lt_session* session, const char* torrent_path, con
     return 0;
 }
 
+// Add-time option flags shared by the `*_ex` entry points. The bitmask keeps
+// the ABI tiny and lets the Rust `AddOptions` struct grow without new C
+// signatures.
+enum RexttoAddFlags {
+    REXTTO_ADD_PAUSED = 1,
+    REXTTO_ADD_SEQUENTIAL = 2,
+    REXTTO_ADD_SEED_MODE = 4,
+    REXTTO_ADD_QUEUE_TOP = 8,
+};
+
+static void rextto_apply_add_flags(lt::add_torrent_params& params, int flags) {
+    if (flags & REXTTO_ADD_PAUSED) params.flags |= lt::torrent_flags::paused;
+    if (flags & REXTTO_ADD_SEQUENTIAL) params.flags |= lt::torrent_flags::sequential_download;
+    if (flags & REXTTO_ADD_SEED_MODE) params.flags |= lt::torrent_flags::seed_mode;
+}
+
+int rextto_lt_add_ex(rextto_lt_session* session, const char* magnet, const char* save_path, int flags, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    if (session == nullptr || magnet == nullptr || save_path == nullptr) {
+        set_error(error, error_size, "invalid libtorrent add parameters");
+        return 0;
+    }
+    try {
+        lt::error_code ec;
+        lt::add_torrent_params params = lt::parse_magnet_uri(magnet, ec);
+        if (ec) {
+            set_error(error, error_size, ec.message());
+            return 0;
+        }
+        params.save_path = save_path;
+        if (!session->pex_enabled) params.flags |= lt::torrent_flags::disable_pex;
+        if (session->sequential_enabled) params.flags |= lt::torrent_flags::sequential_download;
+        rextto_apply_add_flags(params, flags);
+        auto handle = session->session.add_torrent(std::move(params), ec);
+        if (ec) {
+            set_error(error, error_size, ec.message());
+            return 0;
+        }
+        if (flags & REXTTO_ADD_QUEUE_TOP) handle.queue_position_top();
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent add error");
+    }
+    return 0;
+}
+
+int rextto_lt_add_file_ex(rextto_lt_session* session, const char* torrent_path, const char* save_path, int flags, char* hash, size_t hash_size, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    if (session == nullptr || torrent_path == nullptr || save_path == nullptr) {
+        set_error(error, error_size, "invalid torrent-file add parameters");
+        return 0;
+    }
+    try {
+        lt::error_code ec;
+        lt::add_torrent_params params;
+        params.ti = std::make_shared<lt::torrent_info>(std::string(torrent_path), ec);
+        if (ec) { set_error(error, error_size, ec.message()); return 0; }
+        params.save_path = save_path;
+        if (!session->pex_enabled) params.flags |= lt::torrent_flags::disable_pex;
+        if (session->sequential_enabled) params.flags |= lt::torrent_flags::sequential_download;
+        rextto_apply_add_flags(params, flags);
+        auto handle = session->session.add_torrent(std::move(params), ec);
+        if (ec) { set_error(error, error_size, ec.message()); return 0; }
+        copy_string(hash, hash_size, hex_hash(handle));
+        if (flags & REXTTO_ADD_QUEUE_TOP) handle.queue_position_top();
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown torrent-file add error");
+    }
+    return 0;
+}
+
 unsigned int rextto_lt_torrent_count(const rextto_lt_session* session) {
     std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
     if (session == nullptr) return 0;
@@ -931,6 +1007,87 @@ int rextto_lt_set_sequential(rextto_lt_session* session, int enabled, char* erro
         set_error(error, error_size, exception.what());
     } catch (...) {
         set_error(error, error_size, "unknown libtorrent sequential error");
+    }
+    return 0;
+}
+
+int rextto_lt_set_torrent_sequential(rextto_lt_session* session, const char* hash, int enabled, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        if (enabled) {
+            handle.set_flags(lt::torrent_flags::sequential_download);
+        } else {
+            handle.unset_flags(lt::torrent_flags::sequential_download);
+        }
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent sequential error");
+    }
+    return 0;
+}
+
+int rextto_lt_queue_top(rextto_lt_session* session, const char* hash, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        handle.queue_position_top();
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent queue error");
+    }
+    return 0;
+}
+
+// Prioritise the first and last ~1% of every file so playback can start early
+// (qBittorrent's "first/last piece priority"). `enabled=0` restores the default
+// priority for every piece.
+int rextto_lt_set_first_last(rextto_lt_session* session, const char* hash, int enabled, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        auto info = handle.torrent_file();
+        if (!info) { set_error(error, error_size, "torrent metadata not available"); return 0; }
+        const lt::file_storage& files = info->files();
+        const int piece_length = files.piece_length();
+        const int num_pieces = files.num_pieces();
+        if (num_pieces <= 0 || piece_length <= 0) { set_error(error, error_size, "torrent has no pieces"); return 0; }
+        std::vector<lt::download_priority_t> priorities(
+            static_cast<size_t>(num_pieces), lt::default_priority);
+        if (enabled) {
+            for (lt::file_index_t file(0); file < files.end_file(); ++file) {
+                const std::int64_t size = files.file_size(file);
+                if (size <= 0) continue;
+                const std::int64_t offset = files.file_offset(file);
+                int first = static_cast<int>(offset / piece_length);
+                int last = static_cast<int>((offset + size - 1) / piece_length);
+                first = std::max(0, std::min(first, num_pieces - 1));
+                last = std::max(0, std::min(last, num_pieces - 1));
+                const int span = last - first + 1;
+                const int edge = std::max(1, span / 100);
+                for (int step = 0; step < edge; ++step) {
+                    if (first + step <= last) {
+                        priorities[static_cast<size_t>(first + step)] = lt::top_priority;
+                    }
+                    if (last - step >= first) {
+                        priorities[static_cast<size_t>(last - step)] = lt::top_priority;
+                    }
+                }
+            }
+        }
+        handle.prioritize_pieces(priorities);
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent first/last error");
     }
     return 0;
 }

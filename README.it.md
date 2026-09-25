@@ -45,8 +45,12 @@ o disco locale).
   consultabile anche per ciò che non è monitorato.
 - **Policy release** — regole ordinate accetta/rifiuta/punteggio con termini
   wildcard/regex, custom format con punteggio, limiti di dimensione per qualità,
-  hook eventi verso programmi esterni e simulatore dal vivo, modificabili dalla
-  nuova pagina *Automazione*.
+  hook eventi verso programmi esterni, cartelle osservate e simulatore dal vivo,
+  modificabili dalla nuova pagina *Automazione*.
+- **Regolazione acquisizione** — delay profile con coda di attesa, profili
+  qualità con cutoff, smart episode opzionale, ispezione reale dei file con
+  `ffprobe`, backoff progressivo delle sorgenti e housekeeping/VACUUM
+  programmato.
 - **Backup** — manuali o programmati (locale, FTP, cartella cloud, Telegram).
   Salvano database e configurazione, non i media né lo stato torrent.
 

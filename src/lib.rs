@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 pub mod archive;
+pub mod backoff;
 pub mod backup;
 pub mod cache;
 pub mod cleaner;
@@ -16,6 +17,7 @@ pub mod importer;
 pub mod integrations;
 pub mod libtorrent;
 pub mod logging;
+pub mod mediainfo;
 pub mod messages;
 pub mod models;
 pub mod notifier;

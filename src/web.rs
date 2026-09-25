@@ -252,6 +252,21 @@ pub struct AddTorrent {
     /// Se true il torrent non viene rinominato al termine.
     #[serde(default)]
     pub no_rename: bool,
+    /// Download sequenziale per questo torrent.
+    #[serde(default)]
+    pub sequential: bool,
+    /// Salta la verifica dell'hash (assume i dati già completi).
+    #[serde(default)]
+    pub seed_mode: bool,
+    /// Porta il torrent in cima alla coda.
+    #[serde(default)]
+    pub queue_top: bool,
+    /// Dai priorità al primo e all'ultimo pezzo di ogni file.
+    #[serde(default)]
+    pub first_last: bool,
+    /// Scarica solo i metadati e metti in pausa appena arrivano.
+    #[serde(default)]
+    pub stop_at_metadata: bool,
 }
 #[derive(serde::Deserialize)]
 pub struct ScorePreviewInput {
@@ -680,6 +695,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/policy/preview", post(policy_preview))
         .route("/api/event-hooks", get(event_hooks_view).post(save_event_hooks))
         .route(
+            "/api/providers/status",
+            get(providers_status_view).post(clear_providers_status),
+        )
+        .route("/api/media-info", get(media_info_get))
+        .route("/api/media-info/probe", post(media_info_probe))
+        .route(
+            "/api/quality-profiles",
+            get(quality_profiles_view).post(save_quality_profiles),
+        )
+        .route(
             "/api/watched-folders",
             get(watched_folders_view).post(save_watched_folders),
         )
@@ -859,6 +884,7 @@ pub fn router(state: AppState) -> Router {
             post(mark_torrent_failed),
         )
         .route("/api/maintenance/clean-trash", post(clean_trash))
+        .route("/api/maintenance/housekeeping", post(run_housekeeping_now))
         .route(
             "/api/maintenance/clean-duplicates",
             post(clean_duplicates),
@@ -1429,6 +1455,7 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
         "libtorrent_temp_limit_enabled": cfg.settings.get("libtorrent_temp_limit_enabled").cloned().unwrap_or_else(|| "0".into()),
         "libtorrent_temp_limit_until": cfg.settings.get("libtorrent_temp_limit_until").cloned().unwrap_or_else(|| "0".into()),
         "score_settings": cfg.settings.iter().filter(|(key, _)| key.starts_with("score_")).collect::<std::collections::BTreeMap<_, _>>(),
+        "quality_profiles": cfg.quality_profiles,
         "flaresolverr_configured": cfg.flaresolverr_url.is_some(),
         "tmdb_configured": cfg.tmdb_api_key.is_some(),
         "jellyfin_configured": cfg.settings.get("jellyfin_url").is_some_and(|value| !value.trim().is_empty())
@@ -1837,6 +1864,151 @@ async fn policy_preview(
             }
         })),
     )
+}
+
+async fn quality_profiles_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = latest_config(&s);
+    Json(serde_json::json!({"ok": true, "items": cfg.quality_profiles}))
+}
+
+async fn save_quality_profiles(
+    State(s): State<AppState>,
+    Json(profiles): Json<Vec<crate::config::QualityProfile>>,
+) -> impl IntoResponse {
+    if profiles.len() > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"too many quality profiles (max 100)"})),
+        );
+    }
+    if profiles
+        .iter()
+        .any(|profile| profile.name.trim().is_empty() || profile.name.len() > 200)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"a quality profile has an empty or oversized name"})),
+        );
+    }
+    match serde_json::to_string(&profiles).and_then(|value| {
+        Config::save_setting(&s.cfg.data_dir, "quality_profiles", &value)
+            .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+    }) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "items": profiles})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct MediaProbeInput {
+    pub path: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct MediaInfoQuery {
+    pub series: Option<String>,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    pub movie: Option<String>,
+    pub year: Option<i64>,
+}
+
+async fn media_info_get(
+    State(s): State<AppState>,
+    Query(query): Query<MediaInfoQuery>,
+) -> impl IntoResponse {
+    let db = s.db.lock().unwrap();
+    let result = if let (Some(series), Some(season), Some(episode)) =
+        (query.series.as_deref(), query.season, query.episode)
+    {
+        db.episode_media_info(series, season, episode)
+    } else if let Some(movie) = query.movie.as_deref() {
+        db.movie_media_info(movie, query.year)
+    } else {
+        Ok(None)
+    };
+    match result {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "info": value})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+async fn media_info_probe(Json(input): Json<MediaProbeInput>) -> impl IntoResponse {
+    let path = input.path.trim().to_string();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"empty path"})),
+        );
+    }
+    match tokio::task::spawn_blocking(move || {
+        crate::mediainfo::probe(std::path::Path::new(&path))
+    })
+    .await
+    {
+        Ok(Some(info)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "info": info})),
+        ),
+        Ok(None) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"ok":false,"error":"ffprobe unavailable or the file is unreadable"})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ProviderResetInput {
+    /// Provider name to clear; omit to clear every provider status.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+async fn providers_status_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let items = s
+        .db
+        .lock()
+        .unwrap()
+        .provider_statuses()
+        .unwrap_or_default();
+    Json(serde_json::json!({"ok": true, "items": items}))
+}
+
+async fn clear_providers_status(
+    State(s): State<AppState>,
+    Json(input): Json<ProviderResetInput>,
+) -> impl IntoResponse {
+    let provider = input
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match s.db.lock().unwrap().clear_provider_status(provider) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
 }
 
 async fn event_hooks_view(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -3500,7 +3672,7 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
             && cfg
                 .find_movie_match_manual(&release.title, release.year)
                 .is_some_and(|matched| {
-                    matched.id == movie.id && Config::movie_release_allowed(movie, &release.quality)
+                    matched.id == movie.id && cfg.movie_release_allowed(movie, &release.quality)
                 })
             && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
@@ -5432,6 +5604,10 @@ async fn save_setting(
     Json(input): Json<SettingInput>,
 ) -> impl IntoResponse {
     let allowed = input.key.starts_with("libtorrent_")
+        || input.key.starts_with("delay_")
+        || input.key.starts_with("housekeeping_")
+        || input.key == "smart_episode_guard"
+        || input.key == "quality_profiles"
         || input.key.starts_with("score_")
         || input.key.starts_with("tvdb_")
         || input.key.starts_with("trakt_")
@@ -6117,7 +6293,7 @@ fn finalize_episode_search_results(
             .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
             .is_some_and(|release| {
                 cfg.release_allowed(&release)
-                    && Config::series_release_allowed(series, &release.quality, &release.title)
+                    && cfg.series_release_allowed(series, &release.quality, &release.title)
             })
     });
     let mut seen = HashSet::new();
@@ -6209,7 +6385,7 @@ async fn search_missing(
     results.retain(|release| {
         release_matches_series_episode(release, &series, input.season, input.episode)
             && cfg.release_allowed(release)
-            && Config::series_release_allowed(&series, &release.quality, &release.title)
+            && cfg.series_release_allowed(&series, &release.quality, &release.title)
             && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
@@ -7835,6 +8011,19 @@ async fn restore_source(
     )
 }
 
+async fn run_housekeeping_now(State(s): State<AppState>) -> impl IntoResponse {
+    match run_housekeeping(&s).await {
+        Some(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"report":report})),
+        ),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":"housekeeping failed"})),
+        ),
+    }
+}
+
 async fn clean_trash(
     State(s): State<AppState>,
     input: Option<Json<CleanTrashInput>>,
@@ -8008,8 +8197,30 @@ async fn add_torrent(
             Json(serde_json::json!({"ok":false,"error":"complete the initial setup first"})),
         );
     }
-    match s.torrents.add(&input.magnet, &s.cfg) {
-        Ok(true) => (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true}))),
+    let cfg = latest_config(&s);
+    let options = crate::libtorrent::AddOptions {
+        paused: input.start_paused,
+        sequential: input.sequential,
+        seed_mode: input.seed_mode,
+        queue_top: input.queue_top,
+        first_last: input.first_last,
+        stop_at_metadata: input.stop_at_metadata,
+    };
+    let preferred = input
+        .save_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::Path::new);
+    match s.torrents.add_with_options(&input.magnet, &cfg, preferred, &options) {
+        Ok(true) => {
+            if input.no_rename {
+                if let Some(hash) = crate::utils::magnet_hash(&input.magnet) {
+                    let _ = s.db.lock().unwrap().set_torrent_no_rename(&hash, true);
+                }
+            }
+            (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true})))
+        }
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"ok":false,"error":"duplicate"})),
@@ -10519,6 +10730,9 @@ async fn torrent_event_worker(
             // Visibilità sulla coda, come il legacy extto ("📊 Coda: ..."):
             // si logga quando cambia il numero di download attivi, non ad ogni giro.
             let snapshot = torrents.list();
+            // Apply add-time options that need metadata (first/last pieces) or
+            // that pause as soon as metadata arrives (metadata-only adds).
+            torrents.enforce_deferred_options(&snapshot);
             let active = snapshot
                 .iter()
                 .filter(|torrent| torrent.state == "downloading")
@@ -10847,7 +11061,7 @@ async fn torrent_event_worker(
                         "series": completion_meta.as_ref().and_then(|meta| meta.release.series.as_ref()),
                         "season": completion_meta.as_ref().and_then(|meta| meta.release.season),
                         "episode": completion_meta.as_ref().and_then(|meta| meta.release.episode),
-                        "path": processed_path,
+                        "path": &processed_path,
                         "size_bytes": size_bytes,
                         "duration_seconds": duration_seconds,
                         "average_speed_bps": average_speed_bps
@@ -10859,6 +11073,31 @@ async fn torrent_event_worker(
                         Err(error) => {
                             tracing::warn!(hash=%event.hash, event="torrent_completed", title=%title, %error, "completion notification failed")
                         }
+                    }
+                    // Ground-truth media inspection of the placed file. Runs on
+                    // the blocking pool; a missing ffprobe just leaves the
+                    // filename-derived quality in place.
+                    if let Some(meta) = completion_meta.as_ref() {
+                        let probe_path = processed_path.clone();
+                        let release = meta.release.clone();
+                        let probe_db = db.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(info) =
+                                crate::mediainfo::probe(std::path::Path::new(&probe_path))
+                            {
+                                if let Ok(db) = probe_db.lock() {
+                                    let _ = db.set_media_info(&release, &info);
+                                }
+                                tracing::debug!(
+                                    title = %release.title,
+                                    resolution = %info.resolution(),
+                                    hdr = %info.hdr,
+                                    bit_depth = info.bit_depth,
+                                    "media info stored"
+                                );
+                            }
+                        })
+                        .await;
                     }
                 }
             }
@@ -13000,6 +13239,69 @@ async fn temp_cleanup_worker(state: AppState) {
     }
 }
 
+/// Runs the periodic data hygiene (bounded tables + database compaction).
+/// The first pass is delayed so startup stays fast; the interval is
+/// configurable (`housekeeping_interval_hours`, 0/disabled via
+/// `housekeeping_enabled`).
+async fn housekeeping_worker(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    loop {
+        let cfg = latest_config(&state);
+        let enabled = cfg
+            .settings
+            .get("housekeeping_enabled")
+            .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
+            .unwrap_or(true);
+        if enabled {
+            if let Some(report) = run_housekeeping(&state).await {
+                tracing::info!(
+                    cycles = report.old_cycles_removed,
+                    torrents = report.stale_torrents_removed,
+                    seen = report.seen_removed,
+                    gap_logs = report.gap_logs_removed,
+                    providers = report.stale_providers_removed,
+                    "🧹 housekeeping completed"
+                );
+            }
+        }
+        let hours = cfg
+            .settings
+            .get("housekeeping_interval_hours")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(24)
+            .clamp(1, 24 * 30);
+        tokio::time::sleep(Duration::from_secs(hours * 3600)).await;
+    }
+}
+
+/// Trims bounded tables and compacts the databases. Blocking SQLite work runs
+/// on the blocking pool; the DB lock is only held inside the closure.
+async fn run_housekeeping(state: &AppState) -> Option<crate::database::HousekeepingReport> {
+    let cfg = latest_config(state);
+    let params = crate::database::HousekeepingParams::from_settings(&cfg.settings);
+    let db = state.db.clone();
+    let archive = state.archive.clone();
+    let comics = state.comics.clone();
+    let data_dir = state.cfg.data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::database::HousekeepingReport> {
+        let report = db.lock().unwrap().housekeeping(&params)?;
+        run_db_action(&db, &archive, &comics, &data_dir, "vacuum")?;
+        Ok(report)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Some(report),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "housekeeping failed");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "housekeeping task failed");
+            None
+        }
+    }
+}
+
 /// Polls configured watched folders and adds dropped `.torrent`/`.magnet`
 /// files, mirroring qBittorrent's "watched folders". Files that cannot be
 /// added are retried a few times and then left alone.
@@ -13119,6 +13421,7 @@ pub async fn serve(
     let optimize = tokio::spawn(optimize_worker(state.clone()));
     let temp_cleanup = tokio::spawn(temp_cleanup_worker(state.clone()));
     let watched = tokio::spawn(watched_folders_worker(state.clone()));
+    let housekeeping = tokio::spawn(housekeeping_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -13131,6 +13434,7 @@ pub async fn serve(
         registry.push(optimize);
         registry.push(temp_cleanup);
         registry.push(watched);
+        registry.push(housekeeping);
     }
     let app = router(state);
     let result = tokio::try_join!(
@@ -13437,16 +13741,17 @@ mod tests {
         std::fs::write(&config_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let (_layer, log_reload): (_, reload::Handle<EnvFilter, tracing_subscriber::Registry>) =
             reload::Layer::new(EnvFilter::new("rextto=warn"));
+        let db = Arc::new(Mutex::new(
+            Database::open(&root.join("rextto_series.db")).unwrap(),
+        ));
         let state = AppState {
             i18n: Arc::new(I18nDb::open(&root.join("rextto_config.db")).unwrap()),
-            db: Arc::new(Mutex::new(
-                Database::open(&root.join("rextto_series.db")).unwrap(),
-            )),
+            db: db.clone(),
             archive: Arc::new(Mutex::new(
                 Archive::open(&root.join("rextto_archive.db")).unwrap(),
             )),
             comics: Arc::new(ComicsDb::open(&root.join("rextto_comics.db")).unwrap()),
-            engine: Arc::new(Engine::new()),
+            engine: Arc::new(Engine::with_db(db.clone())),
             torrents: Arc::new(LibtorrentClient::new(&cfg).unwrap()),
             torrent_events: Arc::new(Mutex::new(Vec::new())),
             notifier: Arc::new(Notifier::from_config(&cfg)),
@@ -13743,6 +14048,54 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].program, "/bin/true");
         assert_eq!(hooks[0].events, vec!["torrent_completed".to_string()]);
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn quality_profiles_endpoint_roundtrips() {
+        let (state, root) = test_state();
+        let app = router(state);
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/quality-profiles")
+                .header("x-rextto-token", "test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let invalid = app
+            .clone()
+            .oneshot(post(r#"[{"name":"  ","allowed":[]}]"#))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let save = app
+            .clone()
+            .oneshot(post(
+                r#"[{"name":"HD","allowed":["1080p","720p"],"cutoff":"1080p","upgrade_allowed":true}]"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+
+        let view = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/quality-profiles")
+                    .header("x-rextto-token", "test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(view.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["items"][0]["name"], "HD");
+        assert_eq!(value["items"][0]["allowed"][0], "1080p");
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }

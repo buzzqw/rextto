@@ -47,8 +47,12 @@ disk).
   browsable even for titles you do not monitor.
 - **Release policy** — ordered accept/reject/score rules with
   wildcard/regex terms, scored custom formats, per-quality size envelopes,
-  external event hooks and a live simulator, all editable from the new
-  *Automation* page.
+  external event hooks, watched folders and a live simulator, all editable
+  from the new *Automation* page.
+- **Acquisition tuning** — delay profiles with pending queue, named quality
+  profiles with cutoff, opt-in smart-episode guard, ground-truth media
+  inspection via `ffprobe`, escalating provider backoff and scheduled
+  housekeeping/VACUUM.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
   They include databases and configuration, not media files or torrent state.
 
