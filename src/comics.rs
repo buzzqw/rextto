@@ -456,9 +456,14 @@ pub async fn run_cycle(
     tracing::info!(monitored = monitored.len(), "comics cycle: checking monitored titles");
     for comic in monitored {
         tracing::info!(comic=%comic.title, tag=%comic.tag_url, "comics: checking title");
+        // A numbered monitor (e.g. `Poison Ivy #41 (2026)`) identifies one
+        // exact issue. Its publication date may be older than the generic
+        // monitoring start date, so that date must not hide the requested issue.
+        let exact_issue = issue_number(&comic.title).is_some();
+        let tag_from_date = if exact_issue { "" } else { &comic.from_date };
         // Anche col tag obsoleto (404) la ricerca per nome, come nel legacy
         // extto, trova comunque le nuove uscite: uniamo le due fonti.
-        let (mut posts, tag_error) = match client.tag_posts(&comic.tag_url, &comic.from_date).await {
+        let (mut posts, tag_error) = match client.tag_posts(&comic.tag_url, tag_from_date).await {
             Ok(posts) => (posts, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
@@ -493,7 +498,8 @@ pub async fn run_cycle(
                 );
                 continue;
             }
-            if !comic.from_date.trim().is_empty()
+            if !exact_issue
+                && !comic.from_date.trim().is_empty()
                 && !post.date.is_empty()
                 && post.date.as_str() < comic.from_date.as_str()
             {
