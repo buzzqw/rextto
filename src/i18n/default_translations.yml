@@ -82,3 +82,18 @@ eng:
   "Alta": "High"
   "Massima": "Maximum"
   "Priorità aggiornata": "Priority updated"
+
+  # Providers backoff panel + MediaInfo backfill
+  "Sorgenti in backoff": "Sources in backoff"
+  "Sorgenti disattivate temporaneamente dopo ripetuti errori. Rextto le riattiva da solo; qui puoi azzerare il timer di una singola sorgente.": "Sources temporarily disabled after repeated failures. Rextto re-enables them automatically; here you can clear the timer of a single source."
+  "Nessuna sorgente disattivata.": "No disabled source."
+  "Sorgente": "Source"
+  "Tipo": "Type"
+  "Livello": "Level"
+  "Riattiva alle": "Re-enables at"
+  "Ultimo errore": "Last error"
+  "Azzera": "Reset"
+  "Timer azzerato": "Timer cleared"
+  "Aggiorna MediaInfo": "Refresh MediaInfo"
+  "Analizza con ffprobe i file archiviati senza dati MediaInfo e li salva nel database": "Probe archived files without MediaInfo data with ffprobe and store the result"
+  "MediaInfo aggiornato": "MediaInfo updated"

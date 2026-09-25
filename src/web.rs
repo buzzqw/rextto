@@ -880,6 +880,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/maintenance/clean-trash", post(clean_trash))
         .route("/api/maintenance/housekeeping", post(run_housekeeping_now))
         .route(
+            "/api/maintenance/backfill-media-info",
+            post(backfill_media_info),
+        )
+        .route(
             "/api/maintenance/clean-duplicates",
             post(clean_duplicates),
         )
@@ -7737,6 +7741,75 @@ async fn restore_source(
             "items": items,
         })),
     )
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct BackfillMediaInfoInput {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Probes archived files that have no stored `ffprobe` result yet. Runs on the
+/// blocking pool; failures are counted, never fatal.
+async fn backfill_media_info(
+    State(s): State<AppState>,
+    input: Option<Json<BackfillMediaInfoInput>>,
+) -> impl IntoResponse {
+    let limit = input
+        .and_then(|value| value.limit)
+        .unwrap_or(100)
+        .clamp(1, 5000);
+    let db = s.db.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let targets = db.lock().unwrap().media_info_backfill_targets(limit)?;
+        let mut probed = 0usize;
+        let mut failed = 0usize;
+        for target in &targets {
+            match crate::mediainfo::probe_best(std::path::Path::new(&target.path)) {
+                Some(info) => {
+                    let json = serde_json::to_string(&info)?;
+                    let updated = if target.kind == "movie" {
+                        db.lock().unwrap().set_movie_media_info(
+                            &target.name,
+                            target.year,
+                            &json,
+                        )?
+                    } else {
+                        db.lock().unwrap().set_episode_media_info(
+                            &target.series,
+                            target.season.unwrap_or(0),
+                            target.episode.unwrap_or(0),
+                            &json,
+                        )?
+                    };
+                    if updated > 0 {
+                        probed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                None => failed += 1,
+            }
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "candidates": targets.len(),
+            "probed": probed,
+            "failed": failed,
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
 }
 
 async fn run_housekeeping_now(State(s): State<AppState>) -> impl IntoResponse {

@@ -111,6 +111,18 @@ impl HousekeepingParams {
     }
 }
 
+/// One archived entry to (re)probe for the MediaInfo backfill.
+#[derive(Debug, Clone)]
+pub struct MediaInfoBackfillTarget {
+    pub kind: String,
+    pub series: String,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    pub name: String,
+    pub year: Option<i64>,
+    pub path: String,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct HousekeepingReport {
     pub old_cycles_removed: usize,
@@ -1197,6 +1209,86 @@ impl Database {
         raw.flatten()
             .filter(|value| !value.trim().is_empty())
             .and_then(|value| serde_json::from_str(&value).ok())
+    }
+
+    /// Updates one archived episode's media info directly (backfill path).
+    pub fn set_episode_media_info(
+        &self,
+        series: &str,
+        season: i64,
+        episode: i64,
+        json: &str,
+    ) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE episodes SET media_info_json=?1 WHERE series_id=(SELECT id FROM series WHERE name=?2) AND season=?3 AND episode=?4",
+            params![json, series, season, episode],
+        )?)
+    }
+
+    /// Updates one archived movie's media info directly (backfill path).
+    pub fn set_movie_media_info(
+        &self,
+        name: &str,
+        year: Option<i64>,
+        json: &str,
+    ) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE movies SET media_info_json=?1 WHERE name=?2 AND year IS ?3",
+            params![json, name, year],
+        )?)
+    }
+
+    /// Targets for the MediaInfo backfill: archived entries that have a known
+    /// path but no stored probe yet.
+    pub fn media_info_backfill_targets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MediaInfoBackfillTarget>> {
+        let limit = limit.clamp(1, 20_000) as i64;
+        let mut targets = Vec::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT s.name, e.season, e.episode, e.archive_path \
+                 FROM episodes e JOIN series s ON s.id=e.series_id \
+                 WHERE COALESCE(e.media_info_json,'')='' AND COALESCE(e.archive_path,'')<>'' \
+                 ORDER BY e.id DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit], |row| {
+                Ok(MediaInfoBackfillTarget {
+                    kind: "series".into(),
+                    series: row.get(0)?,
+                    season: Some(row.get(1)?),
+                    episode: Some(row.get(2)?),
+                    name: String::new(),
+                    year: None,
+                    path: row.get(3)?,
+                })
+            })?;
+            targets.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        if targets.len() < limit as usize {
+            let remaining = limit - targets.len() as i64;
+            let mut statement = self.conn.prepare(
+                "SELECT m.name, m.year, t.processed_path \
+                 FROM movies m JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) \
+                 WHERE COALESCE(m.media_info_json,'')='' AND COALESCE(t.processed_path,'')<>'' \
+                 AND m.removed_at IS NULL \
+                 ORDER BY m.id DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([remaining], |row| {
+                Ok(MediaInfoBackfillTarget {
+                    kind: "movie".into(),
+                    series: String::new(),
+                    season: None,
+                    episode: None,
+                    name: row.get(0)?,
+                    year: row.get(1)?,
+                    path: row.get(2)?,
+                })
+            })?;
+            targets.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(targets)
     }
 
     pub fn episode_media_info(
@@ -4843,6 +4935,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM gap_search_log", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn media_info_backfill_targets_skip_already_probed_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-media-backfill-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,archive_path) VALUES (?1,1,1,'Show.S01E01','/nas/e1.mkv')",
+                [series_id],
+            )
+            .unwrap();
+        let targets = db.media_info_backfill_targets(10).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, "series");
+        assert_eq!(targets[0].path, "/nas/e1.mkv");
+        // Once probed, it is no longer a candidate.
+        db.set_episode_media_info("Show", 1, 1, "{}").unwrap();
+        assert!(db.media_info_backfill_targets(10).unwrap().is_empty());
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

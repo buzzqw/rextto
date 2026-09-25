@@ -120,9 +120,10 @@ la barra “Salva tutte”.
 - **Avanzate** — spazio libero minimo, retention cestino, retention archivio,
   pagine feed, intervallo verifica rinomina, sposta episodi, flag di debug.
 - **Acquisizione** — delay prima del download (serie/film, con bypass per
-  punteggio alto), intervallo di housekeeping e **Cartelle osservate**: Rextto
+  punteggio alto), intervallo di housekeeping, **Cartelle osservate**: Rextto
   controlla le cartelle indicate e aggiunge i file `.torrent`/`.magnet` copiati,
-  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta.
+  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta; e **Sorgenti in
+  backoff**, con livello, scadenza, ultimo errore e reset per singola sorgente.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
   per tag.
 
@@ -149,8 +150,9 @@ aggiornamenti** nella scheda di serie/film.
 
 ## 9. Manutenzione
 
-- Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi e
-  riavvia il servizio.
+- Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi,
+  **Aggiorna MediaInfo** (analizza con `ffprobe` i file archiviati senza dati e
+  li salva) e riavvia il servizio.
 - **Pulizia cestino** dalla toolbar **Manutenzione** — è forzata e rimuove subito
   il contenuto selezionato. La pulizia avviata dal pannello **Trash** rispetta
   invece il periodo di retention configurato.

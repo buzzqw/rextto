@@ -369,6 +369,9 @@ Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
 - Risultato persistito in `episodes.media_info_json`/`movies.media_info_json`
   al completamento del post-processing; API `GET /api/media-info` e
   `POST /api/media-info/probe`.
+- **Backfill archivio**: `POST /api/maintenance/backfill-media-info`
+  (`{limit}`) analizza episodi/film archiviati senza dati e li salva; da
+  `probe_best` (file o cartella). Pulsante *Aggiorna MediaInfo* in Manutenzione.
 
 ### 8.8 Refactor AddOptions (libtorrent)
 
@@ -398,7 +401,8 @@ Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
 - `src/backoff.rs` (scala di Sonarr) + tabella `provider_status`.
 - Feed e indexer in stato di backoff vengono saltati nel fan-out; successi e
   fallimenti aggiornano il livello. API `GET/POST /api/providers/status` e
-  pulsante di reset nella UI.
+  pannello **Sorgenti in backoff** (tab *Acquisizione*) con livello, scadenza,
+  ultimo errore e reset per singola sorgente.
 
 ### 8.10 Housekeeping
 

@@ -212,6 +212,39 @@ pub fn parse_ffprobe(root: &Value) -> MediaInfo {
     info
 }
 
+const VIDEO_EXTENSIONS: [&str; 8] = ["mkv", "mp4", "avi", "m4v", "ts", "mov", "wmv", "webm"];
+
+/// Probes a video file, or the largest video file directly inside a directory
+/// (archive entries are sometimes stored as a folder).
+pub fn probe_best(path: &Path) -> Option<MediaInfo> {
+    if path.is_file() {
+        return probe(path);
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        let candidate = entry.path();
+        if !candidate.is_file() {
+            continue;
+        }
+        let extension = candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(current, _)| size > *current) {
+            best = Some((size, candidate));
+        }
+    }
+    best.and_then(|(_, path)| probe(&path))
+}
+
 /// Runs `ffprobe` on `path`. Returns `None` when the binary is missing, the
 /// file is unreadable, or the output is not valid JSON.
 pub fn probe(path: &Path) -> Option<MediaInfo> {

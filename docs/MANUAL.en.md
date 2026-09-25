@@ -119,9 +119,10 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
 - **Advanced** — free-space guard, trash retention, archive retention, feed
   pages, rename-verify interval, move episodes, debug flags.
 - **Acquisition** — download delay for series/movies (with a high-score
-  bypass), housekeeping interval and **Watched folders**: Rextto scans the
-  chosen directories and adds copied `.torrent`/`.magnet` files, removing them
-  (or renaming them `.imported`) after a successful add.
+  bypass), housekeeping interval, **Watched folders** (Rextto scans the chosen
+  directories and adds copied `.torrent`/`.magnet` files, removing them or
+  renaming them `.imported` after a successful add) and **Sources in backoff**
+  with level, deadline, last error and per-source reset.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
 
 Release sanity checks are **automatic** and not configurable: hardcoded
@@ -145,7 +146,9 @@ later ones (gap-fill and manual actions always pass). To freeze a title, use
 
 ## 9. Maintenance
 
-- Backup now, clean trash, rescore, scan archives and restart the service.
+- Backup now, clean trash, rescore, scan archives, **Refresh MediaInfo**
+  (probes archived files without data via `ffprobe` and stores it) and restart
+  the service.
 - **Trash cleanup** from the **Maintenance** toolbar is forced: it removes the
   selected trash content immediately. Cleanup started from the **Trash** panel
   respects the configured retention period.

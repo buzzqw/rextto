@@ -6031,6 +6031,58 @@ fn WatchedFoldersPanel() -> impl IntoView {
 }
 
 #[component]
+fn ProvidersStatusPanel() -> impl IntoView {
+    let items = RwSignal::new(Vec::<Value>::new());
+    let message = RwSignal::new(String::new());
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(value) = get("/api/providers/status").await {
+                items.set(array(&value, "items"));
+            }
+        });
+    });
+    view! {
+        <Panel title="Sorgenti in backoff">
+            <p class="hint">{ctx_tr("Sorgenti disattivate temporaneamente dopo ripetuti errori. Rextto le riattiva da solo; qui puoi azzerare il timer di una singola sorgente.")}</p>
+            <Show when=move || items.get().is_empty()>
+                <Empty text="Nessuna sorgente disattivata." />
+            </Show>
+            <div class="table-wrap">
+                <table class="data-table">
+                    <thead><tr><th>{ctx_tr("Sorgente")}</th><th>{ctx_tr("Tipo")}</th><th>{ctx_tr("Livello")}</th><th>{ctx_tr("Riattiva alle")}</th><th>{ctx_tr("Ultimo errore")}</th><th></th></tr></thead>
+                    <tbody>
+                        {move || items.get().iter().enumerate().map(|(index, item)| {
+                            view! {
+                                <tr>
+                                    <td class="truncate">{text(item, "provider", "-")}</td>
+                                    <td>{text(item, "kind", "-")}</td>
+                                    <td class="numeric">{number(item, "level")}</td>
+                                    <td class="muted">{text(item, "disabled_till", "-")}</td>
+                                    <td class="muted truncate">{text(item, "last_error", "-")}</td>
+                                    <td><button class="btn sm" on:click=move |_| {
+                                        let provider = text(&items.get()[index], "provider", "");
+                                        spawn_local(async move {
+                                            match send("POST", "/api/providers/status", Some(json!({"provider": provider}))).await {
+                                                Ok(_) => message.set("Timer azzerato".into()),
+                                                Err(error) => message.set(error),
+                                            }
+                                            if let Ok(value) = get("/api/providers/status").await {
+                                                items.set(array(&value, "items"));
+                                            }
+                                        });
+                                    }>{ctx_tr("Azzera")}</button></td>
+                                </tr>
+                            }
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+            <div class="toolbar"><small class="muted">{move || message.get()}</small></div>
+        </Panel>
+    }
+}
+
+#[component]
 fn EventHooksPanel() -> impl IntoView {
     let hooks = RwSignal::new(Vec::<Value>::new());
     let message = RwSignal::new(String::new());
@@ -6184,6 +6236,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </Panel>
                 <WatchedFoldersPanel />
+                <ProvidersStatusPanel />
             </Show>
             <Show when=move || tab.get() == "sources">
                 <Panel title="Sorgenti di ricerca">
@@ -8027,6 +8080,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     <button class="btn" title=ctx_tr("Svuota subito il cestino ignorando la conservazione configurata") on:click=move |_| run_post(data, "/api/maintenance/clean-trash", Some(json!({"force": true})), "Trash pulito")>{ctx_tr("Pulisci trash")}</button>
                     <button class="btn" title=ctx_tr("Ricalcola il punteggio di qualità degli episodi indicizzati con le regole scoring attuali") on:click=move |_| run_post(data, "/api/database/rescore", None, "Scoring ricalcolato")>{ctx_tr("Ricalcola scoring")}</button>
                     <button class="btn" title=ctx_tr("Rileggi le cartelle archivio e registra nel database i file video già presenti") on:click=move |_| run_post(data, "/api/scan-all-archives", None, "Archivi scansionati")>{ctx_tr("Scansiona archivi")}</button>
+                    <button class="btn" title=ctx_tr("Analizza con ffprobe i file archiviati senza dati MediaInfo e li salva nel database") on:click=move |_| run_post(data, "/api/maintenance/backfill-media-info", Some(json!({"limit": 200})), "MediaInfo aggiornato")>{ctx_tr("Aggiorna MediaInfo")}</button>
                     <button class="btn" title=ctx_tr("Rinomina in background tutti i file archiviati, con progresso") on:click=move |_| {
                         run_post(data, "/api/rename-all", Some(json!({})), "Rinomina avviata…");
                         spawn_local(async move {
