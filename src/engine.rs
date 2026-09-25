@@ -333,7 +333,9 @@ impl Engine {
         let mut kept = Vec::with_capacity(all.len());
         for release in std::mem::take(&mut all) {
             if let Some(reason) = cfg.all_release_denied_reason(&release) {
-                crate::rules::log_rejection(&release, &reason);
+                if cfg.release_is_monitored(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                }
                 continue;
             }
             // Un feed RSS con solo link `.torrent` (es. TorrentLeech) non ha un
@@ -546,7 +548,9 @@ async fn search_one_with_db(
     let mut kept = Vec::with_capacity(all.len());
     for release in all {
         if let Some(reason) = cfg.all_release_denied_reason(&release) {
-            crate::rules::log_rejection(&release, &reason);
+            if cfg.release_is_monitored(&release) {
+                crate::rules::log_rejection(&release, &reason);
+            }
             continue;
         }
         if magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash)) {

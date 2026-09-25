@@ -150,7 +150,8 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
 Release sanity checks are **automatic** and not configurable: hardcoded
 subtitles (`HC`) and absurd sizes (a per-resolution floor derived from a real
 archive) are refused, with an `INFO` log line reporting the title, resolution,
-size and reason. The older-episode protection is fixed too: Rextto never
+size and reason for monitored titles; unrelated releases are discarded without
+logging. The older-episode protection is fixed too: Rextto never
 re-downloads an earlier episode outside a recognised gap while it already owns
 later ones (gap-fill and manual actions always pass). To freeze a title, use
 **Allow upgrades** in the series/movie editor.

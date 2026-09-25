@@ -8129,7 +8129,9 @@ async fn manual_search(
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))
         {
             if let Some(reason) = s.cfg.all_release_denied_reason(&release) {
-                crate::rules::log_rejection(&release, &reason);
+                if s.cfg.release_is_monitored(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                }
             } else {
                 results.push(release);
             }

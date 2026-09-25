@@ -1197,6 +1197,23 @@ impl Config {
         self.all_release_denied_reason(release).is_none()
     }
 
+    /// Returns whether a release belongs to a monitored title. Global filters
+    /// run before acquisition matching, so unrelated indexer noise must not
+    /// produce rejection logs (not even at DEBUG).
+    pub fn release_is_monitored(&self, release: &crate::models::Release) -> bool {
+        match release.kind.as_str() {
+            "series" => release
+                .series
+                .as_deref()
+                .and_then(|name| self.find_series_match(name, release.season))
+                .is_some(),
+            "movie" => self
+                .find_movie_match(&release.title, release.year)
+                .is_some(),
+            _ => false,
+        }
+    }
+
     /// Every global rejection reason combined (static filters, per-source
     /// filters and the built-in sanity rules). Used for logging and the manual
     /// search `allowed` flag so all layers speak with one voice.

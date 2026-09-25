@@ -184,7 +184,9 @@ pub async fn run_cycle_domain(
             }
             if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}")) {
                 if let Some(reason) = cfg.all_release_denied_reason(&release) {
-                    crate::rules::log_rejection(&release, &reason);
+                    if cfg.release_is_monitored(&release) {
+                        crate::rules::log_rejection(&release, &reason);
+                    }
                 } else {
                     releases.push(release);
                 }
@@ -195,7 +197,9 @@ pub async fn run_cycle_domain(
     for (_series, title, magnet, _season, _episode) in db.lock().unwrap().ready_pending()? {
         if let Some(release) = parse_release(&title, &magnet, "timeframe") {
             if let Some(reason) = cfg.all_release_denied_reason(&release) {
-                crate::rules::log_rejection(&release, &reason);
+                if cfg.release_is_monitored(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                }
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
@@ -216,7 +220,9 @@ pub async fn run_cycle_domain(
     for (_name, title, magnet, _year) in db.lock().unwrap().ready_pending_movies()? {
         if let Some(release) = parse_release(&title, &magnet, "delay") {
             if let Some(reason) = cfg.all_release_denied_reason(&release) {
-                crate::rules::log_rejection(&release, &reason);
+                if cfg.release_is_monitored(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                }
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
@@ -340,7 +346,9 @@ pub async fn run_cycle_domain(
                 if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}"))
                 {
                     if let Some(reason) = cfg.all_release_denied_reason(&release) {
-                        crate::rules::log_rejection(&release, &reason);
+                        if cfg.release_is_monitored(&release) {
+                            crate::rules::log_rejection(&release, &reason);
+                        }
                     } else {
                         tracing::debug!(series = %series, season, episode, title = %release.title, source = %release.source, "archive release found");
                         releases.push(release);
