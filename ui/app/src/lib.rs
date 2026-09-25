@@ -34,6 +34,7 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("health", "Salute"),
             ("logs", "Log"),
             ("blocklist", "Blocklist"),
+            ("manual", "Manuale"),
             ("license", "Licenza"),
         ],
     ),
@@ -85,6 +86,243 @@ struct GlobalSearch {
     loading: RwSignal<bool>,
     searched: RwSignal<bool>,
     elapsed: RwSignal<u32>,
+}
+
+/// Tab del pannello Configurazione (id interno -> etichetta).
+const SETTINGS_TABS: &[(&str, &str)] = &[
+    ("daemon", "Daemon"),
+    ("sources", "Sorgenti"),
+    ("libtorrent", "Libtorrent"),
+    ("scores", "Punteggi"),
+    ("rename", "Rinomina"),
+    ("advanced", "Avanzate"),
+    ("acquisition", "Acquisizione"),
+    ("notify", "Notifiche"),
+    ("paths", "Percorsi"),
+    ("i18n", "Traduzioni"),
+];
+
+/// Voce dell'indice delle impostazioni: (etichetta italiana, tab, chiave
+/// `setting_key` usata per ancorare il campo nel DOM).
+const SETTINGS_INDEX: &[(&str, &str, &str)] = &[
+    // daemon
+    ("Ricerca automatica serie/film (secondi)", "daemon", "refresh_interval"),
+    ("Età massima release (giorni)", "daemon", "max_release_age_days"),
+    ("Gap massimi per serie/ciclo", "daemon", "gap_fill_max_per_series"),
+    ("Gap filling attivo", "daemon", "gap_filling"),
+    ("Intervallo deep search (ore)", "daemon", "gap_deep_interval_hours"),
+    ("Deep search massime per ciclo", "daemon", "gap_deep_max_per_cycle"),
+    ("Attivo", "daemon", "active"),
+    // sources
+    ("Blacklist (parole separate da virgola)", "sources", "blacklist"),
+    ("Feed RSS", "sources", ""),
+    ("Indexer Torznab (Jackett / Prowlarr)", "sources", ""),
+    ("FlareSolverr", "sources", ""),
+    ("Motori web", "sources", ""),
+    ("Filtri contenuto esclusi", "sources", ""),
+    ("Filtri per sorgente", "sources", ""),
+    // libtorrent
+    ("Client abilitato", "libtorrent", "libtorrent_enabled"),
+    ("Auto-gestione dinamica coda e risorse", "libtorrent", "libtorrent_dynamic_queue"),
+    ("Ottimizzazione continua (periodica)", "libtorrent", "libtorrent_auto_optimize"),
+    ("Slot download dinamici minimi", "libtorrent", "libtorrent_dynamic_queue_min"),
+    ("Slot download dinamici massimi", "libtorrent", "libtorrent_dynamic_queue_max"),
+    ("Non contare i torrent fermi negli slot attivi", "libtorrent", "libtorrent_dont_count_slow_torrents"),
+    ("Considera stalled dopo (minuti)", "libtorrent", "libtorrent_stall_after_min"),
+    ("Retry stalled (minuti)", "libtorrent", "libtorrent_stall_retry_min"),
+    ("Rimozione stalled (minuti, 0 = mai)", "libtorrent", "libtorrent_stall_giveup_min"),
+    ("Download sequenziale", "libtorrent", "libtorrent_sequential"),
+    ("Download attivi", "libtorrent", "libtorrent_active_downloads"),
+    ("Seed attivi", "libtorrent", "libtorrent_active_seeds"),
+    ("Limite torrent attivi", "libtorrent", "libtorrent_active_limit"),
+    ("Seed ratio globale (0 = infinito)", "libtorrent", "libtorrent_seed_ratio"),
+    ("Seed massimo (minuti, fallback)", "libtorrent", "libtorrent_seed_time"),
+    ("Seed massimo (giorni)", "libtorrent", "libtorrent_seed_time_days"),
+    ("Elimina i completati dopo il seed", "libtorrent", "auto_remove_completed"),
+    ("Limite connessioni totali", "libtorrent", "libtorrent_connections_limit"),
+    ("Slot upload", "libtorrent", "libtorrent_upload_slots_limit"),
+    ("Half-open limit", "libtorrent", "libtorrent_half_open_limit"),
+    ("Connessioni max per torrent", "libtorrent", "libtorrent_max_connections_per_torrent"),
+    ("Upload max per torrent", "libtorrent", "libtorrent_max_uploads_per_torrent"),
+    ("Thread AIO disco", "libtorrent", "libtorrent_aio_threads"),
+    ("Cache disco (blocchi, -1 auto)", "libtorrent", "libtorrent_cache_size"),
+    ("Scadenza cache (s)", "libtorrent", "libtorrent_cache_expiry"),
+    ("Coda alert", "libtorrent", "libtorrent_alert_queue_size"),
+    ("DHT", "libtorrent", "libtorrent_dht"),
+    ("PEX", "libtorrent", "libtorrent_pex"),
+    ("LSD", "libtorrent", "libtorrent_lsd"),
+    ("UPnP", "libtorrent", "libtorrent_upnp"),
+    ("NAT-PMP", "libtorrent", "libtorrent_natpmp"),
+    ("uTP", "libtorrent", "libtorrent_utp"),
+    ("Preferisci RC4", "libtorrent", "libtorrent_prefer_rc4"),
+    ("Annuncia a tutti i tracker", "libtorrent", "libtorrent_announce_to_all_trackers"),
+    ("Annuncia a tutti i tier", "libtorrent", "libtorrent_announce_to_all_tiers"),
+    ("Più connessioni per IP", "libtorrent", "libtorrent_allow_multiple_connections_per_ip"),
+    ("Intervallo announce (s)", "libtorrent", "libtorrent_announce_interval"),
+    ("Connect boost", "libtorrent", "libtorrent_torrent_connect_boost"),
+    ("Nodi bootstrap DHT", "libtorrent", "libtorrent_dht_bootstrap_nodes"),
+    ("Cifratura", "libtorrent", "libtorrent_encryption"),
+    ("Applica IP filter", "libtorrent", "libtorrent_apply_ip_filter"),
+    ("IP filter (file/URL)", "libtorrent", "libtorrent_ipfilter_url"),
+    ("Proxy host", "libtorrent", "libtorrent_proxy_host"),
+    ("Proxy porta", "libtorrent", "libtorrent_proxy_port"),
+    ("Interfacce listen", "libtorrent", "libtorrent_listen_interfaces"),
+    ("Usa il RAM disk", "libtorrent", "libtorrent_ramdisk_enabled"),
+    ("Dimensione massima per torrent (GB)", "libtorrent", "libtorrent_ramdisk_threshold_gb"),
+    ("Margine libero da mantenere (GB)", "libtorrent", "libtorrent_ramdisk_margin_gb"),
+    ("Spazio minimo libero (byte, 0 = dal margine)", "libtorrent", "libtorrent_ramdisk_min_free_bytes"),
+    ("Porta minima", "libtorrent", "libtorrent_port_min"),
+    ("Porta massima", "libtorrent", "libtorrent_port_max"),
+    ("Download globale (KiB/s, 0 = illimitato)", "libtorrent", "libtorrent_dl_limit"),
+    ("Upload globale (KiB/s, 0 = illimitato)", "libtorrent", "libtorrent_ul_limit"),
+    ("Programmazione velocità attiva", "libtorrent", "libtorrent_sched_enabled"),
+    ("Programmazione — ora inizio (HH:MM)", "libtorrent", "libtorrent_sched_start"),
+    ("Programmazione — ora fine (HH:MM)", "libtorrent", "libtorrent_sched_end"),
+    ("Programmazione — giorni (0=Lun … 6=Dom, es. 0,1,2,3,4)", "libtorrent", "libtorrent_sched_days"),
+    ("Programmazione — download (KiB/s)", "libtorrent", "libtorrent_sched_dl_limit"),
+    ("Programmazione — upload (KiB/s)", "libtorrent", "libtorrent_sched_ul_limit"),
+    ("Impostazioni libtorrent avanzate", "libtorrent", "libtorrent_extra_settings"),
+    ("Interfaccia VPN (killswitch)", "libtorrent", ""),
+    ("Test porte torrent", "libtorrent", ""),
+    ("RAM disk", "libtorrent", ""),
+    ("IP filter", "libtorrent", ""),
+    // scores
+    ("Gruppi custom (release group)", "scores", ""),
+    ("Simulatore punteggio", "scores", ""),
+    // rename
+    ("Rinomina episodi", "rename", "rename_episodes"),
+    ("Lingua TVDB (es. ita, eng)", "rename", "tvdb_language"),
+    ("Lingua TMDB (es. it-IT)", "rename", "tmdb_language"),
+    ("Lingua predefinita (es. ita)", "rename", "default_language"),
+    ("Cleanup upgrade", "rename", "cleanup_upgrades"),
+    ("Differenza minima score per cleanup", "rename", "cleanup_min_score_diff"),
+    ("Differenza minima score per upgrade", "rename", "upgrade_min_score_diff"),
+    ("Token API Rextto", "rename", "api_token"),
+    ("Formato rinomina", "rename", "rename-format"),
+    ("Template rinomina", "rename", "rename-template"),
+    ("TMDB API key", "rename", "tmdb_api_key"),
+    ("TVDB API key", "rename", "tvdb_api_key"),
+    // advanced
+    ("Spazio libero minimo per scaricare (GB)", "advanced", "min_free_space_gb"),
+    ("Trash — giorni di conservazione (0 = sempre tutto)", "advanced", "trash_retention_days"),
+    ("Archivio — giorni di conservazione (0 = illimitato)", "advanced", "archive_retention_days"),
+    ("Pulizia automatica archivio", "advanced", "archive_cleanup_enabled"),
+    ("Archivio — età massima (giorni)", "advanced", "archive_max_age_days"),
+    ("Archivio — mantieni almeno N voci", "advanced", "archive_keep_min"),
+    ("Pagine feed da leggere", "advanced", "stop_on_old_page_threshold"),
+    ("Verifica rinomina (ore)", "advanced", "rename_verify_interval"),
+    ("Sposta gli episodi/pack in archivio (non copiare)", "advanced", "move_episodes"),
+    ("Debug (log dettagliati)", "advanced", "debug_enabled"),
+    // acquisition
+    ("Delay serie (minuti, 0 = nessuno)", "acquisition", "delay_torrent_minutes"),
+    ("Delay film (minuti, 0 = nessuno)", "acquisition", "delay_movies_minutes"),
+    ("Bypassa il delay sopra questo punteggio (0 = mai)", "acquisition", "delay_bypass_score"),
+    ("Housekeeping periodico attivo", "acquisition", "housekeeping_enabled"),
+    ("Housekeeping — intervallo (ore)", "acquisition", "housekeeping_interval_hours"),
+    ("Housekeeping — statistiche cicli di ricerca conservate", "acquisition", "housekeeping_retain_cycles"),
+    ("Housekeeping — visti nel feed (giorni, 0 = mai)", "acquisition", "housekeeping_seen_days"),
+    ("Housekeeping — storico download (giorni, 0 = conserva)", "acquisition", "housekeeping_history_days"),
+    ("Backfill MediaInfo automatico", "acquisition", "media_info_backfill_enabled"),
+    ("Backfill MediaInfo — intervallo (minuti)", "acquisition", "media_info_backfill_interval_minutes"),
+    ("Backfill MediaInfo — file per volta", "acquisition", "media_info_backfill_batch"),
+    ("Cartelle osservate", "acquisition", ""),
+    ("Sorgenti in backoff", "acquisition", ""),
+    // notify
+    ("Telegram attivo", "notify", "notify_telegram"),
+    ("Telegram bot token", "notify", "telegram_bot_token"),
+    ("Telegram chat ID", "notify", "telegram_chat_id"),
+    ("Webhook URL", "notify", "notify_webhook_url"),
+    ("Webhook secret", "notify", "notify_webhook_secret"),
+    ("Email attiva", "notify", "notify_email"),
+    ("SMTP", "notify", "email_smtp"),
+    ("Email mittente", "notify", "email_from"),
+    ("Email destinatario", "notify", "email_to"),
+    ("Password email", "notify", "email_password"),
+    // paths
+    ("Cartella archivio", "paths", "archive_root"),
+    ("Cartella trash", "paths", "trash_path"),
+    ("Azione cleanup", "paths", "cleanup_action"),
+    ("Download libtorrent", "paths", "libtorrent_dir"),
+    ("Cartella temporanea libtorrent", "paths", "libtorrent_temp_dir"),
+    ("Percorsi NAS per categoria (tag)", "paths", ""),
+    // i18n
+    ("Importa/esporta traduzioni interfaccia", "i18n", ""),
+];
+
+/// Stato condiviso per aprire la Configurazione su una tab e su un campo
+/// specifico (`focus` = `setting_key` da evidenziare e raggiungere).
+#[derive(Clone, Copy)]
+struct SettingsNav {
+    tab: RwSignal<String>,
+    focus: RwSignal<Option<String>>,
+}
+
+/// Stato del riquadro "Cerca impostazioni": il pulsante vive nel menu, mentre
+/// l'overlay è renderizzato alla radice dell'app (la sidebar ha un
+/// `backdrop-filter` che confinerebbe un `position: fixed`).
+#[derive(Clone, Copy)]
+struct SettingsSearchState {
+    open: RwSignal<bool>,
+}
+
+/// Risultato della ricerca tra le impostazioni.
+#[derive(Clone)]
+struct SettingHit {
+    label: String,
+    tab: &'static str,
+    key: &'static str,
+}
+
+fn settings_tab_label(tab: &str) -> &'static str {
+    SETTINGS_TABS
+        .iter()
+        .find(|(id, _)| *id == tab)
+        .map(|(_, label)| *label)
+        .unwrap_or("Configurazione")
+}
+
+/// Cerca tra le etichette (italiane e tradotte) e le chiavi delle
+/// impostazioni. Include anche i singoli campi punteggio di `SCORE_GROUPS`.
+fn search_settings(data: RwSignal<Data>, query: &str) -> Vec<SettingHit> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.len() < 2 {
+        return Vec::new();
+    }
+    let snapshot = data.get_untracked();
+    let translate = |source: &str| {
+        snapshot
+            .i18n
+            .get(source)
+            .cloned()
+            .unwrap_or_else(|| source.to_string())
+    };
+    let mut hits = Vec::new();
+    for &(label, tab, key) in SETTINGS_INDEX {
+        let translated = translate(label);
+        let haystack = format!("{} {} {}", label, translated, key).to_ascii_lowercase();
+        if haystack.contains(&needle) {
+            hits.push(SettingHit {
+                label: translated,
+                tab,
+                key,
+            });
+        }
+    }
+    for (group, fields) in SCORE_GROUPS {
+        for (label, key, _default) in *fields {
+            let display = format!("{} - {}", translate(group), translate(label));
+            let haystack = format!("{display} {key}").to_ascii_lowercase();
+            if haystack.contains(&needle) {
+                hits.push(SettingHit {
+                    label: display,
+                    tab: "scores",
+                    key,
+                });
+            }
+        }
+    }
+    hits.truncate(14);
+    hits
 }
 
 #[derive(Clone, Default)]
@@ -828,6 +1066,13 @@ pub fn App() -> impl IntoView {
         searched: RwSignal::new(false),
         elapsed: RwSignal::new(0),
     });
+    provide_context(SettingsNav {
+        tab: RwSignal::new("daemon".to_string()),
+        focus: RwSignal::new(None),
+    });
+    provide_context(SettingsSearchState {
+        open: RwSignal::new(false),
+    });
     Effect::new(move |_| {
         refresh.get();
         spawn_local(load(data, busy, false));
@@ -1038,6 +1283,7 @@ pub fn App() -> impl IntoView {
                         <div><strong>Rextto</strong><small title=ctx_tr("Versione applicazione")>{move || format!("Media daemon · v{}", text(&data.get().status, "version", "?"))}</small></div>
                     </div>
                     <nav>
+                        <SettingsSearch />
                         {NAV_GROUPS.iter().enumerate().map(|(index, (_group, items))| {
                             let items = *items;
                             let is_system = index + 1 == NAV_GROUPS.len();
@@ -1137,11 +1383,125 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "health"><HealthView data /></Show>
                         <Show when=move || page.get() == "gaps"><MissingView data /></Show>
                         <Show when=move || page.get() == "blocklist"><BlocklistView data /></Show>
+                        <Show when=move || page.get() == "manual"><ManualView data /></Show>
                         <Show when=move || page.get() == "license"><LicenseView /></Show>
                     </div>
                 </main>
                 <ToastHost data />
+                <SettingsSearchOverlay page=page />
             </div>
+    }
+}
+
+#[component]
+fn SettingsSearch() -> impl IntoView {
+    let state = use_context::<SettingsSearchState>();
+    view! {
+        <button
+            type="button"
+            class="nav-item nav-search"
+            title=ctx_tr("Cerca tra tutte le impostazioni e vai al campo")
+            on:click=move |_| {
+                if let Some(state) = state {
+                    state.open.set(true);
+                }
+            }
+        >
+            <span class="nav-search-icon">"🔍"</span>
+            <span>{ctx_tr("Cerca impostazioni")}</span>
+        </button>
+    }
+}
+
+#[component]
+fn SettingsSearchOverlay(page: RwSignal<String>) -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
+    let nav = use_context::<SettingsNav>();
+    let open = use_context::<SettingsSearchState>()
+        .map(|state| state.open)
+        .unwrap_or_else(|| RwSignal::new(false));
+    let query = RwSignal::new(String::new());
+    let input_ref = NodeRef::<leptos::html::Input>::new();
+    let results = Signal::derive(move || search_settings(data, &query.get()));
+    let choose = move |tab: &'static str, key: &'static str| {
+        if let Some(nav) = nav {
+            nav.tab.set(tab.to_string());
+            nav.focus
+                .set(if key.is_empty() { None } else { Some(key.to_string()) });
+        }
+        page.set("settings".to_string());
+        query.set(String::new());
+        open.set(false);
+    };
+    let has_query = move || query.get().trim().len() >= 2;
+    let has_results = move || !results.get().is_empty();
+    Effect::new(move |_| {
+        if open.get() {
+            if let Some(input) = input_ref.get() {
+                let _ = input.focus();
+            }
+        }
+    });
+    view! {
+        <Show when=move || open.get()>
+            <div class="modal-backdrop" on:click=move |_| open.set(false)>
+                <div
+                    class="modal settings-search-modal"
+                    on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()
+                >
+                    <div class="modal-head">
+                        <h3>{ctx_tr("Cerca impostazioni")}</h3>
+                        <button class="btn sm" type="button" on:click=move |_| open.set(false)>
+                            {ctx_tr("Chiudi")}
+                        </button>
+                    </div>
+                    <div class="modal-body">
+                        <input
+                            node_ref=input_ref
+                            type="search"
+                            prop:value=query
+                            on:input=move |event| query.set(event_target_value(&event))
+                            on:keydown=move |event| {
+                                if event.key() == "Escape" {
+                                    open.set(false);
+                                } else if event.key() == "Enter" {
+                                    if let Some(hit) = results.get_untracked().into_iter().next() {
+                                        choose(hit.tab, hit.key);
+                                    }
+                                }
+                            }
+                            placeholder=ctx_tr("Scrivi almeno 2 lettere (es. proxy, seed, lingua)…")
+                        />
+                        <div class="settings-search-results">
+                            <Show
+                                when=has_query
+                                fallback=move || view! { <span class="muted">{ctx_tr("Scrivi per cercare tra le impostazioni.")}</span> }
+                            >
+                                <Show
+                                    when=has_results
+                                    fallback=move || view! { <span class="muted">{ctx_tr("Nessuna impostazione trovata.")}</span> }
+                                >
+                                    {move || results.get().into_iter().map(|hit| {
+                                        let tab = hit.tab;
+                                        let key = hit.key;
+                                        view! {
+                                            <button
+                                                type="button"
+                                                class="settings-search-hit"
+                                                on:click=move |_| choose(tab, key)
+                                            >
+                                                <span class="settings-search-label">{hit.label}</span>
+                                                <span class="badge">{settings_tab_label(tab)}</span>
+                                            </button>
+                                        }
+                                    }).collect_view()}
+                                </Show>
+                            </Show>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </Show>
     }
 }
 
@@ -6147,14 +6507,14 @@ fn RenameEditor(data: RwSignal<Data>) -> impl IntoView {
         });
     };
     view! {
-        <div class="settings-row" title=ctx_tr("Schema usato per comporre il nome dei file: base, standard, completo o personalizzato.")>
+        <div class="settings-row" id="setting-rename-format" title=ctx_tr("Schema usato per comporre il nome dei file: base, standard, completo o personalizzato.")>
             <label>{ctx_tr("Formato")}</label>
             <select prop:value=format title=ctx_tr("Scegli lo schema di rinomina") on:change=move |event| format.set(event_target_value(&event))>
                 {RENAME_FORMAT_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}
             </select>
             <small class="muted"></small>
         </div>
-        <div class="settings-row" title=ctx_tr("Template usato quando il formato è 'personalizzato': combina i segnaposto come {Serie} o {Risoluzione}.")>
+        <div class="settings-row" id="setting-rename-template" title=ctx_tr("Template usato quando il formato è 'personalizzato': combina i segnaposto come {Serie} o {Risoluzione}.")>
             <label>{ctx_tr("Template custom")}</label>
             <input prop:value=template title=ctx_tr("Template personalizzato del nome file") on:input=move |event| template.set(event_target_value(&event)) placeholder=ctx_tr("{Serie} - {Stagione}{Episodio} - {Titolo}") />
             <div class="form-actions"><button class="btn sm primary" title=ctx_tr("Salva il formato e il template di rinomina") on:click=save>{ctx_tr("Salva")}</button><small class="muted">{message}</small></div>
@@ -6458,18 +6818,43 @@ fn SettingsSaveBar() -> impl IntoView {
 
 #[component]
 fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
-    let tab = RwSignal::new("daemon".to_string());
+    let nav = use_context::<SettingsNav>();
+    let tab = nav
+        .map(|state| state.tab)
+        .unwrap_or_else(|| RwSignal::new("daemon".to_string()));
+    if let Some(state) = nav {
+        Effect::new(move |_| {
+            let Some(key) = state.focus.get() else { return };
+            let state = state;
+            spawn_local(async move {
+                // Attende che la tab richiesta sia montata nel DOM.
+                TimeoutFuture::new(80).await;
+                let Some(element) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.get_element_by_id(&format!("setting-{key}")))
+                else {
+                    state.focus.set(None);
+                    return;
+                };
+                element.scroll_into_view();
+                let _ = element.set_attribute("data-flash", "1");
+                TimeoutFuture::new(2200).await;
+                let _ = element.remove_attribute("data-flash");
+                state.focus.set(None);
+            });
+        });
+    }
     view! {
         <div class="view">
             <SettingsSaveBar />
             <div class="tabs">
-                {[("daemon","Daemon"),("sources","Sorgenti"),("libtorrent","Libtorrent"),("scores","Punteggi"),("rename","Rinomina"),("advanced","Avanzate"),("acquisition","Acquisizione"),("notify","Notifiche"),("paths","Percorsi"),("i18n","Traduzioni")].into_iter().map(|(id, label)| view! {
-                    <button class="tab" class:active=move || tab.get() == id on:click=move |_| tab.set(id.into())>{ctx_tr(label)}</button>
+                {SETTINGS_TABS.iter().map(|(id, label)| view! {
+                    <button class="tab" class:active=move || tab.get() == *id on:click=move |_| tab.set((*id).into())>{ctx_tr(label)}</button>
                 }).collect_view()}
             </div>
             <Show when=move || tab.get() == "daemon">
                 <Panel title="Daemon">
-                    <div class="settings-row" title=ctx_tr("Attiva o disattiva il daemon rextto (i cicli automatici e i download)")><label>{ctx_tr("Attivo")}</label><select prop:value=move || raw(&data.get().config, "active", "false") on:change=move |event| { let value = event_target_value(&event); run_post(data, "/api/config/settings", Some(json!({"key": "active", "value": value})), "Impostazione salvata"); }><option value="true">{ctx_tr("Sì")}</option><option value="false">{ctx_tr("No")}</option></select><small class="muted"></small></div>
+                    <div class="settings-row" id="setting-active" title=ctx_tr("Attiva o disattiva il daemon rextto (i cicli automatici e i download)")><label>{ctx_tr("Attivo")}</label><select prop:value=move || raw(&data.get().config, "active", "false") on:change=move |event| { let value = event_target_value(&event); run_post(data, "/api/config/settings", Some(json!({"key": "active", "value": value})), "Impostazione salvata"); }><option value="true">{ctx_tr("Sì")}</option><option value="false">{ctx_tr("No")}</option></select><small class="muted"></small></div>
                      <TextSetting label="Ricerca automatica serie/film (secondi)" setting_key="refresh_interval" value=Signal::derive(move || raw(&data.get().config, "refresh_secs", "21600")) placeholder="21600" />
                     <TextSetting label="Età massima release (giorni)" setting_key="max_release_age_days" value=Signal::derive(move || raw(&data.get().config, "max_release_age_days", "0")) placeholder="0 = nessun limite" />
                     <TextSetting label="Gap massimi per serie/ciclo" setting_key="gap_fill_max_per_series" value=Signal::derive(move || raw(&data.get().config, "gap_fill_max_per_series", "0")) placeholder="0 = illimitato" />
@@ -6869,7 +7254,7 @@ fn TextSetting(
         }
     });
     view! {
-        <form class="settings-row" title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
+        <form class="settings-row" id=format!("setting-{setting_key}") title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
             event.prevent_default();
             let draft_value = draft.get();
             spawn_local(async move {
@@ -6929,7 +7314,7 @@ fn PathSetting(
         }
     });
     view! {
-        <form class="settings-row" title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
+        <form class="settings-row" id=format!("setting-{setting_key}") title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
             event.prevent_default();
             let draft_value = draft.get();
             spawn_local(async move {
@@ -6982,7 +7367,7 @@ fn AreaSetting(
         }
     });
     view! {
-        <form class="settings-row" title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
+        <form class="settings-row" id=format!("setting-{setting_key}") title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
             event.prevent_default();
             let draft_value = draft.get();
             spawn_local(async move {
@@ -7017,7 +7402,7 @@ fn SecretSetting(label: &'static str, setting_key: &'static str) -> impl IntoVie
     let dirty = use_context::<DirtySettings>();
     let data = use_context::<RwSignal<Data>>();
     view! {
-        <form class="settings-row" title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
+        <form class="settings-row" id=format!("setting-{setting_key}") title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
             event.prevent_default();
             let value = draft.get();
             if value.trim().is_empty() {
@@ -7069,7 +7454,7 @@ fn TmdbKeySetting(data: RwSignal<Data>) -> impl IntoView {
         }
     });
     view! {
-        <div class="settings-row" title=ctx_tr("Chiave API TMDB: serve per titoli episodi, poster e metadati.")>
+        <div class="settings-row" id="setting-tmdb_api_key" title=ctx_tr("Chiave API TMDB: serve per titoli episodi, poster e metadati.")>
             <label>{ctx_tr("TMDB API key")}</label>
             <div class="stack">
                 <div class="path-picker">
@@ -7116,7 +7501,7 @@ fn TvdbKeySetting(data: RwSignal<Data>) -> impl IntoView {
         }
     });
     view! {
-        <div class="settings-row" title=ctx_tr("Chiave API TVDB: serve per ricerca serie e metadati.")>
+        <div class="settings-row" id="setting-tvdb_api_key" title=ctx_tr("Chiave API TVDB: serve per ricerca serie e metadati.")>
             <label>{ctx_tr("TVDB API key")}</label>
             <div class="stack">
                 <div class="path-picker">
@@ -7155,7 +7540,7 @@ fn SelectSetting(
     let data = use_context::<RwSignal<Data>>();
     Effect::new(move |_| draft.set(value.get()));
     view! {
-        <div class="settings-row" title=ctx_tr(setting_tooltip(setting_key))>
+        <div class="settings-row" id=format!("setting-{setting_key}") title=ctx_tr(setting_tooltip(setting_key))>
             <label>{ctx_tr(label)}</label>
             <select prop:value=draft on:change=move |event| {
                 let selected = event_target_value(&event);
@@ -8198,7 +8583,7 @@ fn ScoreField(
     let dirty = use_context::<DirtySettings>();
     Effect::new(move |_| draft.set(value.get()));
     view! {
-        <label class="field" title=ctx_tr(score_tooltip(setting_key))>
+        <label class="field" id=format!("setting-{setting_key}") title=ctx_tr(score_tooltip(setting_key))>
             <span>{ctx_tr(label)}</span>
             <div class="path-picker">
                 <input prop:value=draft on:input=move |event| {
@@ -9320,6 +9705,243 @@ fn BlocklistView(data: RwSignal<Data>) -> impl IntoView {
     view! {
         <div class="view">
             <BlocklistPanel data />
+        </div>
+    }
+}
+
+/// Manuale utente, incorporato nel bundle della UI in italiano e inglese.
+const MANUAL_IT: &str = include_str!("../../../docs/MANUAL.it.md");
+const MANUAL_EN: &str = include_str!("../../../docs/MANUAL.en.md");
+
+/// Slug per gli id dei titoli: rende funzionanti i link interni del manuale
+/// (es. `#1-primo-avvio`), con lo stesso criterio di GitHub.
+fn manual_slug(text: &str) -> String {
+    let mut slug = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+        } else if (ch.is_whitespace() || ch == '-' || ch == '_') && !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+/// Ritorna il contenuto tra due marcatori se `text` inizia con `marker`.
+fn manual_delimited<'a>(text: &'a str, marker: &str) -> Option<(&'a str, usize)> {
+    let after = text.strip_prefix(marker)?;
+    let end = after.find(marker)?;
+    if end == 0 {
+        return None;
+    }
+    Some((&after[..end], marker.len() + end + marker.len()))
+}
+
+/// Riconosce `[etichetta](url)` all'inizio di `text`.
+fn manual_link(text: &str) -> Option<(&str, &str, usize)> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let close = text.find("](")?;
+    let label = &text[1..close];
+    let after = &text[close + 2..];
+    let end = after.find(')')?;
+    let url = &after[..end];
+    if label.is_empty() || url.is_empty() {
+        return None;
+    }
+    Some((label, url, close + 2 + end + 1))
+}
+
+/// Formattazione inline del manuale: `code`, **grassetto**, *corsivo* e link.
+/// Il testo in ingresso è già passato da `escape_html`.
+fn render_manual_inline(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len() + 16);
+    let mut index = 0usize;
+    while index < escaped.len() {
+        let rest = &escaped[index..];
+        if let Some((inner, consumed)) = manual_delimited(rest, "`") {
+            out.push_str("<code>");
+            out.push_str(inner);
+            out.push_str("</code>");
+            index += consumed;
+            continue;
+        }
+        if let Some((inner, consumed)) = manual_delimited(rest, "**") {
+            out.push_str("<strong>");
+            out.push_str(&render_manual_inline(inner));
+            out.push_str("</strong>");
+            index += consumed;
+            continue;
+        }
+        if let Some((inner, consumed)) = manual_delimited(rest, "*") {
+            out.push_str("<em>");
+            out.push_str(&render_manual_inline(inner));
+            out.push_str("</em>");
+            index += consumed;
+            continue;
+        }
+        if let Some((label, url, consumed)) = manual_link(rest) {
+            if url.ends_with(".md") {
+                out.push_str(&render_manual_inline(label));
+            } else if url.starts_with('#') {
+                out.push_str("<a href=\"");
+                out.push_str(url);
+                out.push_str("\">");
+                out.push_str(&render_manual_inline(label));
+                out.push_str("</a>");
+            } else {
+                out.push_str("<a href=\"");
+                out.push_str(url);
+                out.push_str("\" target=\"_blank\" rel=\"noopener\">");
+                out.push_str(&render_manual_inline(label));
+                out.push_str("</a>");
+            }
+            index += consumed;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn flush_manual_paragraph(html: &mut String, paragraph: &mut String) {
+    let text = paragraph.trim();
+    if !text.is_empty() {
+        html.push_str("<p>");
+        html.push_str(&render_manual_inline(&escape_html(text)));
+        html.push_str("</p>");
+    }
+    paragraph.clear();
+}
+
+fn flush_manual_list_item(html: &mut String, item: &mut String) {
+    let text = item.trim();
+    if !text.is_empty() {
+        html.push_str("<li>");
+        html.push_str(&render_manual_inline(&escape_html(text)));
+        html.push_str("</li>");
+    }
+    item.clear();
+}
+
+/// Converte il manuale Markdown in HTML. Copre la sintassi usata dai file
+/// `docs/MANUAL.*.md`: titoli, paragrafi, elenchi puntati, righe orizzontali e
+/// formattazione inline. Evita di introdurre una dipendenza markdown.
+fn render_manual_markdown(markdown: &str) -> String {
+    let mut html = String::with_capacity(markdown.len() * 2);
+    let mut paragraph = String::new();
+    let mut list_item = String::new();
+    let mut in_list = false;
+
+    let heading = |html: &mut String, level: usize, text: &str| {
+        html.push_str(&format!(
+            "<h{0} id=\"{1}\">{2}</h{0}>",
+            level,
+            manual_slug(text),
+            render_manual_inline(&escape_html(text))
+        ));
+    };
+
+    for raw in markdown.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            continue;
+        }
+        if trimmed == "---" {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            html.push_str("<hr>");
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("### ") {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            heading(&mut html, 3, text);
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("## ") {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            heading(&mut html, 2, text);
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("# ") {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            heading(&mut html, 1, text);
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("- ") {
+            flush_manual_paragraph(&mut html, &mut paragraph);
+            flush_manual_list_item(&mut html, &mut list_item);
+            if !in_list {
+                html.push_str("<ul>");
+                in_list = true;
+            }
+            list_item.push_str(text);
+            continue;
+        }
+        // Continuazione di una voce di elenco (riga indentata).
+        if in_list && raw.len() > trimmed.len() {
+            if !list_item.is_empty() {
+                list_item.push(' ');
+            }
+            list_item.push_str(trimmed);
+            continue;
+        }
+        flush_manual_list_item(&mut html, &mut list_item);
+        if in_list {
+            html.push_str("</ul>");
+            in_list = false;
+        }
+        if !paragraph.is_empty() {
+            paragraph.push(' ');
+        }
+        paragraph.push_str(trimmed);
+    }
+    flush_manual_paragraph(&mut html, &mut paragraph);
+    flush_manual_list_item(&mut html, &mut list_item);
+    if in_list {
+        html.push_str("</ul>");
+    }
+    html
+}
+
+#[component]
+fn ManualView(data: RwSignal<Data>) -> impl IntoView {
+    view! {
+        <div class="view">
+            <Panel title="Manuale">
+                <div class="manual-body" inner_html=move || {
+                    let markdown = if data.get().language == "en" { MANUAL_EN } else { MANUAL_IT };
+                    render_manual_markdown(markdown)
+                }></div>
+            </Panel>
         </div>
     }
 }

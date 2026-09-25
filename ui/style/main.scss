@@ -723,3 +723,31 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
   .toolbar .btn, .toolbar .row-actions { flex: 1 1 auto; }
   .panel-head h3 { white-space: normal; }
 }
+
+/* Manuale utente (vista "Manuale"): stile per l'HTML generato dal Markdown. */
+.manual-body { max-width: 70rem; line-height: 1.65; color: var(--text); }
+.manual-body h1 { font-size: 1.5rem; margin: 0 0 14px; }
+.manual-body h2 { font-size: 1.2rem; margin: 26px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line-soft); }
+.manual-body h3 { font-size: 1.02rem; margin: 20px 0 8px; color: var(--label); }
+.manual-body p { margin: 0 0 12px; }
+.manual-body ul { margin: 0 0 14px; padding-left: 22px; }
+.manual-body li { margin: 0 0 4px; }
+.manual-body hr { border: 0; border-top: 1px solid var(--line-soft); margin: 20px 0; }
+.manual-body a { color: var(--accent-2); text-decoration: none; }
+.manual-body a:hover { text-decoration: underline; }
+.manual-body code { padding: 1px 5px; border-radius: 5px; background: var(--code-bg); color: var(--code-text); font: 0.85em/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }
+.manual-body strong { color: var(--text); }
+
+/* Ricerca impostazioni: voce nel menu + overlay con risultati. */
+.nav-search { background: var(--btn); color: var(--btn-text); border: 1px solid var(--btn-line); font-weight: 600; }
+.nav-search:hover { background: var(--hover); color: var(--text); }
+.nav-search-icon { font-size: 0.95rem; }
+.settings-search-modal { width: min(680px, 100%); display: flex; flex-direction: column; max-height: 80vh; }
+.settings-search-modal .modal-body { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.settings-search-modal input[type="search"] { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--input-line); background: var(--input-bg); color: var(--text); }
+.settings-search-results { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; max-height: 52vh; padding: 2px; }
+.settings-search-hit { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid transparent; background: var(--panel-2); color: var(--text); text-align: left; cursor: pointer; }
+.settings-search-hit:hover { background: var(--hover); border-color: var(--btn-line); }
+.settings-search-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-search-hit .badge { flex: none; }
+.settings-row[data-flash="1"], .field[data-flash="1"] { box-shadow: 0 0 0 2px var(--accent-2); border-radius: 8px; transition: box-shadow .2s; }
