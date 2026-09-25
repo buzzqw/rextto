@@ -3,6 +3,12 @@
 # translation is never overwritten. Keys are the Italian source strings used
 # with `ctx_tr`.
 eng:
+  "CPU del processo Rextto": "Rextto process CPU"
+  "RAM residente del processo Rextto": "Rextto process resident RAM"
+  "Sessione torrent in tempo reale": "Live torrent session"
+  "Velocità di download": "Download speed"
+  "Velocità di upload": "Upload speed"
+
   # Comics — GetComics selection flow
   "Aggiungi fumetto": "Add comic"
   "Titolo": "Title"

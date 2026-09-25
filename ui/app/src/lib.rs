@@ -744,6 +744,7 @@ pub fn App() -> impl IntoView {
     spawn_local(async move {
         loop {
             TimeoutFuture::new(4_000).await;
+            let process_metrics = get("/api/process-metrics").await.ok();
             if let Ok(value) = get("/api/torrents").await {
                 if let Some(items) = value.as_array().cloned() {
                     let sample: f64 = items
@@ -763,6 +764,16 @@ pub fn App() -> impl IntoView {
                         })
                         .collect();
                     data.update(|current| {
+                        if let Some(metrics) = process_metrics.as_ref() {
+                            if let Some(health) = current.health.as_object_mut() {
+                                if let Some(resident) = metrics.get("resident_bytes") {
+                                    health.insert("resident_bytes".into(), resident.clone());
+                                }
+                                if let Some(cpu) = metrics.get("process_cpu_percent") {
+                                    health.insert("process_cpu_percent".into(), cpu.clone());
+                                }
+                            }
+                        }
                         // Campioni live per i grafici (CPU, RAM, disco, ramdisk).
                         let health = &current.health;
                         let cpu = health.get("cpu_percent").and_then(Value::as_f64).unwrap_or(0.0);
@@ -885,6 +896,23 @@ pub fn App() -> impl IntoView {
                 .sum(),
         )
     });
+    let live_cpu = Signal::derive(move || {
+        data.get()
+            .health
+            .get("process_cpu_percent")
+            .and_then(Value::as_f64)
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "—".into())
+    });
+    let live_ram = Signal::derive(move || {
+        size_str(
+            data.get()
+                .health
+                .get("resident_bytes")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+        )
+    });
     let live_count = Signal::derive(move || data.get().torrents.len());
     let live_peers = Signal::derive(move || {
         data.get()
@@ -955,7 +983,9 @@ pub fn App() -> impl IntoView {
                         </div>
                         <div class="top-actions">
                             <Show when=move || busy.get()><span class="loading">{ctx_tr("Aggiornamento…")}</span></Show>
-                            <span class="live-stats" title=ctx_tr("Sessione torrent in tempo reale")>
+                             <span class="live-stats" title=ctx_tr("Sessione torrent in tempo reale")>
+                                <span title=ctx_tr("CPU del processo Rextto")>CPU {move || live_cpu.get()}</span>
+                                <span title=ctx_tr("RAM residente del processo Rextto")>RAM {move || live_ram.get()}</span>
                                 <span title=ctx_tr("Velocità di download")>"↓ " {move || format!("{}/s", live_dl.get())}</span>
                                 <span title=ctx_tr("Velocità di upload")>"↑ " {move || format!("{}/s", live_ul.get())}</span>
                                 <span title=ctx_tr("Torrent nella sessione")>{move || format!("{} torrent", live_count.get())}</span>

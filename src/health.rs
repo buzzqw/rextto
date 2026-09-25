@@ -29,6 +29,12 @@ pub struct Health {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ProcessMetrics {
+    pub resident_bytes: u64,
+    pub process_cpu_percent: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DiskInfo {
     pub mount: String,
     pub filesystem: String,
@@ -182,6 +188,20 @@ pub fn check(data_dir: &Path) -> Health {
         archive_root: None,
         ramdisk_path: None,
     })
+}
+
+/// Lightweight process-only metrics for the always-visible UI status bar.
+/// Unlike `check_with_paths`, this does not inspect disks, paths or trash.
+pub fn process_metrics() -> ProcessMetrics {
+    let resident_bytes = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|value| value.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64);
+    ProcessMetrics {
+        resident_bytes,
+        process_cpu_percent: process_cpu_percent(),
+    }
 }
 
 pub fn check_with_paths(paths: &HealthPaths) -> Health {

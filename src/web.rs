@@ -920,6 +920,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/i18n/import/{lang}", post(i18n_import))
         .route("/api/i18n/{lang}", delete(i18n_delete_lang))
         .route("/api/health", get(health_api))
+        .route("/api/process-metrics", get(process_metrics_api))
         .route("/api/status", get(status))
         .route("/api/logs", get(logs))
         .route("/api/logs/stream", get(logs_stream))
@@ -1553,6 +1554,10 @@ async fn health_api(State(s): State<AppState>) -> Json<health::Health> {
         health::check(&s.cfg.data_dir)
     });
     Json(report)
+}
+
+async fn process_metrics_api() -> Json<health::ProcessMetrics> {
+    Json(health::process_metrics())
 }
 async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let marker = setup_complete(&s.cfg);
