@@ -127,32 +127,20 @@ fn display_resolution(resolution: &str) -> String {
     }
 }
 
-/// Logs a rejected release. A rejection caused directly by a built-in sanity
-/// rule (size floor or hardcoded subtitles) is logged at `INFO`; every other
-/// filter, including blacklist/content-filter matches, stays at `DEBUG`.
+/// Logs a rejected release at `DEBUG`. Rejections are routine filter outcomes
+/// and must not pollute the production `INFO` log, including hardcoded
+/// subtitles and size-floor checks.
 pub fn log_rejection(release: &Release, reason: &str) {
-    let sanity_rejection = reason == "hardcoded subtitles"
-        || reason.contains("hard floor")
-        || reason.contains("sanity floor");
-    if sanity_rejection {
-        tracing::info!(
-            title = %release.title,
-            source = %release.source,
-            resolution = %release.quality.resolution,
-            size_mb = release.size_bytes / 1_048_576,
-            season = ?release.season,
-            episode = ?release.episode,
-            reason = %reason,
-            "🚫 release rejected"
-        );
-    } else {
-        tracing::debug!(
-            title = %release.title,
-            source = %release.source,
-            reason = %reason,
-            "🚫 FILTER rejected"
-        );
-    }
+    tracing::debug!(
+        title = %release.title,
+        source = %release.source,
+        resolution = %release.quality.resolution,
+        size_mb = release.size_bytes / 1_048_576,
+        season = ?release.season,
+        episode = ?release.episode,
+        reason = %reason,
+        "🚫 release rejected"
+    );
 }
 
 /// Small preference for a healthier bitrate within the same resolution:
