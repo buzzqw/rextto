@@ -29,7 +29,9 @@ disk).
 - **Multiple sources** — generic RSS feeds, HTML listings (with FlareSolverr
   fallback for Cloudflare), Torznab indexers (Jackett/Prowlarr) and web engines.
 - **Quality scoring** — resolution, source, codec, audio, HDR/Dolby Vision,
-  groups and configurable weights, with a built-in simulator.
+  groups and configurable weights, with a built-in simulator. One score is used
+  consistently for acquisition, searches, upgrades, post-processing, archive
+  records and rescoring, including size and movie-subtitle bonuses.
 - **Automatic upgrades** — replaces an archived file when a better release
   appears (resolution jump, HDTV→WEB-DL, HDR, repack) beyond a configurable
   score threshold.
@@ -37,7 +39,8 @@ disk).
   episode search, calendar, manual search.
 - **Torrents** — embedded libtorrent: queue, limits, tags, peers, trackers,
   files, storage moves, seed policy, fastresume, VPN killswitch and restart
-  recovery. Add options include pause, sequential, skip-check, queue-top,
+  recovery. **Stalled torrents are really paused and excluded from active slots**,
+  then resumed/reannounced automatically. Add options include pause, sequential, skip-check, queue-top,
   first/last piece and metadata-only; per-file priorities, web seeds, tracker
   editing, super seeding and `.torrent`/magnet export are in the torrent
   details.
@@ -61,7 +64,9 @@ disk).
 - **Resilience** — escalating provider backoff with a visible reset list and
   scheduled housekeeping/VACUUM.
 - **Automation without clutter** — external event hooks live under
-  *Integrations* and watched folders under *Configuration*.
+  *Integrations* and watched folders under *Configuration*. Watched files are
+  checked for stability and import failures retry with backoff instead of being
+  abandoned after a fixed attempt limit.
 - **Monotonic library** — Rextto never pulls an older episode outside a
   recognised gap while it already owns later ones (a genuine quality upgrade
   still passes); gap-fill and manual actions always win.
@@ -134,6 +139,9 @@ REXTTO_DATA_DIR="$PWD/data" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
 ```
 
 For a real service installation, use the installer described above.
+
+See the [25 September 2026 operational change sheet](docs/SPECCHIETTO-OPERATIVO-2026-09-25.it.md)
+for the current behaviour, settings and code locations.
 
 ### Check it
 

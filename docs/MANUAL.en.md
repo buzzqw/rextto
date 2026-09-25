@@ -60,6 +60,21 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
   archived), type/season/episode, **NAS tag** (folder rule), score, status
   (*Completed*), the **library/NAS path** and the completion time.
 
+### Stalled torrents
+
+When a torrent stops increasing its completed-byte count for the configured
+period, it enters **stalled** state. Rextto pauses it in libtorrent too, so it no
+longer occupies an active slot. It remains in the session and is resumed and
+reannounced on the next retry. The values are under *Configuration → libtorrent*:
+
+- **Consider stalled after** — 60 minutes by default;
+- **Stalled retry** — 60 minutes by default;
+- **Stalled removal** — 20160 minutes (14 days) by default, `0` = never.
+
+Peers without byte progress do not reset the timer. Look for `DOWNLOAD STALLED`,
+`stalled torrent resumed and reannounced`, and, only after the final limit,
+`DOWNLOAD FAILED — stalled` in the logs.
+
 ## 4. Series
 
 Add a series via TMDB search or manually (title, quality, languages, seasons,
@@ -110,7 +125,11 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   Under *Security, proxy and network* the **VPN killswitch interface** binds
   listening and outgoing traffic to a chosen interface (e.g. `tun0`, `wg0`);
   the list is read from the server, and the change applies after a restart.
-- **Scores** — weights per category, custom groups and a live simulator.
+- **Scores** — weights per category, custom groups and a live simulator. One
+  effective score is used for acquisition, searches, upgrades, post-processing,
+  archive records and rescoring; it also includes the size bonus and, for movies,
+  the preferred-subtitle bonus. Use **Maintenance → Rescore** after changing
+  weights.
 - **Rename** — rename enable, template editor with tokens and live preview,
   TMDB/TVDB keys, language, upgrade thresholds, API token. Verification recovers
   the source token from the original release title stored in the database and
@@ -120,8 +139,9 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   pages, rename-verify interval, move episodes, debug flags.
 - **Acquisition** — download delay for series/movies (with a high-score
   bypass), housekeeping interval, **Watched folders** (Rextto scans the chosen
-  directories and adds copied `.torrent`/`.magnet` files, removing them or
-  renaming them `.imported` after a successful add), **Sources in backoff**
+  directories, waits for two stable observations, and adds copied `.torrent`/
+  `.magnet` files; import failures retry with backoff until they succeed, then
+  files are removed or renamed `.imported`), **Sources in backoff**
   with level, deadline, last error and per-source reset, and the automatic
   **MediaInfo backfill** (configurable files-per-run and interval), plus a
   Maintenance button for an immediate scan.
@@ -151,7 +171,8 @@ scan). If `ffprobe` is missing, the backfill pauses by itself.
   (`download_started`, `torrent_completed`, `season_pack_completed`,
   `torrent_error`, …). Fields accept placeholders such as `{title}`, `{hash}`,
   `{path}`, `{series}`, `{episode}`; the same values are exported as `REXTTO_*`
-  environment variables. Programs run without a shell and with a timeout.
+  environment variables. Programs run without a shell and use a 60-second
+  default timeout (maximum 24 hours; `0` also means the default).
 
 ## 9. Maintenance
 
@@ -216,6 +237,12 @@ test. Completion notifications include size, download time and average speed.
   sources health panel; Cloudflare-protected sites need a working FlareSolverr.
 - **Nothing downloads** — confirm *active mode*, that the series/movie is
   enabled, and check the quality/language filters and the free-space guard.
+- **A torrent is stalled** — check the three values under *Configuration →
+  libtorrent*. It is intentionally paused and excluded from active slots; wait
+  for the retry or use **Resume/Restart** manually.
+- **A watched-folder file is not imported** — keep the `.torrent` or `.magnet`
+  extension. Rextto waits for size and timestamp stability, then retries import
+  errors automatically; check the watcher log.
 - **A file is not renamed** — `mediainfo` should be installed (technical tags);
   check *Rename* settings and the TMDB key.
 - **FTP backup fails** — use *Test FTP*: it reports the failing step (connection,

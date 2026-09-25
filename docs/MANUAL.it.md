@@ -60,6 +60,22 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
   **tag NAS** (regola di cartella), score, stato (*Completato*), **percorso
   libreria/NAS** e data di conclusione.
 
+### Torrent stalled
+
+Quando un torrent non aumenta i byte completati per il tempo configurato, passa
+allo stato **stalled**: Rextto lo mette in pausa anche in libtorrent, quindi non
+occupa più gli slot attivi. Il torrent resta nella sessione; al tentativo
+successivo viene ripreso e riannunciato. I valori sono in *Configurazione →
+libtorrent*:
+
+- **Considera stalled dopo** — default 60 minuti;
+- **Retry stalled** — default 60 minuti;
+- **Rimozione stalled** — default 20160 minuti (14 giorni), `0` = mai.
+
+La presenza di peer senza aumento dei byte non resetta il timer. Nel log cerca
+`DOWNLOAD STALLED`, `stalled torrent resumed and reannounced` e, solo dopo il
+limite finale, `DOWNLOAD FAILED — stalled`.
+
 ## 4. Serie TV
 
 Aggiungi una serie via ricerca TMDB o manualmente (titolo, qualità, lingue,
@@ -111,7 +127,10 @@ la barra “Salva tutte”.
   aggiornamenti. In *Sicurezza, proxy e rete* l'**interfaccia VPN (killswitch)**
   vincola ascolto e traffico in uscita a una scheda scelta (es. `tun0`, `wg0`);
   l'elenco è letto dal server e la modifica si applica dopo il riavvio.
-- **Punteggi** — pesi per categoria, gruppi custom e simulatore live.
+- **Punteggi** — pesi per categoria, gruppi custom e simulatore live. Il punteggio
+  effettivo è unico per acquisizione, ricerche, upgrade, post-processing,
+  archivio e rescore; comprende anche bonus dimensione e, per i film, sottotitoli
+  preferiti. Usa **Manutenzione → Ricalcola scoring** dopo aver cambiato i pesi.
 - **Rinomina** — abilita rinomina, editor del template con token e anteprima,
   chiavi TMDB/TVDB, lingua, soglie di upgrade, token API. La verifica recupera il
   token sorgente dal titolo originale della release nel database ed elimina i
@@ -122,7 +141,9 @@ la barra “Salva tutte”.
 - **Acquisizione** — delay prima del download (serie/film, con bypass per
   punteggio alto), intervallo di housekeeping, **Cartelle osservate**: Rextto
   controlla le cartelle indicate e aggiunge i file `.torrent`/`.magnet` copiati,
-  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta; **Sorgenti in
+  aspettando due rilevazioni stabili prima di leggerli e ritentando gli errori con
+  backoff fino alla riuscita; li rimuove (o li rinomina `.imported`) dopo
+  l'aggiunta; **Sorgenti in
   backoff**, con livello, scadenza, ultimo errore e reset per singola sorgente;
   e il **backfill MediaInfo** automatico (file per volta e intervallo
   configurabili), oltre al pulsante in Manutenzione per una scansione immediata.
@@ -156,7 +177,8 @@ backfill si mette in pausa da solo.
   (`download_started`, `torrent_completed`, `season_pack_completed`,
   `torrent_error`, …). I campi accettano segnaposto come `{title}`, `{hash}`,
   `{path}`, `{series}`, `{episode}`; gli stessi valori sono esposti come variabili
-  d'ambiente `REXTTO_*`. I programmi sono eseguiti senza shell e con timeout.
+  d'ambiente `REXTTO_*`. I programmi sono eseguiti senza shell e con timeout di
+  default pari a 60 secondi (massimo 24 ore; anche `0` usa il default).
 
 ## 9. Manutenzione
 
@@ -226,6 +248,12 @@ velocità media.
   FlareSolverr funzionante.
 - **Non scarica nulla** — verifica la *modalità attiva*, che serie/film siano
   abilitati, e controlla filtri qualità/lingua e il limite di spazio libero.
+- **Un torrent è stalled** — controlla i tre valori in *Configurazione →
+  libtorrent*. Il torrent è intenzionalmente pausato e fuori dalla coda attiva;
+  attendi il retry oppure usa **Riprendi/Riavvia** manualmente.
+- **Una cartella osservata non importa il file** — lascia il file con estensione
+  `.torrent` o `.magnet`; Rextto aspetta che dimensione e timestamp restino
+  stabili, poi ritenta automaticamente gli errori. Controlla il log del watcher.
 - **Un file non viene rinominato** — conviene avere `mediainfo` installato (tag
   tecnici); controlla le impostazioni *Rinomina* e la chiave TMDB.
 - **Il backup FTP fallisce** — usa *Test FTP*: indica il passo che fallisce

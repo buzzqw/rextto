@@ -1406,11 +1406,19 @@ impl Config {
                 };
             }
         }
-        let movie_query = if conn
+        let has_movie_metadata = conn
             .prepare("SELECT tmdb_id,tvdb_id,original_title,overview,poster_path FROM movies_config")
-            .is_ok()
-        {
+            .is_ok();
+        let has_disable_upgrades = conn
+            .prepare("SELECT disable_upgrades FROM movies_config")
+            .is_ok();
+        let movie_query = if has_movie_metadata && has_disable_upgrades {
             "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path,disable_upgrades FROM movies_config"
+        } else if has_movie_metadata {
+            // Databases created before the per-title upgrade switch do not
+            // have `disable_upgrades`; keep loading their movies and use the
+            // default false value instead of silently returning an empty list.
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path,0 FROM movies_config"
         } else if conn
             .prepare("SELECT language_requirements,subtitle_requirements FROM movies_config")
             .is_ok()

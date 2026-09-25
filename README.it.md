@@ -28,7 +28,9 @@ o disco locale).
 - **Sorgenti multiple** — feed RSS generici, listing HTML (con fallback
   FlareSolverr per Cloudflare), indexer Torznab (Jackett/Prowlarr) e motori web.
 - **Punteggio qualità** — risoluzione, sorgente, codec, audio, HDR/Dolby Vision,
-  gruppi e pesi configurabili, con simulatore integrato.
+  gruppi e pesi configurabili, con simulatore integrato. Lo stesso punteggio
+  viene usato per acquisizione, ricerche, upgrade, post-processing, archivio e
+  rescore, includendo bonus dimensione e sottotitoli dei film.
 - **Upgrade automatici** — sostituisce un file archiviato quando compare una
   release migliore (salto di risoluzione, HDTV→WEB-DL, HDR, repack) oltre una
   soglia di punteggio configurabile.
@@ -36,7 +38,8 @@ o disco locale).
   episodi mancanti, calendario, ricerca manuale.
 - **Torrent** — libtorrent embedded: coda, limiti, tag, peer, tracker, file,
   spostamento storage, politica di seeding, fastresume, killswitch VPN e recupero
-  dopo riavvio. In aggiunta: pausa, sequenziale, salta-verifica, cima-coda,
+  dopo riavvio. I torrent **stalled** vengono messi realmente in pausa e fuori
+  dagli slot attivi, poi riprovati automaticamente. In aggiunta: pausa, sequenziale, salta-verifica, cima-coda,
   primo/ultimo pezzo, solo-metadati; priorità per-file, web seed, modifica
   tracker, super seeding ed export `.torrent`/magnet nel dettaglio torrent.
 - **Fumetti** — monitoraggio GetComics e weekly pack.
@@ -58,7 +61,9 @@ o disco locale).
 - **Robustezza** — backoff progressivo delle sorgenti con lista di reset e
   housekeeping/VACUUM programmato.
 - **Automazione senza confusione** — hook eventi sotto *Integrazioni* e cartelle
-  osservate sotto *Configurazione*.
+  osservate sotto *Configurazione*. I file copiati nelle cartelle osservate
+  vengono verificati come stabili e gli errori di importazione vengono ritentati
+  con backoff, senza abbandonarli dopo un numero fisso di tentativi.
 - **Libreria monotona** — Rextto non scarica mai un episodio più vecchio fuori
   dai buchi riconosciuti quando possiede già episodi successivi (un vero upgrade
   di qualità passa comunque); gap-fill e azioni manuali vincono sempre.
@@ -131,6 +136,9 @@ REXTTO_DATA_DIR="$PWD/data" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
 ```
 
 Per installare il servizio reale usa l'installer descritto sopra.
+
+Per i dettagli operativi delle modifiche recenti consulta lo
+[specchietto operativo del 25 settembre 2026](docs/SPECCHIETTO-OPERATIVO-2026-09-25.it.md).
 
 ### Verifica
 
