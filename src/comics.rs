@@ -982,6 +982,13 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
         let Some(raw) = anchor.value().attr("href") else {
             continue;
         };
+        // GetComics sometimes renders a decorative "Download Now" anchor with
+        // an empty href before the real file-host link. Joining an empty href
+        // to the post URL would incorrectly turn the post page itself into a
+        // download candidate.
+        if raw.trim().is_empty() || raw.trim() == "#" {
+            continue;
+        }
         // Un singolo href non valido (es. magnet con caratteri strani) non deve
         // far fallire l'intero parsing della pagina: si salta solo quell'anchor.
         let Ok(joined) = url::Url::parse(page_url).and_then(|base| base.join(raw)) else {
@@ -1874,6 +1881,7 @@ mod tests {
     #[test]
     fn parse_links_identifies_download_now_button() {
         let html = r#"
+            <a href="" title="Download Now">DOWNLOAD NOW</a>
             <a href="/dls/download-now-token">Download Now</a>
             <a href="/dls/download-now-title" title="Download Now">file host</a>
             <a href="https://datanodes.to/file/example.cbr">Alternative download</a>
