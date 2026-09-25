@@ -51,14 +51,20 @@ disk).
 - **Automatic sanity rules** — hardcoded subtitles and absurd file sizes
   (per-resolution floors derived from a real archive) are rejected with a clear
   `INFO` log line; no numbers to configure.
-- **Acquisition tuning** — delay before grabbing with a pending queue,
-  per-title "allow upgrades" switch, ground-truth media inspection via
-  `ffprobe`, escalating provider backoff and scheduled housekeeping/VACUUM.
+- **Acquisition tuning** — delay before grabbing with a pending queue and a
+  per-title "allow upgrades" switch.
+- **Real media inspection** — `ffprobe` results (HDR, codec, audio, languages)
+  are stored per file and **used in upgrade comparisons**, so decisions read the
+  real archived file, not just its name. New files are probed on completion and
+  a scheduled incremental backfill covers the rest; additive only, it never
+  downgrades a file.
+- **Resilience** — escalating provider backoff with a visible reset list and
+  scheduled housekeeping/VACUUM.
 - **Automation without clutter** — external event hooks live under
   *Integrations* and watched folders under *Configuration*.
 - **Monotonic library** — Rextto never pulls an older episode outside a
-  recognised gap while it already owns later ones (a genuine upgrade below the
-  profile cutoff still passes); gap-fill and manual actions always win.
+  recognised gap while it already owns later ones (a genuine quality upgrade
+  still passes); gap-fill and manual actions always win.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
   They include databases and configuration, not media files or torrent state.
 

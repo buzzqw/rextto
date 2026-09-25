@@ -138,6 +138,14 @@ buchi riconosciuti quando possiede già episodi successivi (gap-fill e azioni
 manuali restano sempre permessi). Per congelare un titolo usa **Consenti
 aggiornamenti** nella scheda di serie/film.
 
+I dati reali dei file (`ffprobe`: HDR, codec, audio, lingue) sono salvati per
+episodio/film e **usati nei confronti di upgrade**: il file archiviato viene
+letto com'è davvero, non solo dal nome. Sono additivi (non declassano mai un
+file). I file nuovi vengono analizzati al completamento; gli altri vengono
+coperti dal **backfill MediaInfo** incrementale schedulato (o dal pulsante in
+Manutenzione per una scansione immediata). Se `ffprobe` non è installato il
+backfill si mette in pausa da solo.
+
 ## 8. Integrazioni
 
 - **Trakt / Simkl** — credenziali, flussi PIN/OAuth, import watchlist, calendario,

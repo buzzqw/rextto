@@ -48,15 +48,20 @@ o disco locale).
 - **Regole di sanità automatiche** — sottotitoli hardcoded e dimensioni assurde
   (soglie per risoluzione derivate da un archivio reale) vengono rifiutati con
   una riga `INFO` chiara nel log; nessun numero da configurare.
-- **Regolazione acquisizione** — delay prima del download con coda di attesa,
-  interruttore per-titolo "Consenti aggiornamenti", ispezione reale dei file con
-  `ffprobe`, backoff progressivo delle sorgenti e housekeeping/VACUUM programmato.
+- **Regolazione acquisizione** — delay prima del download con coda di attesa e
+  interruttore per-titolo "Consenti aggiornamenti".
+- **Ispezione reale dei file** — i dati `ffprobe` (HDR, codec, audio, lingue)
+  sono salvati per file e **usati nei confronti di upgrade**, così le decisioni
+  leggono il file archiviato vero, non solo il nome. I file nuovi sono
+  analizzati al completamento; un backfill incrementale schedulato copre gli
+  altri. È additivo: non declassa mai un file.
+- **Robustezza** — backoff progressivo delle sorgenti con lista di reset e
+  housekeeping/VACUUM programmato.
 - **Automazione senza confusione** — hook eventi sotto *Integrazioni* e cartelle
   osservate sotto *Configurazione*.
 - **Libreria monotona** — Rextto non scarica mai un episodio più vecchio fuori
-  dai buchi riconosciuti quando possiede già episodi successivi (un vero
-  upgrade sotto il cutoff del profilo passa comunque); gap-fill e azioni
-  manuali vincono sempre.
+  dai buchi riconosciuti quando possiede già episodi successivi (un vero upgrade
+  di qualità passa comunque); gap-fill e azioni manuali vincono sempre.
 - **Backup** — manuali o programmati (locale, FTP, cartella cloud, Telegram).
   Salvano database e configurazione, non i media né lo stato torrent.
 

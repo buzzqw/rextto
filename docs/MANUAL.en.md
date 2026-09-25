@@ -135,6 +135,13 @@ re-downloads an earlier episode outside a recognised gap while it already owns
 later ones (gap-fill and manual actions always pass). To freeze a title, use
 **Allow upgrades** in the series/movie editor.
 
+The real file data (`ffprobe`: HDR, codec, audio, languages) is stored per
+episode/movie and **used in upgrade comparisons**, so the archived file is read
+as it really is, not just from its name. It is additive (never downgrades a
+file). New files are probed on completion; the rest are covered by the scheduled
+incremental **MediaInfo backfill** (or the Maintenance button for an immediate
+scan). If `ffprobe` is missing, the backfill pauses by itself.
+
 ## 8. Integrations
 
 - **Trakt / Simkl** — credentials, PIN/OAuth flows, watchlist import, calendar,
