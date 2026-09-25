@@ -5340,6 +5340,7 @@ async fn save_setting(
     let allowed = input.key.starts_with("libtorrent_")
         || input.key.starts_with("delay_")
         || input.key.starts_with("housekeeping_")
+        || input.key.starts_with("media_info_")
         || input.key.starts_with("score_")
         || input.key.starts_with("tvdb_")
         || input.key.starts_with("trakt_")
@@ -7751,16 +7752,14 @@ pub struct BackfillMediaInfoInput {
 
 /// Probes archived files that have no stored `ffprobe` result yet. Runs on the
 /// blocking pool; failures are counted, never fatal.
-async fn backfill_media_info(
-    State(s): State<AppState>,
-    input: Option<Json<BackfillMediaInfoInput>>,
-) -> impl IntoResponse {
-    let limit = input
-        .and_then(|value| value.limit)
-        .unwrap_or(100)
-        .clamp(1, 5000);
-    let db = s.db.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+/// Probes up to `limit` archived entries without stored MediaInfo. Blocking
+/// work runs on the blocking pool; returns a small JSON report.
+async fn run_media_info_backfill(
+    state: &AppState,
+    limit: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let targets = db.lock().unwrap().media_info_backfill_targets(limit)?;
         let mut probed = 0usize;
         let mut failed = 0usize;
@@ -7784,6 +7783,17 @@ async fn backfill_media_info(
                     };
                     if updated > 0 {
                         probed += 1;
+                        tracing::debug!(
+                            kind = %target.kind,
+                            series = %target.series,
+                            season = ?target.season,
+                            episode = ?target.episode,
+                            name = %target.name,
+                            resolution = %info.resolution(),
+                            hdr = %info.hdr,
+                            bit_depth = info.bit_depth,
+                            "media info backfill: probed"
+                        );
                     } else {
                         failed += 1;
                     }
@@ -7798,13 +7808,75 @@ async fn backfill_media_info(
             "failed": failed,
         }))
     })
-    .await;
-    match result {
-        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
-        Ok(Err(error)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-        ),
+    .await?
+}
+
+/// Scheduled incremental backfill: a few archived files per run, only those
+/// without stored MediaInfo. Automatic for new files at completion; this
+/// catches files imported by a scan or by hand.
+async fn media_info_backfill_worker(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    let mut warned_unavailable = false;
+    loop {
+        let cfg = latest_config(&state);
+        let enabled = cfg
+            .settings
+            .get("media_info_backfill_enabled")
+            .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
+            .unwrap_or(true);
+        let interval_minutes = cfg
+            .settings
+            .get("media_info_backfill_interval_minutes")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(60)
+            .clamp(5, 24 * 60);
+        let batch = cfg
+            .settings
+            .get("media_info_backfill_batch")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(10)
+            .clamp(1, 200);
+        if enabled {
+            if crate::mediainfo::available() {
+                warned_unavailable = false;
+                match run_media_info_backfill(&state, batch).await {
+                    Ok(report) => {
+                        let candidates =
+                            report.get("candidates").and_then(|value| value.as_u64()).unwrap_or(0);
+                        if candidates > 0 {
+                            tracing::info!(
+                                candidates,
+                                probed = report.get("probed").and_then(|value| value.as_u64()).unwrap_or(0),
+                                failed = report.get("failed").and_then(|value| value.as_u64()).unwrap_or(0),
+                                "🔬 MediaInfo backfill: analyzed archived files"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "MediaInfo backfill run failed")
+                    }
+                }
+            } else if !warned_unavailable {
+                warned_unavailable = true;
+                tracing::warn!(
+                    "ffprobe is not available: MediaInfo backfill paused until it is installed"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(interval_minutes * 60)).await;
+    }
+}
+
+async fn backfill_media_info(
+    State(s): State<AppState>,
+    input: Option<Json<BackfillMediaInfoInput>>,
+) -> impl IntoResponse {
+    let limit = input
+        .and_then(|value| value.limit)
+        .unwrap_or(100)
+        .clamp(1, 5000);
+    match run_media_info_backfill(&s, limit).await {
+        Ok(value) => (StatusCode::OK, Json(value)),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -11090,12 +11162,12 @@ async fn torrent_event_worker(
                                 if let Ok(db) = probe_db.lock() {
                                     let _ = db.set_media_info(&release, &info);
                                 }
-                                tracing::debug!(
+                                tracing::info!(
                                     title = %release.title,
                                     resolution = %info.resolution(),
                                     hdr = %info.hdr,
                                     bit_depth = info.bit_depth,
-                                    "media info stored"
+                                    "🔬 MediaInfo stored for the completed file"
                                 );
                             }
                         })
@@ -13424,6 +13496,7 @@ pub async fn serve(
     let temp_cleanup = tokio::spawn(temp_cleanup_worker(state.clone()));
     let watched = tokio::spawn(watched_folders_worker(state.clone()));
     let housekeeping = tokio::spawn(housekeeping_worker(state.clone()));
+    let media_backfill = tokio::spawn(media_info_backfill_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -13437,6 +13510,7 @@ pub async fn serve(
         registry.push(temp_cleanup);
         registry.push(watched);
         registry.push(housekeeping);
+        registry.push(media_backfill);
     }
     let app = router(state);
     let result = tokio::try_join!(

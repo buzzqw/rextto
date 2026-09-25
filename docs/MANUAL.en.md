@@ -121,8 +121,10 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
 - **Acquisition** — download delay for series/movies (with a high-score
   bypass), housekeeping interval, **Watched folders** (Rextto scans the chosen
   directories and adds copied `.torrent`/`.magnet` files, removing them or
-  renaming them `.imported` after a successful add) and **Sources in backoff**
-  with level, deadline, last error and per-source reset.
+  renaming them `.imported` after a successful add), **Sources in backoff**
+  with level, deadline, last error and per-source reset, and the automatic
+  **MediaInfo backfill** (configurable files-per-run and interval), plus a
+  Maintenance button for an immediate scan.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
 
 Release sanity checks are **automatic** and not configurable: hardcoded

@@ -122,8 +122,10 @@ la barra “Salva tutte”.
 - **Acquisizione** — delay prima del download (serie/film, con bypass per
   punteggio alto), intervallo di housekeeping, **Cartelle osservate**: Rextto
   controlla le cartelle indicate e aggiunge i file `.torrent`/`.magnet` copiati,
-  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta; e **Sorgenti in
-  backoff**, con livello, scadenza, ultimo errore e reset per singola sorgente.
+  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta; **Sorgenti in
+  backoff**, con livello, scadenza, ultimo errore e reset per singola sorgente;
+  e il **backfill MediaInfo** automatico (file per volta e intervallo
+  configurabili), oltre al pulsante in Manutenzione per una scansione immediata.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
   per tag.
 

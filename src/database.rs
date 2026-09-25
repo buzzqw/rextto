@@ -217,6 +217,17 @@ fn renamed_file_title(path: &str) -> String {
 
 /// Qualità "riconoscibile" da un testo (titolo release o nome file): `None` se
 /// non contiene alcun token utile, così il ricalcolo non azzera gli score.
+/// Enriches a quality parsed from a title with stored `ffprobe` data, when
+/// present. Additive only: it fills values the filename did not provide.
+fn enrich_quality_with_media_info(json: Option<&str>, quality: &mut crate::models::Quality) {
+    let Some(json) = json.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if let Ok(info) = serde_json::from_str::<crate::mediainfo::MediaInfo>(json) {
+        info.apply_to_quality(quality);
+    }
+}
+
 fn meaningful_quality(text: &str) -> Option<crate::models::Quality> {
     let quality = parse_quality(text);
     if quality.resolution != "unknown"
@@ -641,7 +652,7 @@ impl Database {
         if same_hash_is_archived {
             return Ok((false, "duplicate".into()));
         }
-        let db_row: Option<(i64, i64, String, String)> = self.conn.query_row("SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).optional()?;
+        let db_row: Option<(i64, i64, String, String, String)> = self.conn.query_row("SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,''),COALESCE(media_info_json,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3", params![sid, season, episode], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?))).optional()?;
         // Intelligenza archivio (parità col legacy `_best_quality_in_path`): se
         // su disco c'è già un file di qualità uguale o superiore, non scaricare
         // anche se il DB non lo conosce. Se il file su disco è inferiore, il
@@ -652,7 +663,7 @@ impl Database {
             }
             let db_score = db_row
                 .as_ref()
-                .map(|(_, value, _, _)| *value)
+                .map(|(_, value, _, _, _)| *value)
                 .unwrap_or(i64::MIN);
             if *disk_score > db_score
                 && release
@@ -663,7 +674,7 @@ impl Database {
                 return Ok((false, "duplicate".into()));
             }
         }
-        if let Some((id, existing_score, existing_title, archive_path)) = db_row {
+        if let Some((id, existing_score, existing_title, archive_path, existing_media)) = db_row {
             if manual && !archive_path.is_empty() {
                 return Ok((false, "duplicate".into()));
             }
@@ -675,7 +686,8 @@ impl Database {
             }
             // legacy upgrade_reason: resolution jump, HDTV→WEB-DL, HDR, first
             // REPACK, or a score gain of at least `min_score_diff`.
-            let old_quality = parse_quality(&existing_title);
+            let mut old_quality = parse_quality(&existing_title);
+            enrich_quality_with_media_info(Some(&existing_media), &mut old_quality);
             if !manual && release
                 .quality
                 .upgrade_reason(&old_quality, score, existing_score, min_score_diff)
@@ -693,7 +705,7 @@ impl Database {
                 |row| row.get(0),
             )?;
             let episode_hash = if hash_taken_elsewhere { None } else { Some(hash.as_str()) };
-            self.conn.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
+            self.conn.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL,media_info_json='' WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
             return Ok((true, "upgrade".into()));
         }
         let hash_taken_elsewhere: bool = self.conn.query_row(
@@ -801,10 +813,10 @@ impl Database {
             if active {
                 continue;
             }
-            let existing: Option<(i64, i64, String, String)> = tx.query_row(
-                "SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3",
+            let existing: Option<(i64, i64, String, String, String)> = tx.query_row(
+                "SELECT id,quality_score,COALESCE(title,''),COALESCE(archive_path,''),COALESCE(media_info_json,'') FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3",
                 params![series_id, season, episode],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             ).optional()?;
             match existing {
                 None => {
@@ -828,17 +840,18 @@ impl Database {
                     tx.execute("INSERT INTO episodes(series_id,season,episode,title,quality_score,magnet_hash,magnet_link) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![series_id, season, episode, release.title, score, episode_hash, release.magnet])?;
                     inserted += 1;
                 }
-                Some((id, existing_score, existing_title, archive_path)) => {
+                Some((id, existing_score, existing_title, archive_path, existing_media)) => {
                     if manual && (!archive_path.is_empty() || context.archive.best_for(season, *episode).is_some()) {
                         continue;
                     }
                     // Confronta col migliore tra la riga DB e il file su disco.
-                    let (old_quality, old_score) = match context.archive.best_for(season, *episode) {
+                    let (mut old_quality, old_score) = match context.archive.best_for(season, *episode) {
                         Some((disk_quality, disk_score)) if *disk_score > existing_score => {
                             (disk_quality.clone(), *disk_score)
                         }
                         _ => (parse_quality(&existing_title), existing_score),
                     };
+                    enrich_quality_with_media_info(Some(&existing_media), &mut old_quality);
                     if manual
                         || (release
                             .quality
@@ -856,7 +869,7 @@ impl Database {
                             None
                         };
                         // COALESCE: se non assegniamo l'hash, mantieni quello esistente.
-                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
+                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL,media_info_json='' WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
                         upgraded += 1;
                     }
                 }
@@ -891,7 +904,7 @@ impl Database {
                         } else {
                             None
                         };
-                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
+                        tx.execute("UPDATE episodes SET title=?1,quality_score=?2,magnet_hash=COALESCE(?3,magnet_hash),magnet_link=?4,downloaded_at=NULL,archive_path=NULL,media_info_json='' WHERE id=?5", params![release.title, score, episode_hash, release.magnet, id])?;
                         upgraded += 1;
                     }
                 }
@@ -960,7 +973,7 @@ impl Database {
             self.conn.execute("UPDATE movies SET name=?1,year=?2,title=?1,quality_score=?3,magnet_link=?4,downloaded_at=NULL,removed_at=NULL WHERE id=?5", params![release.title, release.year, score, release.magnet, id])?;
             return Ok((true, "restored".into()));
         }
-        if let Some((id, existing_score, metadata_json, downloaded_at)) = self.conn.query_row("SELECT m.id,m.quality_score,COALESCE(t.metadata_json,''),m.downloaded_at FROM movies m LEFT JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) WHERE m.removed_at IS NULL AND m.name=?1 AND m.year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))).optional()? {
+        if let Some((id, existing_score, metadata_json, downloaded_at, existing_media)) = self.conn.query_row("SELECT m.id,m.quality_score,COALESCE(t.metadata_json,''),m.downloaded_at,COALESCE(m.media_info_json,'') FROM movies m LEFT JOIN torrent_meta t ON lower(t.hash)=lower(m.magnet_hash) WHERE m.removed_at IS NULL AND m.name=?1 AND m.year IS ?2", params![release.title, release.year], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?))).optional()? {
             // Quality profile cutoff reached on a real imported file: never
             // replace it.
             if forbid_upgrade && downloaded_at.is_some() {
@@ -973,7 +986,11 @@ impl Database {
             // retain the historical score-delta fallback.
             let hard_upgrade = serde_json::from_str::<TorrentMeta>(&metadata_json)
                 .ok()
-                .map(|metadata| {
+                .map(|mut metadata| {
+                    enrich_quality_with_media_info(
+                        Some(&existing_media),
+                        &mut metadata.release.quality,
+                    );
                     release.quality.upgrade_reason(
                         &metadata.release.quality,
                         score,
@@ -990,7 +1007,7 @@ impl Database {
             }
             let previous = self.conn.query_row("SELECT id,name,year,title,quality_score,magnet_hash,magnet_link,downloaded_at,size_bytes FROM movies WHERE id=?1", [id], |row| Ok(UpgradeBackup { kind: "movie".into(), row_id: row.get(0)?, series_id: None, series_name: None, season: None, episode: None, name: Some(row.get::<_, Option<String>>(1)?.unwrap_or_default()), year: row.get(2)?, title: row.get::<_, Option<String>>(3)?.unwrap_or_default(), quality_score: row.get(4)?, magnet_hash: row.get(5)?, magnet_link: row.get(6)?, downloaded_at: row.get(7)?, archive_path: None, size_bytes: row.get(8)? }))?;
             self.save_upgrade_backup(&hash, &previous)?;
-            self.conn.execute("UPDATE movies SET title=?1,quality_score=?2,magnet_hash=?3,magnet_link=?4,downloaded_at=NULL WHERE id=?5", params![release.title, score, hash, release.magnet, id])?;
+            self.conn.execute("UPDATE movies SET title=?1,quality_score=?2,magnet_hash=?3,magnet_link=?4,downloaded_at=NULL,media_info_json='' WHERE id=?5", params![release.title, score, hash, release.magnet, id])?;
             return Ok((true, "upgrade".into()));
         }
         self.conn.execute("INSERT INTO movies(name,year,title,quality_score,magnet_hash,magnet_link,downloaded_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![release.title, release.year, release.title, score, hash, release.magnet, Option::<String>::None])?;
@@ -2815,9 +2832,35 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut changed = 0;
         for (hash, json) in rows {
-            let Ok(meta) = serde_json::from_str::<TorrentMeta>(&json) else {
+            let Ok(mut meta) = serde_json::from_str::<TorrentMeta>(&json) else {
                 continue;
             };
+            // If the archived file was probed, refine the tracked release
+            // quality with the real HDR/codec before rescoring.
+            let media_info: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(media_info_json,'') FROM episodes WHERE lower(magnet_hash)=lower(?1) AND COALESCE(media_info_json,'')<>'' LIMIT 1",
+                    [&hash],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .filter(|value: &String| !value.is_empty())
+                .or_else(|| {
+                    self.conn
+                        .query_row(
+                            "SELECT COALESCE(media_info_json,'') FROM movies WHERE lower(magnet_hash)=lower(?1) AND COALESCE(media_info_json,'')<>'' LIMIT 1",
+                            [&hash],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .filter(|value| !value.is_empty())
+                });
+            if let Some(media_info) = media_info.as_deref() {
+                enrich_quality_with_media_info(Some(media_info), &mut meta.release.quality);
+            }
             let score = meta.release.quality.score_with_settings(settings);
             changed += self.conn.execute(
                 "UPDATE episodes SET quality_score=?1 WHERE lower(magnet_hash)=lower(?2)",
@@ -2836,7 +2879,7 @@ impl Database {
         let episodes = self
             .conn
             .prepare(
-                "SELECT e.id, COALESCE(e.title,''), COALESCE(e.archive_path,'') FROM episodes e
+                "SELECT e.id, COALESCE(e.title,''), COALESCE(e.archive_path,''), COALESCE(e.media_info_json,'') FROM episodes e
                  WHERE e.magnet_hash IS NULL
                     OR NOT EXISTS(SELECT 1 FROM torrent_meta t WHERE lower(t.hash)=lower(e.magnet_hash) AND COALESCE(t.metadata_json,'') != '')",
             )?
@@ -2845,18 +2888,20 @@ impl Database {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, title, path) in episodes {
-            let quality = meaningful_quality(&title).or_else(|| {
+        for (id, title, path, media_info) in episodes {
+            let mut quality = meaningful_quality(&title).or_else(|| {
                 let name = std::path::Path::new(&path)
                     .file_name()
                     .and_then(|value| value.to_str())
                     .unwrap_or_default();
                 meaningful_quality(name)
             });
-            if let Some(quality) = quality {
+            if let Some(quality) = quality.as_mut() {
+                enrich_quality_with_media_info(Some(&media_info), quality);
                 changed += self.conn.execute(
                     "UPDATE episodes SET quality_score=?1 WHERE id=?2",
                     params![quality.score_with_settings(settings), id],
@@ -2867,16 +2912,17 @@ impl Database {
         let movies = self
             .conn
             .prepare(
-                "SELECT m.id, COALESCE(NULLIF(m.title,''), m.name, '') FROM movies m
+                "SELECT m.id, COALESCE(NULLIF(m.title,''), m.name, ''), COALESCE(m.media_info_json,'') FROM movies m
                  WHERE m.magnet_hash IS NULL
                     OR NOT EXISTS(SELECT 1 FROM torrent_meta t WHERE lower(t.hash)=lower(m.magnet_hash) AND COALESCE(t.metadata_json,'') != '')",
             )?
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, title) in movies {
-            if let Some(quality) = meaningful_quality(&title) {
+        for (id, title, media_info) in movies {
+            if let Some(mut quality) = meaningful_quality(&title) {
+                enrich_quality_with_media_info(Some(&media_info), &mut quality);
                 changed += self.conn.execute(
                     "UPDATE movies SET quality_score=?1 WHERE id=?2",
                     params![quality.score_with_settings(settings), id],
@@ -4935,6 +4981,62 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM gap_search_log", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn rescore_uses_stored_media_info() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-rescore-media-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        let media = crate::mediainfo::MediaInfo {
+            hdr: "HDR10".into(),
+            video_codec: "hevc".into(),
+            ..Default::default()
+        };
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,media_info_json) \
+                 VALUES (?1,1,1,'Show.S01E01.1080p.WEB-DL',0,'2024-01-01T00:00:00+00:00',?2)",
+                params![series_id, serde_json::to_string(&media).unwrap()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at) \
+                 VALUES (?1,1,2,'Show.S01E02.1080p.WEB-DL',0,'2024-01-01T00:00:00+00:00')",
+                [series_id],
+            )
+            .unwrap();
+        db.rescore(&std::collections::BTreeMap::new()).unwrap();
+        let score = |episode: i64| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT quality_score FROM episodes WHERE season=1 AND episode=?1",
+                    [episode],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(
+            score(1) > score(2),
+            "stored MediaInfo must raise the archived score: {} vs {}",
+            score(1),
+            score(2)
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

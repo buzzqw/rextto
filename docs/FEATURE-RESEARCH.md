@@ -372,6 +372,17 @@ Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
 - **Backfill archivio**: `POST /api/maintenance/backfill-media-info`
   (`{limit}`) analizza episodi/film archiviati senza dati e li salva; da
   `probe_best` (file o cartella). Pulsante *Aggiorna MediaInfo* in Manutenzione.
+- **Usato nei confronti**: `MediaInfo::apply_to_quality` arricchisce la qualità
+  derivata dal nome (HDR/is_dv, codec, audio, risoluzione, lingue) nei confronti
+  di upgrade (serie singole, pack, film) e nel `rescore`. È **solo additivo**:
+  riempie i valori mancanti, non cancella mai un dato rilevato dal nome, quindi
+  non peggiora la libreria.
+- **Automatico e incrementale**: i file nuovi sono analizzati al completamento
+  (log `INFO` "MediaInfo stored"); un worker periodico analizza pochi file per
+  volta (`media_info_backfill_enabled`, `media_info_backfill_interval_minutes`
+  default 60, `media_info_backfill_batch` default 10), con log `INFO` di
+  riepilogo e skip se `ffprobe` manca. Ogni file è analizzato una sola volta;
+  all'upgrade `media_info_json` viene azzerato per rianalizzare il nuovo file.
 
 ### 8.8 Refactor AddOptions (libtorrent)
 

@@ -51,6 +51,69 @@ impl MediaInfo {
     pub fn has_hdr(&self) -> bool {
         !self.hdr.is_empty()
     }
+
+    /// Enriches a filename-derived quality with ground-truth attributes. It is
+    /// additive: it fills HDR/codec/audio/resolution only when the probe found
+    /// them and the filename value is unknown, so it can never clear a value or
+    /// regress an existing file. Used to make upgrade comparisons read the real
+    /// archived file, not just its name.
+    pub fn apply_to_quality(&self, quality: &mut crate::models::Quality) {
+        if !self.hdr.trim().is_empty() {
+            if quality.hdr.trim().is_empty() {
+                quality.hdr = self.hdr.clone();
+            }
+            if self.hdr.to_ascii_lowercase().contains("dv") {
+                quality.is_dv = true;
+            }
+        }
+        if matches!(quality.codec.trim(), "" | "unknown") {
+            if let Some(codec) = codec_label(&self.video_codec) {
+                quality.codec = codec.to_string();
+            }
+        }
+        if matches!(quality.audio.trim(), "" | "unknown") {
+            if let Some(audio) = audio_label(&self.audio_codec) {
+                quality.audio = audio.to_string();
+            }
+        }
+        if matches!(quality.resolution.trim(), "" | "unknown") {
+            let resolution = self.resolution();
+            if !resolution.is_empty() {
+                quality.resolution = resolution.to_string();
+            }
+        }
+        if quality.languages.is_empty() && !self.audio_languages.is_empty() {
+            quality.languages = self.audio_languages.clone();
+        }
+    }
+}
+
+/// ffprobe codec name → Rextto quality codec label.
+pub fn codec_label(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "hevc" | "h265" => Some("h265"),
+        "h264" | "avc" => Some("h264"),
+        "av1" => Some("av1"),
+        "vp9" => Some("vp9"),
+        "mpeg2video" => Some("mpeg2"),
+        "vc1" => Some("vc1"),
+        _ => None,
+    }
+}
+
+/// ffprobe codec name → Rextto quality audio label.
+pub fn audio_label(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "eac3" => Some("ddp"),
+        "ac3" => Some("ac3"),
+        "aac" => Some("aac"),
+        "dts" => Some("dts"),
+        "truehd" => Some("truehd"),
+        "flac" => Some("flac"),
+        "opus" => Some("opus"),
+        "mp3" => Some("mp3"),
+        _ => None,
+    }
 }
 
 fn text(value: Option<&Value>) -> Option<String> {
@@ -245,6 +308,18 @@ pub fn probe_best(path: &Path) -> Option<MediaInfo> {
     best.and_then(|(_, path)| probe(&path))
 }
 
+/// True when `ffprobe` can be executed. Lets the scheduler skip runs instead
+/// of retrying every entry when the binary is missing.
+pub fn available() -> bool {
+    std::process::Command::new("ffprobe")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Runs `ffprobe` on `path`. Returns `None` when the binary is missing, the
 /// file is unreadable, or the output is not valid JSON.
 pub fn probe(path: &Path) -> Option<MediaInfo> {
@@ -358,6 +433,42 @@ mod tests {
         assert_eq!(info.resolution(), "720p");
         assert_eq!(info.bit_depth, 8);
         assert_eq!(info.hdr, "");
+    }
+
+    #[test]
+    fn apply_to_quality_is_additive_only() {
+        let info = MediaInfo {
+            hdr: "HDR10".into(),
+            video_codec: "hevc".into(),
+            audio_codec: "eac3".into(),
+            width: 1920,
+            height: 1080,
+            audio_languages: vec!["ita".into()],
+            ..Default::default()
+        };
+        let mut unknown = crate::models::Quality {
+            resolution: "1080p".into(),
+            codec: "unknown".into(),
+            audio: "unknown".into(),
+            ..Default::default()
+        };
+        info.apply_to_quality(&mut unknown);
+        assert_eq!(unknown.hdr, "HDR10");
+        assert_eq!(unknown.codec, "h265");
+        assert_eq!(unknown.audio, "ddp");
+        assert_eq!(unknown.languages, vec!["ita"]);
+        // Known values are never overwritten.
+        let mut known = crate::models::Quality {
+            resolution: "1080p".into(),
+            hdr: "HLG".into(),
+            codec: "h264".into(),
+            audio: "dts".into(),
+            ..Default::default()
+        };
+        info.apply_to_quality(&mut known);
+        assert_eq!(known.hdr, "HLG");
+        assert_eq!(known.codec, "h264");
+        assert_eq!(known.audio, "dts");
     }
 
     #[test]

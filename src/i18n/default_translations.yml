@@ -97,3 +97,6 @@ eng:
   "Aggiorna MediaInfo": "Refresh MediaInfo"
   "Analizza con ffprobe i file archiviati senza dati MediaInfo e li salva nel database": "Probe archived files without MediaInfo data with ffprobe and store the result"
   "MediaInfo aggiornato": "MediaInfo updated"
+  "Backfill MediaInfo automatico": "Automatic MediaInfo backfill"
+  "Backfill MediaInfo — intervallo (minuti)": "MediaInfo backfill — interval (minutes)"
+  "Backfill MediaInfo — file per volta": "MediaInfo backfill — files per run"
