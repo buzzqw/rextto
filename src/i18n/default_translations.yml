@@ -8,6 +8,14 @@ eng:
   "Sessione torrent in tempo reale": "Live torrent session"
   "Velocità di download": "Download speed"
   "Velocità di upload": "Upload speed"
+  "CPU": "CPU"
+  "RAM": "RAM"
+  "Download": "Download"
+  "Upload": "Upload"
+  "Torrent": "Torrents"
+  "Peer": "Peers"
+  "Prossimo ciclo": "Next cycle"
+  "Licenza EUPL-1.2. Il testo completo della licenza è riportato qui sotto.": "EUPL-1.2 licence. The complete licence text is shown below."
 
   # Comics — GetComics selection flow
   "Aggiungi fumetto": "Add comic"

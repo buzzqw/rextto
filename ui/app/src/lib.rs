@@ -39,6 +39,8 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+const FULL_EUPL_LICENSE: &str = include_str!("../../../LICENSE");
+
 /// Voci poco usate: restano nel menu su desktop ma sono nascoste su mobile,
 /// così la barra di navigazione del telefono resta corta.
 fn is_optional_nav(id: &str) -> bool {
@@ -983,15 +985,13 @@ pub fn App() -> impl IntoView {
                         </div>
                         <div class="top-actions">
                             <Show when=move || busy.get()><span class="loading">{ctx_tr("Aggiornamento…")}</span></Show>
-                             <span class="live-stats" title=ctx_tr("Sessione torrent in tempo reale")>
-                                <span title=ctx_tr("CPU del processo Rextto")>CPU {move || live_cpu.get()}</span>
-                                <span title=ctx_tr("RAM residente del processo Rextto")>RAM {move || live_ram.get()}</span>
-                                <span title=ctx_tr("Velocità di download")>"↓ " {move || format!("{}/s", live_dl.get())}</span>
-                                <span title=ctx_tr("Velocità di upload")>"↑ " {move || format!("{}/s", live_ul.get())}</span>
-                                <span title=ctx_tr("Torrent nella sessione")>{move || format!("{} torrent", live_count.get())}</span>
-                                <span title=ctx_tr("Peer connessi")>{move || format!("{} peer", live_peers.get())}</span>
-                            </span>
-                            <span class="muted" title=move || tr(data, "Tempo stimato al prossimo ciclo automatico")>{move || tr(data, "Prossimo ciclo: ")}{move || next_cycle.get()}</span>
+                             <div class="top-metric" title=ctx_tr("CPU del processo Rextto")><span class="top-metric-label">{ctx_tr("CPU")}</span><strong>{move || live_cpu.get()}</strong></div>
+                             <div class="top-metric top-metric-ram" title=ctx_tr("RAM residente del processo Rextto")><span class="top-metric-label">{ctx_tr("RAM")}</span><strong>{move || live_ram.get()}</strong></div>
+                             <div class="top-metric top-metric-rate" title=ctx_tr("Velocità di download")><span class="top-metric-label">{move || format!("↓ {}", tr(data, "Download"))}</span><strong>{move || format!("{}/s", live_dl.get())}</strong></div>
+                             <div class="top-metric top-metric-rate" title=ctx_tr("Velocità di upload")><span class="top-metric-label">{move || format!("↑ {}", tr(data, "Upload"))}</span><strong>{move || format!("{}/s", live_ul.get())}</strong></div>
+                             <div class="top-metric" title=ctx_tr("Torrent nella sessione")><span class="top-metric-label">{ctx_tr("Torrent")}</span><strong>{move || live_count.get()}</strong></div>
+                             <div class="top-metric" title=ctx_tr("Peer connessi")><span class="top-metric-label">{ctx_tr("Peer")}</span><strong>{move || live_peers.get()}</strong></div>
+                             <div class="top-metric top-metric-cycle" title=move || tr(data, "Tempo stimato al prossimo ciclo automatico")><span class="top-metric-label">{ctx_tr("Prossimo ciclo")}</span><strong>{move || next_cycle.get()}</strong></div>
                             <button class="btn" title=ctx_tr("Testo più piccolo") on:click=move |_| font_scale.update(|value| *value = (*value - 5).max(85))>{ctx_tr("A−")}</button>
                             <button class="btn" title=ctx_tr("Dimensione testo predefinita (100%)") on:click=move |_| font_scale.set(100)>{move || format!("Testo {}%", font_scale.get())}</button>
                             <button class="btn" title=ctx_tr("Testo più grande") on:click=move |_| font_scale.update(|value| *value = (*value + 5).min(140))>{ctx_tr("A+")}</button>
@@ -9086,7 +9086,8 @@ fn LicenseView() -> impl IntoView {
             <Panel title="Licenza">
                 <div class="stack">
                     <p>{ctx_tr("Rextto — media daemon.")}</p>
-                    <p class="muted">{ctx_tr("Licenza EUPL-1.2. Vedi il file LICENSE nel repository.")}</p>
+                    <p class="muted">{ctx_tr("Licenza EUPL-1.2. Il testo completo della licenza è riportato qui sotto.")}</p>
+                    <pre style="white-space:pre-wrap;max-height:70vh;overflow:auto;padding:16px;border:1px solid var(--border-color);border-radius:8px;background:var(--bg-secondary);font:0.82rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace">{FULL_EUPL_LICENSE}</pre>
                 </div>
             </Panel>
         </div>
