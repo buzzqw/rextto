@@ -362,14 +362,8 @@ pub fn stage_pack_file(
     let season = file.season;
     let episode = file.episode;
     if let Some(existing) = best_episode_file(destination, season, episode) {
-        let existing_score = existing
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(crate::parser::parse_quality)
-            .map(|quality| quality.score_with_settings(&cfg.settings))
-            .unwrap_or(0);
-        let incoming_score = crate::parser::parse_quality(name)
-            .score_with_settings(&cfg.settings);
+        let existing_score = cfg.file_score(&existing, "series", "");
+        let incoming_score = cfg.file_score(&file.path, "series", "");
         if existing_score >= incoming_score.max(release_quality_score) {
             return Ok(Some(existing));
         }
@@ -443,7 +437,7 @@ pub async fn process_pack_files(
         let renamed = rename_episode(&actual, &episode_release, cfg, tmdb).await?;
         let final_path = renamed.unwrap_or(actual);
         let archive = final_path.parent().unwrap_or_else(|| Path::new("."));
-        let score = episode_release.quality.score_with_settings(&cfg.settings);
+        let score = cfg.release_score(&episode_release);
         let discarded = crate::cleaner::discard_if_inferior(
             cfg,
             release.series.as_deref().unwrap_or_default(),
@@ -466,13 +460,13 @@ pub async fn process_pack_files(
         }
         // Score of the file actually kept, so an upgraded 2160p episode is not
         // recorded with the stale 1080p quality of its old title.
-        let quality_score = final_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(crate::parser::parse_quality)
-            .map(|quality| quality.score_with_settings(&cfg.settings))
-            .filter(|value| *value > 0)
-            .unwrap_or(score);
+        let quality_score = cfg
+            .file_score(
+                &final_path,
+                "series",
+                release.series.as_deref().unwrap_or_default(),
+            )
+            .max(score);
         results.push(PackFileResult {
             episode,
             size_bytes: size_of_path(&final_path).unwrap_or(0),
@@ -501,8 +495,10 @@ pub async fn rename_episode(
     if crate::cleaner::resolve_existing_target(
         &source,
         &target,
-        release.quality.score_with_settings(&cfg.settings),
+        cfg.release_score(release),
         cfg,
+        "series",
+        release.series.as_deref().unwrap_or_default(),
     )? {
         apply_sidecars(&source, &target, cfg);
         return Ok(Some(target));
@@ -768,8 +764,10 @@ pub async fn rename_movie(
     if crate::cleaner::resolve_existing_target(
         source,
         &target,
-        release.quality.score_with_settings(&cfg.settings),
+        cfg.release_score(release),
         cfg,
+        "movie",
+        &release.title,
     )? {
         return Ok(Some(target));
     }

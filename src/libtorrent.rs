@@ -1379,7 +1379,7 @@ impl LibtorrentClient {
                     name: native_string(&status.name),
                     save_path: native_string(&status.save_path),
                     progress: status.progress.clamp(0.0, 100.0),
-                    state: if stalled && status.paused == 0 {
+                    state: if stalled {
                         "stalled".into()
                     } else {
                         native_state(status.state, status.paused != 0)
@@ -1672,11 +1672,18 @@ impl LibtorrentClient {
         self.clear_stalled(hash);
         Ok(result)
     }
-    pub fn mark_stalled(&self, hash: &str) {
-        self.stalled
-            .write()
-            .unwrap()
-            .insert(hash.to_ascii_lowercase());
+    pub fn mark_stalled(&self, hash: &str) -> Result<bool> {
+        // Keep the local marker and the native state in sync. Merely changing
+        // the UI label leaves libtorrent's auto-managed queue counting the
+        // torrent as an active download.
+        let paused = self.pause(hash)?;
+        if paused {
+            self.stalled
+                .write()
+                .unwrap()
+                .insert(hash.to_ascii_lowercase());
+        }
+        Ok(paused)
     }
     pub fn clear_stalled(&self, hash: &str) {
         self.stalled

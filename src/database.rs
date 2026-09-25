@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::models::{Release, TorrentMeta};
 use crate::parser::parse_quality;
 use crate::utils::magnet_hash;
@@ -18,17 +19,41 @@ pub struct Database {
 
 /// Real size and default quality score of a file on disk, derived from its
 /// name. Missing files yield zeros so callers can keep the stored values.
-fn file_stats(path: &str) -> (i64, i64) {
+fn file_stats(cfg: &Config, path: &str, kind: &str, title: &str) -> (i64, i64) {
     let size_bytes = std::fs::metadata(path)
         .map(|value| value.len().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
-    let quality_score = Path::new(path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(parse_quality)
-        .map(|quality| quality.score())
-        .unwrap_or(0);
+    let quality_score = cfg.file_score(Path::new(path), kind, title);
     (size_bytes, quality_score)
+}
+
+fn archived_release(
+    title: &str,
+    path: &str,
+    quality: crate::models::Quality,
+    kind: &str,
+    year: Option<i64>,
+) -> Release {
+    Release {
+        torrent_url: None,
+        title: title.to_string(),
+        magnet: String::new(),
+        source: "archive".into(),
+        quality,
+        kind: kind.into(),
+        series: None,
+        season: None,
+        episode: None,
+        is_pack: false,
+        episode_range: Vec::new(),
+        year,
+        discovered_at: Utc::now(),
+        size_bytes: std::fs::metadata(path)
+            .map(|value| value.len().min(i64::MAX as u64) as i64)
+            .unwrap_or(0),
+        seeders: -1,
+        peers: -1,
+    }
 }
 
 /// Runs `VACUUM`/`ANALYZE` on an arbitrary connection (used for every Rextto
@@ -2151,12 +2176,13 @@ impl Database {
     /// together with the real size and (monotonic) quality score of the file.
     pub fn set_episode_archive_path(
         &self,
+        cfg: &Config,
         series_name: &str,
         season: i64,
         episode: i64,
         path: &str,
     ) -> Result<()> {
-        let (size_bytes, quality_score) = file_stats(path);
+        let (size_bytes, quality_score) = file_stats(cfg, path, "series", series_name);
         self.conn.execute(
             "UPDATE episodes SET archive_path=?1, downloaded_at=COALESCE(downloaded_at, datetime('now')), size_bytes=CASE WHEN ?2>0 THEN ?2 ELSE size_bytes END, quality_score=CASE WHEN ?3>quality_score THEN ?3 ELSE quality_score END WHERE series_id=(SELECT id FROM series WHERE name=?4) AND season=?5 AND episode=?6",
             params![path, size_bytes, quality_score, series_name, season, episode],
@@ -2169,12 +2195,13 @@ impl Database {
     /// title needed by the "restore source" pass).
     pub fn refresh_episode_file_stats(
         &self,
+        cfg: &Config,
         series_name: &str,
         season: i64,
         episode: i64,
         path: &str,
     ) -> Result<()> {
-        let (size_bytes, quality_score) = file_stats(path);
+        let (size_bytes, quality_score) = file_stats(cfg, path, "series", series_name);
         self.conn.execute(
             "UPDATE episodes SET size_bytes=CASE WHEN ?1>0 THEN ?1 ELSE size_bytes END, quality_score=CASE WHEN ?2>quality_score THEN ?2 ELSE quality_score END, downloaded_at=COALESCE(downloaded_at, datetime('now')) WHERE series_id=(SELECT id FROM series WHERE name=?3) AND season=?4 AND episode=?5",
             params![size_bytes, quality_score, series_name, season, episode],
@@ -2354,7 +2381,13 @@ impl Database {
     /// Persists the identity found in the actual torrent name when an indexer
     /// advertised a different season. Move the not-yet-downloaded placeholders
     /// with it, otherwise the old RSS season remains eligible for later cycles.
-    pub fn reconcile_pack_release(&self, hash: &str, release: &Release) -> Result<()> {
+    pub fn reconcile_pack_release(
+        &self,
+        hash: &str,
+        release: &Release,
+        cfg: &Config,
+    ) -> Result<()> {
+        let score = cfg.release_score(release);
         let normalized = hash.to_ascii_lowercase();
         let Some(old) = self.torrent_meta(&normalized)? else {
             return Ok(());
@@ -2378,7 +2411,7 @@ impl Database {
         let Some(new_series_id) = new_series_id else {
             tx.execute(
                 "UPDATE torrent_meta SET kind=?1,title=?2,series_name=?3,season=?4,episode=?5,year=?6,quality_score=?7,source=?8,metadata_json=?9,updated_at=?10 WHERE hash=?11",
-                params![release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, metadata_json, now, normalized],
+                params![release.kind, release.title, release.series, release.season, release.episode, release.year, score, release.source, metadata_json, now, normalized],
             )?;
             tx.commit()?;
             return Ok(());
@@ -2421,7 +2454,7 @@ impl Database {
         }
         tx.execute(
             "UPDATE torrent_meta SET kind=?1,title=?2,series_name=?3,season=?4,episode=?5,year=?6,quality_score=?7,source=?8,metadata_json=?9,updated_at=?10 WHERE hash=?11",
-            params![release.kind, release.title, release.series, release.season, release.episode, release.year, release.quality.score(), release.source, metadata_json, now, normalized],
+            params![release.kind, release.title, release.series, release.season, release.episode, release.year, score, release.source, metadata_json, now, normalized],
         )?;
         tx.commit()?;
         Ok(())
@@ -2840,7 +2873,7 @@ impl Database {
     /// personalizzati, e questo li faceva apparire inferiori → riscaricamenti.
     /// La qualità si ricava dal titolo o, in mancanza, dal nome del file
     /// archiviato; se non è riconoscibile il record resta invariato.
-    pub fn rescore(&self, settings: &std::collections::BTreeMap<String, String>) -> Result<usize> {
+    pub fn rescore(&self, cfg: &Config) -> Result<usize> {
         let mut statement = self
             .conn
             .prepare("SELECT hash,metadata_json FROM torrent_meta WHERE metadata_json!=''")?;
@@ -2880,7 +2913,7 @@ impl Database {
             if let Some(media_info) = media_info.as_deref() {
                 enrich_quality_with_media_info(Some(media_info), &mut meta.release.quality);
             }
-            let score = meta.release.quality.score_with_settings(settings);
+            let score = cfg.release_score(&meta.release);
             changed += self.conn.execute(
                 "UPDATE episodes SET quality_score=?1 WHERE lower(magnet_hash)=lower(?2)",
                 params![score, hash],
@@ -2921,9 +2954,10 @@ impl Database {
             });
             if let Some(quality) = quality.as_mut() {
                 enrich_quality_with_media_info(Some(&media_info), quality);
+                let release = archived_release(&title, &path, quality.clone(), "series", None);
                 changed += self.conn.execute(
                     "UPDATE episodes SET quality_score=?1 WHERE id=?2",
-                    params![quality.score_with_settings(settings), id],
+                    params![cfg.release_score(&release), id],
                 )?;
             }
         }
@@ -2931,20 +2965,26 @@ impl Database {
         let movies = self
             .conn
             .prepare(
-                "SELECT m.id, COALESCE(NULLIF(m.title,''), m.name, ''), COALESCE(m.media_info_json,'') FROM movies m
+                "SELECT m.id, COALESCE(NULLIF(m.title,''), m.name, ''), m.year, COALESCE(m.media_info_json,'') FROM movies m
                  WHERE m.magnet_hash IS NULL
                     OR NOT EXISTS(SELECT 1 FROM torrent_meta t WHERE lower(t.hash)=lower(m.magnet_hash) AND COALESCE(t.metadata_json,'') != '')",
             )?
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, title, media_info) in movies {
+        for (id, title, year, media_info) in movies {
             if let Some(mut quality) = meaningful_quality(&title) {
                 enrich_quality_with_media_info(Some(&media_info), &mut quality);
+                let release = archived_release(&title, "", quality, "movie", year);
                 changed += self.conn.execute(
                     "UPDATE movies SET quality_score=?1 WHERE id=?2",
-                    params![quality.score_with_settings(settings), id],
+                    params![cfg.release_score(&release), id],
                 )?;
             }
         }
@@ -3391,16 +3431,16 @@ impl Database {
     /// Registra nel "visto nei feed" tutte le release di un ciclo, in un'unica
     /// transazione. Le release già note vengono aggiornate (found_at, magnet,
     /// qualità) mantenendo `first_seen_at` originale.
-    pub fn record_seen_batch(&self, releases: &[Release]) -> Result<()> {
+    pub fn record_seen_batch(&self, releases: &[Release], cfg: &Config) -> Result<()> {
         if releases.is_empty() {
             return Ok(());
         }
         let transaction = self.conn.unchecked_transaction()?;
         for release in releases {
             if release.kind == "series" {
-                insert_series_seen(&transaction, release)?;
+                insert_series_seen(&transaction, release, cfg.release_score(release))?;
             } else {
-                insert_movie_seen(&transaction, release)?;
+                insert_movie_seen(&transaction, release, cfg.release_score(release))?;
             }
         }
         transaction.commit()?;
@@ -3537,7 +3577,7 @@ fn seen_like_pattern(query: &str) -> String {
     }
 }
 
-fn insert_movie_seen(conn: &Connection, release: &Release) -> Result<()> {
+fn insert_movie_seen(conn: &Connection, release: &Release, quality_score: i64) -> Result<()> {
     let name = crate::utils::extract_clean_movie_name(&release.title);
     let group_key = crate::utils::condensed_key(&name);
     let now = Utc::now().to_rfc3339();
@@ -3563,7 +3603,7 @@ fn insert_movie_seen(conn: &Connection, release: &Release) -> Result<()> {
             release.quality.resolution,
             release.quality.codec,
             release.quality.audio,
-            release.quality.score(),
+            quality_score,
             release.magnet,
             release.source,
             now,
@@ -3573,7 +3613,7 @@ fn insert_movie_seen(conn: &Connection, release: &Release) -> Result<()> {
     Ok(())
 }
 
-fn insert_series_seen(conn: &Connection, release: &Release) -> Result<()> {
+fn insert_series_seen(conn: &Connection, release: &Release, quality_score: i64) -> Result<()> {
     let name = release
         .series
         .clone()
@@ -3604,7 +3644,7 @@ fn insert_series_seen(conn: &Connection, release: &Release) -> Result<()> {
             release.quality.resolution,
             release.quality.codec,
             release.quality.audio,
-            release.quality.score(),
+            quality_score,
             release.magnet,
             release.source,
             now,
@@ -3801,7 +3841,8 @@ mod tests {
         let mut actual = advertised.clone();
         actual.title = "Example.S05E01-06.1080p".into();
         actual.season = Some(5);
-        db.reconcile_pack_release(&hash, &actual).unwrap();
+        db.reconcile_pack_release(&hash, &actual, &Config::default())
+            .unwrap();
 
         assert_eq!(db.torrent_meta(&hash).unwrap().unwrap().release.season, Some(5));
         let old_count: i64 = db
@@ -4464,7 +4505,7 @@ mod tests {
             movie("The.Veil.2024.1080p.BluRay", "1080p"),
             movie("The.Veil.2024.2160p.WEB-DL", "2160p"),
             series_release,
-        ])
+        ], &Config::default())
         .unwrap();
         let (groups, total) = db.movies_seen_grouped(0, 50, "").unwrap();
         assert_eq!(total, 1, "le due release dello stesso film formano un gruppo");
@@ -4747,9 +4788,10 @@ mod tests {
                 [],
             )
             .unwrap();
-        let mut settings = std::collections::BTreeMap::new();
-        settings.insert("score_res_1080p".to_string(), "1500".to_string());
-        db.rescore(&settings).unwrap();
+        let mut cfg = Config::default();
+        cfg.settings
+            .insert("score_res_1080p".to_string(), "1500".to_string());
+        db.rescore(&cfg).unwrap();
         let score = |id: i64| -> i64 {
             db.conn
                 .query_row("SELECT quality_score FROM episodes WHERE id=?1", [id], |row| {
@@ -5040,7 +5082,7 @@ mod tests {
                 [series_id],
             )
             .unwrap();
-        db.rescore(&std::collections::BTreeMap::new()).unwrap();
+        db.rescore(&Config::default()).unwrap();
         let score = |episode: i64| -> i64 {
             db.conn
                 .query_row(

@@ -136,10 +136,10 @@ pub async fn run_cycle_domain(
                 .is_none_or(|hash| !blocked_hashes.contains(&hash))
         });
     }
-    archive.lock().unwrap().save_batch(&releases)?;
+    archive.lock().unwrap().save_batch(&releases, cfg)?;
     // "Seen from feed": record every collected release, including unmonitored
     // titles, so it remains available for archive browsing.
-    if let Err(error) = db.lock().unwrap().record_seen_batch(&releases) {
+    if let Err(error) = db.lock().unwrap().record_seen_batch(&releases, cfg) {
         tracing::debug!(%error, "feed seen recording failed");
     }
     let mut archive_queries = Vec::new();
@@ -573,7 +573,7 @@ pub async fn run_cycle_domain(
             episodes = %episodes_label(&release.episode_range),
             gap_episodes = %episodes_label(&gap_episodes_for_release(release, &gap_targets)),
             source = %release.source,
-            score = release.quality.score_with_settings(&cfg.settings),
+            score = cfg.release_score(release),
             "candidate ready for evaluation"
         );
     }

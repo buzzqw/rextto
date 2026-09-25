@@ -2146,7 +2146,7 @@ async fn series_search_missing(
             result
                 .get("release")
                 .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
-                .map(|release| release.quality.score_with_settings(&cfg.settings))
+                .map(|release| cfg.release_score(&release))
                 .unwrap_or_default(),
         )
     });
@@ -2720,6 +2720,7 @@ async fn series_rename_apply(
                 // DB può essere rimasto alla qualità precedente (es. titolo
                 // 1080p con file 2160p), così l'episodio non viene ri-scaricato.
                 let _ = s.db.lock().unwrap().refresh_episode_file_stats(
+                    &cfg,
                     &series.name,
                     episode.season,
                     episode.episode,
@@ -2743,6 +2744,7 @@ async fn series_rename_apply(
                     // file so an upgraded episode is not marked as the old one.
                     if execute {
                         let _ = s.db.lock().unwrap().refresh_episode_file_stats(
+                            &cfg,
                             &series.name,
                             episode.season,
                             episode.episode,
@@ -2765,6 +2767,7 @@ async fn series_rename_apply(
                     // Il file rinominato ha un nuovo percorso: aggiorna il DB,
                     // altrimenti la prossima anteprima non trova più il file.
                     if let Err(error) = s.db.lock().unwrap().set_episode_archive_path(
+                        &cfg,
                         &series.name,
                         episode.season,
                         episode.episode,
@@ -2881,13 +2884,13 @@ async fn series_rename_apply(
                         &series.name,
                         season,
                         episode_number,
-                        &cfg.settings,
+                        &cfg,
                         &file,
                     );
                 }
                 continue;
             }
-            let score = release.quality.score_with_settings(&cfg.settings);
+            let score = cfg.release_score(&release);
             if execute {
                 match crate::cleaner::discard_if_inferior(
                     &cfg,
@@ -2945,7 +2948,7 @@ async fn series_rename_apply(
                         &series.name,
                         season,
                         episode_number,
-                        &cfg.settings,
+                        &cfg,
                         &target,
                     );
                     items.push(serde_json::json!({
@@ -2963,7 +2966,7 @@ async fn series_rename_apply(
                         &series.name,
                         season,
                         episode_number,
-                        &cfg.settings,
+                        &cfg,
                         &file,
                     );
                 }
@@ -3402,10 +3405,7 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
             && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
-        std::cmp::Reverse(
-            release.quality.score_with_settings(&cfg.settings)
-                + Config::movie_subtitle_bonus(movie, &release.quality),
-        )
+        std::cmp::Reverse(cfg.release_score_for_movie(release, movie))
     });
     (
         StatusCode::OK,
@@ -5651,7 +5651,7 @@ fn link_archive_file(
     series: &str,
     season: i64,
     episode: i64,
-    settings: &std::collections::BTreeMap<String, String>,
+    cfg: &Config,
     path: &FsPath,
 ) {
     let Some(title) = path
@@ -5665,7 +5665,7 @@ fn link_archive_file(
         .metadata()
         .map(|value| value.len().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
-    let quality_score = crate::parser::parse_quality(title).score_with_settings(settings);
+    let quality_score = cfg.file_score(path, "series", series);
     if let Err(error) = db.lock().unwrap().sync_archive_file_scored(
         series,
         season,
@@ -5683,7 +5683,7 @@ fn scan_archive_path(
     db: &Arc<Mutex<Database>>,
     series: &SeriesConfig,
     path: &FsPath,
-    settings: &std::collections::BTreeMap<String, String>,
+    cfg: &Config,
 ) -> anyhow::Result<(usize, usize)> {
     if !path.is_dir() {
         anyhow::bail!("archive path is not a directory: {}", path.display());
@@ -5715,7 +5715,7 @@ fn scan_archive_path(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(name)
             .to_string();
-        let quality_score = crate::parser::parse_quality(&title).score_with_settings(settings);
+        let quality_score = cfg.file_score(&file, "series", &series.name);
         db.lock().unwrap().sync_archive_file_scored(
             &series.name,
             season,
@@ -5764,7 +5764,7 @@ async fn scan_series_archive(
         .map(FsPath::new)
         .map(FsPath::to_path_buf)
         .unwrap_or_else(|| FsPath::new(&series.archive_path).to_path_buf());
-    match scan_archive_path(&s.db, series, &path, &cfg.settings) {
+    match scan_archive_path(&s.db, series, &path, &cfg) {
         Ok((found, updated)) => (
             StatusCode::OK,
             Json(
@@ -5791,7 +5791,7 @@ async fn scan_all_archives(State(s): State<AppState>) -> impl IntoResponse {
             &s.db,
             series,
             FsPath::new(&series.archive_path),
-            &cfg.settings,
+            &cfg,
         ) {
             Ok((_found, count)) => updated += count,
             Err(error) => {
@@ -6049,7 +6049,7 @@ fn finalize_episode_search_results(
             result
                 .get("release")
                 .and_then(|release| serde_json::from_value::<Release>(release.clone()).ok())
-                .map(|release| release.quality.score_with_settings(&cfg.settings))
+                .map(|release| cfg.release_score(&release))
                 .unwrap_or_default(),
         )
     });
@@ -6122,7 +6122,7 @@ async fn search_missing(
             && crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
-        std::cmp::Reverse(release.quality.score_with_settings(&s.cfg.settings))
+        std::cmp::Reverse(s.cfg.release_score(release))
     });
     (
         StatusCode::OK,
@@ -6265,7 +6265,7 @@ async fn score_preview(
             "year": release.year,
             "quality": quality,
             "base_score": quality.score(),
-            "score": quality.score_with_settings(&cfg.settings),
+            "score": cfg.release_score(&release),
             "breakdown": breakdown,
             "allowed": cfg.release_allowed(&release),
             "matched_series": matched_series,
@@ -6281,7 +6281,7 @@ async fn rescore_database(State(s): State<AppState>) -> impl IntoResponse {
         );
     }
     let cfg = latest_config(&s);
-    match s.db.lock().unwrap().rescore(&cfg.settings) {
+    match s.db.lock().unwrap().rescore(&cfg) {
         Ok(count) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok":true,"updated":count})),
@@ -7712,6 +7712,7 @@ async fn restore_source(
                 match std::fs::rename(path, &target) {
                     Ok(()) => {
                         let _ = s.db.lock().unwrap().set_episode_archive_path(
+                            &cfg,
                             &series.name,
                             episode.season,
                             episode.episode,
@@ -8139,7 +8140,7 @@ async fn manual_search(
         crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
     results.sort_by_key(|release| {
-        std::cmp::Reverse(release.quality.score_with_settings(&s.cfg.settings))
+        std::cmp::Reverse(s.cfg.release_score(release))
     });
     (
         StatusCode::OK,
@@ -11424,10 +11425,13 @@ async fn monitor_stalled(
             next_retry_at: now,
         });
         let mut progress = (entry.last_progress_at, entry.last_done);
+        let had_progress = torrent.total_done > entry.last_done;
         if !stall_expired(&mut progress, now, torrent.total_done, stall_timeout) {
             entry.last_progress_at = progress.0;
             entry.last_done = progress.1;
-            entry.stalled_since = None;
+            if had_progress {
+                entry.stalled_since = None;
+            }
             entry.next_retry_at = now;
             torrents.clear_stalled(&torrent.hash);
             continue;
@@ -11436,7 +11440,15 @@ async fn monitor_stalled(
         entry.last_done = progress.1;
         let first_stall = entry.stalled_since.is_none();
         let stalled_since = *entry.stalled_since.get_or_insert(now);
-        torrents.mark_stalled(&torrent.hash);
+        if let Err(error) = torrents.mark_stalled(&torrent.hash) {
+            tracing::debug!(
+                hash = %torrent.hash,
+                name = %torrent.name,
+                %error,
+                "could not park stalled torrent"
+            );
+            continue;
+        }
         if first_stall {
             tracing::warn!(
                 hash = %torrent.hash,
@@ -11497,26 +11509,43 @@ async fn monitor_stalled(
             continue;
         }
         if now >= entry.next_retry_at {
-            match torrents.reannounce(&torrent.hash) {
-                Ok(true) => tracing::info!(
-                    hash = %torrent.hash,
-                    name = %torrent.name,
-                    retry_minutes,
-                    "🔁 stalled torrent reannounced"
-                ),
-                Ok(false) => tracing::debug!(
-                    hash = %torrent.hash,
-                    name = %torrent.name,
-                    "stalled torrent reannounce unavailable in current mode"
-                ),
-                Err(error) => tracing::debug!(
-                    hash = %torrent.hash,
-                    name = %torrent.name,
-                    %error,
-                    "stalled torrent reannounce failed"
-                ),
+            let restarted = match torrents.restart(&torrent.hash) {
+                Ok(true) => {
+                    tracing::info!(
+                        hash = %torrent.hash,
+                        name = %torrent.name,
+                        retry_minutes,
+                        "🔁 stalled torrent resumed and reannounced"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        hash = %torrent.hash,
+                        name = %torrent.name,
+                        "stalled torrent restart unavailable in current mode"
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        hash = %torrent.hash,
+                        name = %torrent.name,
+                        %error,
+                        "stalled torrent restart failed"
+                    );
+                    false
+                }
+            };
+            if restarted {
+                // Keep the total give-up window, but give the resumed torrent a
+                // fresh progress grace period before parking it again.
+                entry.last_progress_at = now;
+                entry.last_done = torrent.total_done;
+                entry.next_retry_at = now + retry_timeout;
+            } else {
+                entry.next_retry_at = now + Duration::from_secs(15);
             }
-            entry.next_retry_at = now + retry_timeout;
         }
     }
     watch.retain(|hash, _| live.contains(hash));
@@ -12456,7 +12485,11 @@ async fn handle_torrent_event(
                 );
                 db.lock()
                     .unwrap()
-                    .reconcile_pack_release(&event.hash, &corrected)?;
+                        .reconcile_pack_release(
+                            &event.hash,
+                            &corrected,
+                            cfg,
+                        )?;
                 release = corrected;
             }
             let destination = postprocess::destination_for(&release, cfg);
@@ -12505,7 +12538,7 @@ async fn handle_torrent_event(
                             &source,
                             &destination,
                             cfg,
-                            release.quality.score_with_settings(&cfg.settings),
+                            cfg.release_score(&release),
                         )?
                         else {
                             continue;
@@ -12847,7 +12880,7 @@ async fn complete_torrent(
                 path.parent().unwrap_or(path.as_path())
             };
             if let Some(new_file) = new_file {
-                let score = release.quality.score_with_settings(&cfg.settings);
+                let score = cfg.release_score(release);
                 if crate::cleaner::discard_if_inferior(
                     cfg, series, season, episode, score, &new_file, archive,
                 )? {
@@ -12870,7 +12903,7 @@ async fn complete_torrent(
             } else {
                 path.parent().unwrap_or(path.as_path())
             };
-            let score = release.quality.score_with_settings(&cfg.settings);
+            let score = cfg.release_score(release);
             if crate::cleaner::discard_if_inferior_movie(
                 cfg,
                 &release.title,
@@ -13378,15 +13411,18 @@ async fn run_housekeeping(state: &AppState) -> Option<crate::database::Housekeep
 
 /// Polls configured watched folders and adds dropped `.torrent`/`.magnet`
 /// files, mirroring qBittorrent's "watched folders". Files that cannot be
-/// added are retried a few times and then left alone.
+/// added are retried indefinitely with a bounded exponential backoff.
 async fn watched_folders_worker(state: AppState) {
     const PERIOD: Duration = Duration::from_secs(15);
-    const MAX_ATTEMPTS: u32 = 5;
     let mut processed: std::collections::HashSet<(String, u64, u64)> =
         std::collections::HashSet::new();
-    let mut failures: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut observed: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    let mut failures: std::collections::HashMap<String, (u32, Instant, (u64, u64))> =
+        std::collections::HashMap::new();
     loop {
         tokio::time::sleep(PERIOD).await;
+        let now = Instant::now();
         let cfg = latest_config(&state);
         if cfg.dry_run {
             continue;
@@ -13403,18 +13439,31 @@ async fn watched_folders_worker(state: AppState) {
                             meta.modified()
                                 .ok()
                                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|duration| duration.as_secs())
+                                .map(|duration| {
+                                    duration.as_nanos().min(u64::MAX as u128) as u64
+                                })
                                 .unwrap_or(0),
                         )
                     })
                 else {
                     continue;
                 };
-                if failures.get(&path_key).copied().unwrap_or(0) >= MAX_ATTEMPTS {
+                let signature = (length, modified);
+                // A producer may copy a .torrent/.magnet directly into the
+                // watched directory. Require two identical observations so we
+                // never parse a half-written file.
+                if observed.insert(path_key.clone(), signature) != Some(signature) {
                     continue;
                 }
+                if let Some((_, next_retry, previous_signature)) = failures.get(&path_key) {
+                    if *previous_signature != signature {
+                        failures.remove(&path_key);
+                    } else if now < *next_retry {
+                        continue;
+                    }
+                }
                 let key = (path_key.clone(), length, modified);
-                if !folder.delete_after && processed.contains(&key) {
+                if processed.contains(&key) {
                     continue;
                 }
                 let result = if path_key.to_ascii_lowercase().ends_with(".magnet") {
@@ -13445,9 +13494,17 @@ async fn watched_folders_worker(state: AppState) {
                         // Session disabled or dry-run: keep the file for later.
                     }
                     Err(error) => {
-                        let count = failures.entry(path_key.clone()).or_insert(0);
-                        *count += 1;
-                        tracing::warn!(file = %path.display(), %error, attempts = *count, "watched folder: could not add torrent");
+                        let (attempts, _, _) = failures
+                            .get(&path_key)
+                            .copied()
+                            .unwrap_or((0, now, signature));
+                        let attempts = attempts.saturating_add(1);
+                        let backoff = Duration::from_secs(
+                            15_u64.saturating_mul(1_u64 << attempts.saturating_sub(1).min(7)),
+                        )
+                        .min(Duration::from_secs(30 * 60));
+                        failures.insert(path_key.clone(), (attempts, now + backoff, signature));
+                        tracing::warn!(file = %path.display(), %error, attempts, retry_in_secs = backoff.as_secs(), "watched folder: could not add torrent; retry scheduled");
                     }
                 }
             }
@@ -13457,6 +13514,9 @@ async fn watched_folders_worker(state: AppState) {
         }
         if failures.len() > 4096 {
             failures.clear();
+        }
+        if observed.len() > 4096 {
+            observed.clear();
         }
     }
 }

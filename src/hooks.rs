@@ -27,8 +27,12 @@ fn default_true() -> bool {
     true
 }
 
+fn default_timeout_secs() -> u64 {
+    60
+}
+
 /// One external program bound to a set of events.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventHook {
     pub name: String,
     #[serde(default = "default_true")]
@@ -43,8 +47,21 @@ pub struct EventHook {
     #[serde(default)]
     pub args: String,
     /// Kill the process after this many seconds (default 60, max 86400).
-    #[serde(default)]
+    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for EventHook {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            events: Vec::new(),
+            program: String::new(),
+            args: String::new(),
+            timeout_secs: default_timeout_secs(),
+        }
+    }
 }
 
 /// Loads hooks from the `event_hooks` settings key (a JSON array).
@@ -242,7 +259,15 @@ pub async fn run_hook(
     let vars = variables(event, payload);
     let program = expand(hook.program.trim(), &vars);
     let args = split_args(&expand(&hook.args, &vars));
-    let timeout = Duration::from_secs(hook.timeout_secs.clamp(1, 86_400));
+    // `0` was the serde default in older configurations. Treat it as the
+    // documented default too, so upgrading does not silently turn hooks into
+    // one-second processes.
+    let timeout_secs = if hook.timeout_secs == 0 {
+        default_timeout_secs()
+    } else {
+        hook.timeout_secs
+    };
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, 86_400));
     let mut command = tokio::process::Command::new(&program);
     command.args(&args);
     command.kill_on_drop(true);
@@ -398,6 +423,15 @@ mod tests {
             ..Default::default()
         }];
         assert!(validate_hooks(&hooks).is_some());
+    }
+
+    #[test]
+    fn missing_timeout_uses_the_documented_default() {
+        let hook: EventHook = serde_json::from_str(
+            r#"{"name":"legacy","program":"/bin/true"}"#,
+        )
+        .unwrap();
+        assert_eq!(hook.timeout_secs, 60);
     }
 
     #[tokio::test]

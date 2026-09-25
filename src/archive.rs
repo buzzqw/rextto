@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::models::Release;
 use crate::utils::magnet_hash;
 use anyhow::Result;
@@ -42,7 +43,7 @@ impl Archive {
         }
         Ok(Self { conn })
     }
-    pub fn save_batch(&self, releases: &[Release]) -> Result<()> {
+    pub fn save_batch(&self, releases: &[Release], cfg: &Config) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for r in releases {
             // RSS sources such as Jackett can expose only a `.torrent` URL.
@@ -55,7 +56,7 @@ impl Archive {
             if source.trim().is_empty() {
                 continue;
             }
-            tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, r.quality.score()])?;
+            tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, cfg.release_score(r)])?;
         }
         tx.commit()?;
         Ok(())
@@ -334,7 +335,7 @@ mod tests {
             discovered_at: Utc::now(),
         };
         let releases: Vec<Release> = (1..=5).map(release).collect();
-        archive.save_batch(&releases).unwrap();
+        archive.save_batch(&releases, &Config::default()).unwrap();
         let recent = archive.recent_entries(3).unwrap();
         assert_eq!(recent.len(), 3);
         assert!(archive.recent_entries(100).unwrap().len() == 5);
@@ -373,7 +374,9 @@ mod tests {
             "magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd",
             "Example Movie 2160p",
         );
-        archive.save_batch(&[first.clone(), first, second]).unwrap();
+        archive
+            .save_batch(&[first.clone(), first, second], &Config::default())
+            .unwrap();
         assert_eq!(archive.count().unwrap(), 2);
         assert_eq!(archive.search("Example Movie").unwrap().len(), 2);
         assert_eq!(
@@ -416,7 +419,7 @@ mod tests {
             peers: -1,
             discovered_at: Utc::now(),
         };
-        archive.save_batch(&[release]).unwrap();
+        archive.save_batch(&[release], &Config::default()).unwrap();
         assert_eq!(archive.count().unwrap(), 1);
         let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
         archive.canonicalize_torrent_url(torrent_url, magnet).unwrap();

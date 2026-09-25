@@ -63,7 +63,7 @@ pub fn index_archive(
             continue;
         };
         let quality = parse_quality(name);
-        let score = quality.score_with_settings(settings);
+        let score = crate::config::score_quality(&quality, settings);
         let key = (season, episode);
         let better = index
             .best
@@ -77,17 +77,18 @@ pub fn index_archive(
     index
 }
 
-/// Motivi di upgrade considerati "forti" anche quando la differenza di score è
-/// sotto la soglia configurata (parità con EXTTO `_HARD_UPGRADE_REASONS`).
-const HARD_UPGRADE_REASONS: [&str; 4] = ["resolution", "source", "hdr", "repack"];
-
-/// True se `new` migliora `old` per un motivo forte (risoluzione, sorgente,
-/// HDR o repack), indipendentemente dal delta di score.
-fn hard_upgrade(new: &crate::models::Quality, old: &crate::models::Quality, min_diff: i64) -> bool {
-    matches!(
-        new.upgrade_reason(old, new.score(), old.score(), min_diff),
-        Some(reason) if HARD_UPGRADE_REASONS.contains(&reason)
-    )
+/// Uses the same semantic upgrade rules as acquisition. In particular, merely
+/// filling a missing source token in a normalized archive filename is not an
+/// upgrade, even when the numeric score is lower for the old file.
+fn quality_upgrade_allowed(
+    new: &crate::models::Quality,
+    old: &crate::models::Quality,
+    new_score: i64,
+    old_score: i64,
+    min_diff: i64,
+) -> bool {
+    new.upgrade_reason(old, new_score, old_score, min_diff)
+        .is_some()
 }
 
 /// Esito del confronto lingua di un file rispetto a quella preferita.
@@ -283,17 +284,30 @@ pub fn resolve_existing_target(
     target: &Path,
     new_score: i64,
     cfg: &Config,
+    kind: &str,
+    title: &str,
 ) -> Result<bool> {
     if !target.exists() {
         return Ok(false);
     }
-    let old_score = target
+    let old_score = cfg.file_score(target, kind, title);
+    let old_quality = target
         .file_name()
         .and_then(|value| value.to_str())
         .map(crate::parser::parse_quality)
-        .map(|quality| quality.score_with_settings(&cfg.settings))
-        .unwrap_or(0);
-    if old_score + cfg.upgrade_min_score_diff >= new_score {
+        .unwrap_or_default();
+    let new_quality = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(crate::parser::parse_quality)
+        .unwrap_or_default();
+    if !quality_upgrade_allowed(
+        &new_quality,
+        &old_quality,
+        new_score,
+        old_score,
+        cfg.upgrade_min_score_diff,
+    ) {
         handle_duplicate(source, cfg)?;
         return Ok(true);
     }
@@ -360,7 +374,7 @@ pub fn cleanup_old_episode(
         // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
         // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
         // 1080p e lo scartava.
-        let old_score = old_quality.score_with_settings(&cfg.settings);
+        let old_score = cfg.file_score(&file, "series", "");
         let new_quality = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -391,9 +405,13 @@ pub fn cleanup_old_episode(
         }
         // Si scarta il vecchio se lo score è chiaramente inferiore, oppure se il
         // nuovo rappresenta un upgrade "forte" (risoluzione/sorgente/HDR/repack).
-        if old_score + cfg.cleanup_min_score_diff >= new_score
-            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
-        {
+        if !quality_upgrade_allowed(
+            &new_quality,
+            &old_quality,
+            new_score,
+            old_score,
+            cfg.cleanup_min_score_diff,
+        ) {
             continue;
         }
         handle_duplicate(&file, cfg)?;
@@ -608,7 +626,7 @@ pub fn discard_if_inferior(
         // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
         // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
         // 1080p e lo scartava.
-        let old_score = old_quality.score_with_settings(&cfg.settings);
+        let old_score = cfg.file_score(&file, "series", "");
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -634,8 +652,13 @@ pub fn discard_if_inferior(
         }
         // Non scartare il nuovo se rappresenta un upgrade "forte" anche quando
         // il suo score non supera la soglia rispetto all'esistente.
-        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
-            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        if !quality_upgrade_allowed(
+            &new_quality,
+            &old_quality,
+            new_score,
+            old_score,
+            cfg.cleanup_min_score_diff,
+        ) && old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
         {
             handle_duplicate(new_file, cfg)?;
             return Ok(true);
@@ -689,7 +712,7 @@ pub fn cleanup_old_movie(
         // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
         // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
         // 1080p e lo scartava.
-        let old_score = old_quality.score_with_settings(&cfg.settings);
+        let old_score = cfg.file_score(&file, "movie", movie);
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -712,9 +735,13 @@ pub fn cleanup_old_movie(
                 _ => {}
             }
         }
-        if old_score.saturating_add(cfg.cleanup_min_score_diff) >= new_score
-            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
-        {
+        if !quality_upgrade_allowed(
+            &new_quality,
+            &old_quality,
+            new_score,
+            old_score,
+            cfg.cleanup_min_score_diff,
+        ) {
             continue;
         }
         handle_duplicate(&file, cfg)?;
@@ -769,7 +796,7 @@ pub fn discard_if_inferior_movie(
         // Prima si usava `score()` puro, quindi una soglia personalizzata (es.
         // `score_res_1080p` più bassa) faceva sembrare "inferiore" ogni nuovo
         // 1080p e lo scartava.
-        let old_score = old_quality.score_with_settings(&cfg.settings);
+        let old_score = cfg.file_score(&file, "movie", movie);
         let new_name = new_file
             .file_name()
             .and_then(|value| value.to_str())
@@ -791,8 +818,13 @@ pub fn discard_if_inferior_movie(
                 _ => {}
             }
         }
-        if old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
-            && !hard_upgrade(&new_quality, &old_quality, cfg.cleanup_min_score_diff)
+        if !quality_upgrade_allowed(
+            &new_quality,
+            &old_quality,
+            new_score,
+            old_score,
+            cfg.cleanup_min_score_diff,
+        ) && old_score >= new_score.saturating_add(cfg.cleanup_min_score_diff)
         {
             handle_duplicate(new_file, cfg)?;
             return Ok(true);

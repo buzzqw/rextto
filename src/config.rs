@@ -665,6 +665,16 @@ impl Default for Config {
     }
 }
 
+/// Applies the configured quality weights without requiring a full `Config`.
+/// Archive indexing uses this same primitive while it is handed a settings
+/// map rather than the complete runtime configuration.
+pub fn score_quality(
+    quality: &crate::models::Quality,
+    settings: &BTreeMap<String, String>,
+) -> i64 {
+    quality.score_with_settings(settings)
+}
+
 impl Config {
     /// BCP-47 language used for TMDB API calls (e.g. `it-IT`).
     pub fn tmdb_language(&self) -> String {
@@ -1200,16 +1210,82 @@ impl Config {
         crate::rules::denied_reason(release)
     }
 
-    /// Score used for acquisition and upgrade decisions: the additive quality
-    /// score, the movie subtitle bonus and the small built-in size preference.
+    /// Score used for every release decision's quality component.
+    pub fn quality_score(&self, quality: &crate::models::Quality) -> i64 {
+        score_quality(quality, &self.settings)
+    }
+
+    /// Score used for acquisition, upgrade decisions and archive comparisons.
     pub fn release_score(&self, release: &crate::models::Release) -> i64 {
-        let mut score = release.quality.score_with_settings(&self.settings);
-        if release.kind == "movie" {
-            if let Some(movie) = self.find_movie_match(&release.title, release.year) {
-                score += Self::movie_subtitle_bonus(movie, &release.quality);
-            }
-        }
-        score + crate::rules::size_score_bonus(release)
+        let movie = (release.kind == "movie")
+            .then(|| self.find_movie_match(&release.title, release.year))
+            .flatten();
+        self.release_score_with_movie(release, movie)
+    }
+
+    /// Variant used by a movie-specific search, where the monitored movie is
+    /// already known even if the raw release title is not a perfect match.
+    pub fn release_score_for_movie(
+        &self,
+        release: &crate::models::Release,
+        movie: &MovieConfig,
+    ) -> i64 {
+        self.release_score_with_movie(release, Some(movie))
+    }
+
+    fn release_score_with_movie(
+        &self,
+        release: &crate::models::Release,
+        movie: Option<&MovieConfig>,
+    ) -> i64 {
+        self.quality_score(&release.quality)
+            + movie
+                .map(|movie| Self::movie_subtitle_bonus(movie, &release.quality))
+                .unwrap_or(0)
+            + crate::rules::size_score_bonus(release)
+    }
+
+    /// Scores an already archived file with the same release scorer used at
+    /// acquisition time. `title` is the monitored identity for movies (and is
+    /// only informational for series); an empty title falls back to the file
+    /// name. This keeps archive scans and post-processing from silently
+    /// dropping the size/subtitle parts of the score.
+    pub fn file_score(&self, path: &Path, kind: &str, title: &str) -> i64 {
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let title = if title.trim().is_empty() {
+            file_name
+        } else {
+            title
+        };
+        let size_bytes = path
+            .metadata()
+            .map(|value| value.len().min(i64::MAX as u64) as i64)
+            .unwrap_or(0);
+        let release = crate::models::Release {
+            torrent_url: None,
+            title: title.to_string(),
+            magnet: String::new(),
+            source: "archive".into(),
+            quality: crate::parser::parse_quality(file_name),
+            kind: kind.to_string(),
+            series: None,
+            season: None,
+            episode: None,
+            is_pack: false,
+            episode_range: Vec::new(),
+            year: None,
+            size_bytes,
+            seeders: -1,
+            peers: -1,
+            discovered_at: Utc::now(),
+        };
+        let movie = (kind == "movie")
+            .then(|| self.find_movie_match_manual(title, None))
+            .flatten();
+        self.release_score_with_movie(&release, movie)
     }
 
     /// Reason a release is refused by a per-source filter, if any. Unlike the
