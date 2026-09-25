@@ -456,6 +456,13 @@ pub struct FileView {
     pub path: String,
     pub size: i64,
     pub downloaded: i64,
+    /// libtorrent priority: 0 skipped, 1 normal, 6 high, 7 maximum.
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+}
+
+fn default_priority() -> i32 {
+    4
 }
 
 #[cfg(test)]

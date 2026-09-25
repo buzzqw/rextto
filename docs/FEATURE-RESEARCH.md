@@ -276,12 +276,16 @@ contenuto/sorgente, exclude per titolo) e chiedevano all'utente di indovinare
 numeri. Al loro posto, controlli automatici sempre attivi:
 
 - **Sottotitoli hardcoded** (`HC`/`hardcoded`): rifiutati, default di Radarr.
-- **Dimensione assurda**: soglia per risoluzione derivata da un archivio reale
-  (4962 file) con statistica robusta (taglio del 5% degli estremi grandi), posta
-  sotto il **file più piccolo realmente presente** per non toccare gli encode 4K
-  efficienti: 2160p 800 MiB (min reale ~1539, mediana 6440), 1080p 120 (min 236,
-  mediana 1578), 720p 100 (min 437), 576p 60, 480p 60 (min 236). Dimensione
-  sconosciuta = nessun rifiuto.
+- **Dimensione assurda**: due livelli, per non escludere mai un episodio sano.
+  - *hard floor* globale (2160p 300 MiB, 1080p 80, 720p 60, 576p 50, 480p 40):
+    scarta solo i fake evidenti prima ancora del match col titolo.
+  - *sane floor* per titolo, derivata da un archivio reale (4962 file, 5% di
+    estremi grandi tagliati): 2160p 800 MiB, 1080p 120, 720p 100, 576p 60,
+    480p 60. Applicata **solo per abbassare**: per una serie con storico il
+    limite scende a metà dell'episodio archiviato più piccolo, mai sopra il sane
+    floor; per una serie **senza storico** si usa l'hard floor permissivo. Così
+    un episodio piccolo ma sano non è mai rifiutato perché la serie non ha file
+    grandi. Dimensione sconosciuta = nessun rifiuto.
 - **Preferenza dimensione**: piccolo bonus (max 100) per un bitrate più sano
   nella stessa risoluzione; non può mai colmare un divario di qualità.
 
@@ -375,6 +379,19 @@ Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
 - Le opzioni che richiedono i metadati (first/last, metadata-only) vengono
   applicate dal worker eventi via `enforce_deferred_options`.
 - `/api/torrents/add` accetta i nuovi campi.
+- **Completamento**: ora ci sono anche
+  - **priorità per-file** (`set_file_priorities`, `FileView.priority`,
+    `POST /api/torrents/{hash}/files/priority`) con selettore nella tab
+    *Contenuto*;
+  - **web seed** (`add_web_seeds`, `POST /api/torrents/{hash}/web-seeds`);
+  - **modifica tracker** (`set_trackers`, `POST /api/torrents/{hash}/trackers`,
+    editor `tier|url` per riga);
+  - **super seeding** (`set_super_seeding`,
+    `POST /api/torrents/{hash}/super-seeding`);
+  - **export** `.torrent` (`GET /api/torrents/{hash}/export.torrent`) e magnet
+    completo con tracker (`GET /api/torrents/{hash}/magnet`);
+  - layout contenuto all'add: **non implementato** (nessuna API libtorrent
+    affidabile senza toccare il layout di seeding).
 
 ### 8.9 Provider backoff
 
@@ -397,13 +414,20 @@ Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
 - `GET /api/media-info`, `POST /api/media-info/probe`
 - `GET/POST /api/providers/status`
 - `POST /api/maintenance/housekeeping`
+- Torrent: `POST /api/torrents/{hash}/files/priority`, `/web-seeds`,
+  `/trackers`, `/super-seeding`; `GET /api/torrents/{hash}/export.torrent`,
+  `/magnet`.
 - Nessuna pagina Automazione: **Hook eventi** è in *Integrazioni*, **Cartelle
   osservate** nella tab *Acquisizione* di *Configurazione*.
+- Le traduzioni inglesi delle stringhe nuove sono **incorporate** in
+  `src/i18n/default_translations.yml` e unite all'avvio con `INSERT OR IGNORE`
+  (mai sopra le modifiche dell'utente).
 
 ### 8.12 Test
 
-- `rules.rs`: 3 test (soglia dimensione e dimensioni sconosciute, sottotitoli
-  hardcoded, bonus dimensione limitato).
+- `rules.rs`: 4 test (soglia dura, soglia adattiva, sottotitoli hardcoded,
+  bonus dimensione limitato).
+- `i18n.rs`: seed delle traduzioni senza sovrascrivere.
 - `hooks.rs`: 6 test (espansione, split argomenti, flatten variabili, filtro
   eventi, validazione, esecuzione reale di `/bin/echo` e `/bin/sh` con env).
 - `watcher.rs`: 4 test (scan piatto/ricorsivo con rumore, cartella mancante,

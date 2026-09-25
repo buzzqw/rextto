@@ -932,8 +932,22 @@ pub fn router(state: AppState) -> Router {
         .route("/feed.xml", get(magnet_feed))
         .route("/api/feed.xml", get(magnet_feed))
         .route("/api/torrents/{hash}/peers", get(torrent_peers))
-        .route("/api/torrents/{hash}/trackers", get(torrent_trackers))
+        .route(
+            "/api/torrents/{hash}/trackers",
+            get(torrent_trackers).post(set_torrent_trackers),
+        )
         .route("/api/torrents/{hash}/files", get(torrent_files))
+        .route(
+            "/api/torrents/{hash}/files/priority",
+            post(set_file_priorities),
+        )
+        .route("/api/torrents/{hash}/web-seeds", post(set_web_seeds))
+        .route(
+            "/api/torrents/{hash}/super-seeding",
+            post(set_super_seeding),
+        )
+        .route("/api/torrents/{hash}/export.torrent", get(export_torrent))
+        .route("/api/torrents/{hash}/magnet", get(export_magnet))
         .route(
             "/api/torrents/{hash}",
             get(torrent_details).delete(remove_torrent),
@@ -8744,6 +8758,197 @@ async fn torrent_files(State(s): State<AppState>, Path(hash): Path<String>) -> i
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
         ),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct FilePrioritiesInput {
+    pub priorities: Vec<i32>,
+}
+
+async fn set_file_priorities(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Json(input): Json<FilePrioritiesInput>,
+) -> impl IntoResponse {
+    if input.priorities.len() > 100_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"too many file priorities"})),
+        );
+    }
+    match s.torrents.set_file_priorities(&hash, &input.priorities) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent unavailable in dry-run"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct WebSeedsInput {
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub remove: bool,
+}
+
+async fn set_web_seeds(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Json(input): Json<WebSeedsInput>,
+) -> impl IntoResponse {
+    let urls = input
+        .urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| {
+            !url.is_empty()
+                && (url.starts_with("http://")
+                    || url.starts_with("https://")
+                    || url.starts_with("ftp://"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if urls.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"no valid web seed URL"})),
+        );
+    }
+    match s.torrents.web_seeds(&hash, &urls, input.remove) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent unavailable in dry-run"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct TrackerEntryInput {
+    pub url: String,
+    #[serde(default)]
+    pub tier: i32,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TrackersInput {
+    #[serde(default)]
+    pub trackers: Vec<TrackerEntryInput>,
+}
+
+async fn set_torrent_trackers(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Json(input): Json<TrackersInput>,
+) -> impl IntoResponse {
+    if input.trackers.len() > 500 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"too many trackers"})),
+        );
+    }
+    let trackers = input
+        .trackers
+        .iter()
+        .filter(|tracker| !tracker.url.trim().is_empty())
+        .map(|tracker| (tracker.tier, tracker.url.trim().to_string()))
+        .collect::<Vec<_>>();
+    match s.torrents.set_trackers(&hash, &trackers) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent unavailable in dry-run"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SuperSeedingInput {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+async fn set_super_seeding(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Json(input): Json<SuperSeedingInput>,
+) -> impl IntoResponse {
+    match s.torrents.set_super_seeding(&hash, input.enabled) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"torrent unavailable in dry-run"})),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
+async fn export_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> axum::response::Response {
+    let Some(path) = s.torrents.torrent_file_path(&hash) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"torrent file not available"})),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-bittorrent",
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn export_magnet(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
+    let stored = s
+        .db
+        .lock()
+        .unwrap()
+        .torrent_meta(&hash)
+        .ok()
+        .flatten()
+        .map(|meta| meta.release.magnet)
+        .filter(|magnet| magnet.starts_with("magnet:"));
+    let mut magnet = stored.unwrap_or_else(|| format!("magnet:?xt=urn:btih:{hash}"));
+    if let Ok(Some(trackers)) = s.torrents.trackers(&hash) {
+        for tracker in trackers {
+            if !magnet.contains(&tracker.url) {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(tracker.url.as_bytes()).collect();
+                magnet.push_str(&format!("&tr={encoded}"));
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"magnet":magnet})),
+    )
 }
 async fn torrent_peers_legacy(
     State(s): State<AppState>,

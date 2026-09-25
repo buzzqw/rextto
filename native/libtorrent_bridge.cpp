@@ -59,6 +59,7 @@ struct rextto_lt_file {
     char path[1024];
     long long size;
     long long downloaded;
+    int priority;
 };
 
 struct rextto_lt_session {
@@ -904,6 +905,7 @@ size_t rextto_lt_files(rextto_lt_session* session, const char* hash, rextto_lt_f
         if (!info) return 0;
         auto storage = info->files();
         std::vector<std::int64_t> progress = handle.file_progress();
+        std::vector<int> priorities = handle.file_priorities();
         const int total = storage.num_files();
         if (output == nullptr || capacity == 0) return static_cast<size_t>(total);
         const size_t count = std::min(capacity, static_cast<size_t>(total));
@@ -912,6 +914,9 @@ size_t rextto_lt_files(rextto_lt_session* session, const char* hash, rextto_lt_f
             copy_string(output[i].path, sizeof(output[i].path), storage.file_path(static_cast<int>(i)));
             output[i].size = storage.file_size(static_cast<int>(i));
             output[i].downloaded = i < progress.size() ? progress[i] : 0;
+            output[i].priority = i < priorities.size()
+                ? priorities[i]
+                : static_cast<int>(lt::default_priority);
         }
         return count;
     } catch (const std::exception& exception) {
@@ -1088,6 +1093,117 @@ int rextto_lt_set_first_last(rextto_lt_session* session, const char* hash, int e
         set_error(error, error_size, exception.what());
     } catch (...) {
         set_error(error, error_size, "unknown libtorrent first/last error");
+    }
+    return 0;
+}
+
+// Splits a newline-separated payload into non-empty lines.
+static std::vector<std::string> rextto_split_lines(const char* text) {
+    std::vector<std::string> out;
+    if (text == nullptr) return out;
+    std::istringstream stream{std::string(text)};
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+
+int rextto_lt_set_file_priorities(rextto_lt_session* session, const char* hash, const int* priorities, size_t count, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        auto info = handle.torrent_file();
+        if (!info) { set_error(error, error_size, "torrent metadata not available"); return 0; }
+        if (priorities == nullptr || count != static_cast<size_t>(info->files().num_files())) {
+            set_error(error, error_size, "priority count does not match the file count");
+            return 0;
+        }
+        std::vector<lt::download_priority_t> values;
+        values.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            int level = priorities[i];
+            if (level < 0) level = 0;
+            if (level > 7) level = 7;
+            values.push_back(lt::download_priority_t(static_cast<std::uint8_t>(level)));
+        }
+        handle.prioritize_files(values);
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent file priority error");
+    }
+    return 0;
+}
+
+int rextto_lt_add_web_seeds(rextto_lt_session* session, const char* hash, const char* urls, int remove, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        for (const auto& url : rextto_split_lines(urls)) {
+            if (remove) {
+                handle.remove_url_seed(url);
+            } else {
+                handle.add_url_seed(url);
+            }
+        }
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent web seed error");
+    }
+    return 0;
+}
+
+int rextto_lt_set_trackers(rextto_lt_session* session, const char* hash, const char* tiered, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        std::vector<lt::announce_entry> entries;
+        for (const auto& line : rextto_split_lines(tiered)) {
+            std::string url = line;
+            int tier = 0;
+            auto separator = line.find('|');
+            if (separator != std::string::npos) {
+                tier = std::atoi(line.substr(0, separator).c_str());
+                url = line.substr(separator + 1);
+            }
+            if (url.empty()) continue;
+            lt::announce_entry entry(url);
+            entry.tier = static_cast<std::uint8_t>(std::max(0, std::min(tier, 255)));
+            entries.push_back(entry);
+        }
+        handle.replace_trackers(entries);
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent tracker error");
+    }
+    return 0;
+}
+
+int rextto_lt_set_super_seeding(rextto_lt_session* session, const char* hash, int enabled, char* error, size_t error_size) {
+    std::lock_guard<std::recursive_mutex> lock(LIBTORRENT_API_MUTEX);
+    try {
+        auto handle = find_torrent(session, hash);
+        if (!handle.is_valid()) { set_error(error, error_size, "torrent not found"); return 0; }
+        if (enabled) {
+            handle.set_flags(lt::torrent_flags::super_seeding);
+        } else {
+            handle.unset_flags(lt::torrent_flags::super_seeding);
+        }
+        return 1;
+    } catch (const std::exception& exception) {
+        set_error(error, error_size, exception.what());
+    } catch (...) {
+        set_error(error, error_size, "unknown libtorrent super seeding error");
     }
     return 0;
 }

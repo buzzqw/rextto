@@ -2,10 +2,14 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
 };
+
+/// English translations for strings added after the first dictionary release.
+/// Merged with `INSERT OR IGNORE` so user edits always win.
+const DEFAULT_TRANSLATIONS: &str = include_str!("i18n/default_translations.yml");
 
 #[derive(Clone)]
 pub struct I18nDb {
@@ -98,6 +102,27 @@ impl I18nDb {
         Ok(())
     }
 
+    /// Merges the bundled default translations into the database without
+    /// overwriting existing entries. Returns how many rows were added.
+    pub fn seed_default_translations(&self) -> Result<usize> {
+        let defaults: BTreeMap<String, BTreeMap<String, String>> =
+            serde_yaml::from_str(DEFAULT_TRANSLATIONS)?;
+        let mut inserted = 0usize;
+        for (lang, entries) in defaults {
+            let storage = Self::storage_language(&lang);
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            for (key, value) in &entries {
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO translations(lang,key,value) VALUES (?1,?2,?3)",
+                    params![storage, key, value],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(inserted)
+    }
+
     /// Removes every translation row for a language. Returns how many rows were
     /// deleted.
     pub fn delete_lang(&self, lang: &str) -> Result<usize> {
@@ -140,6 +165,32 @@ mod tests {
         db.set("en", "dashboard.title", "Dashboard").unwrap();
         assert_eq!(db.language().unwrap(), "en");
         assert_eq!(db.list("en").unwrap()[0].value, "Dashboard");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn seeds_default_translations_without_overwriting() {
+        let path =
+            std::env::temp_dir().join(format!("rextto-i18n-seed-{}.db", uuid::Uuid::new_v4()));
+        let db = I18nDb::open(&path).unwrap();
+        // A pre-existing user translation must survive the merge.
+        db.set("en", "Consenti aggiornamenti", "MY VALUE").unwrap();
+        assert!(db.seed_default_translations().unwrap() > 0);
+        let list = db.list("en").unwrap();
+        let find = |key: &str| {
+            list.iter()
+                .find(|entry| entry.key == key)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(find("Consenti aggiornamenti"), "MY VALUE");
+        assert_eq!(find("Cartelle osservate"), "Watched folders");
+        // Idempotent: nothing new on a second run.
+        assert_eq!(db.seed_default_translations().unwrap(), 0);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

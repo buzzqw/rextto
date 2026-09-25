@@ -2705,6 +2705,11 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
     let hash_tag = StoredValue::new(hash.clone());
     let hash_spark = StoredValue::new(hash.clone());
     let hash_norename = StoredValue::new(hash.clone());
+    let hash_trackers = StoredValue::new(hash.clone());
+    let hash_files = StoredValue::new(hash.clone());
+    let hash_super = StoredValue::new(hash.clone());
+    let hash_web = StoredValue::new(hash.clone());
+    let hash_export = StoredValue::new(hash.clone());
     let item = Signal::derive(move || {
         data.get()
             .torrents
@@ -2764,6 +2769,9 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
     let peers = RwSignal::new(Vec::<Value>::new());
     let trackers = RwSignal::new(Vec::<Value>::new());
     let files = RwSignal::new(Vec::<Value>::new());
+    let trackers_edit = RwSignal::new(String::new());
+    let web_seeds = RwSignal::new(String::new());
+    let super_seeding = RwSignal::new(false);
     let detail = RwSignal::new(Value::Null);
     let detail_magnet = RwSignal::new(String::new());
     let no_rename = RwSignal::new(false);
@@ -2799,7 +2807,21 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                     peers.set(array(&value, "peers"));
                 }
                 if let Ok(value) = get(&trackers_path).await {
-                    trackers.set(array(&value, "trackers"));
+                    let items = array(&value, "trackers");
+                    trackers_edit.set(
+                        items
+                            .iter()
+                            .map(|tracker| {
+                                format!(
+                                    "{}|{}",
+                                    tracker.get("tier").and_then(Value::as_i64).unwrap_or(0),
+                                    tracker.get("url").and_then(Value::as_str).unwrap_or("")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    trackers.set(items);
                 }
                 if let Ok(value) = get(&files_path).await {
                     files.set(array(&value, "files"));
@@ -2924,6 +2946,13 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             run_post(data, &path, Some(json!({"value": next})), if next { "Rinomina disattivata per il torrent" } else { "Rinomina riattivata per il torrent" });
                                         }>{move || if no_rename.get() { "Non rinominare ✓" } else { "Non rinominare" }}</button>
                                         <button class="btn sm" title=ctx_tr("Forza l'annuncio a tutti i tracker") on:click=move |_| { let path = announce_path.get_value(); run_post(data, &path, None, "Reannounce richiesto"); }>{ctx_tr("Annuncia")}</button>
+                                        <a class="btn sm" download=move || format!("{}.torrent", hash_export.get_value()) href=move || format!("/api/torrents/{}/export.torrent", hash_export.get_value()) title=ctx_tr("Scarica il file .torrent di questo torrent")>{ctx_tr("Esporta .torrent")}</a>
+                                        <button class="btn sm" class:primary=move || super_seeding.get() title=ctx_tr("Attiva o disattiva il super seeding (initial seeding)") on:click=move |_| {
+                                            let next = !super_seeding.get();
+                                            super_seeding.set(next);
+                                            let path = format!("/api/torrents/{}/super-seeding", hash_super.get_value());
+                                            run_post(data, &path, Some(json!({"enabled": next})), if next { "Super seeding attivo" } else { "Super seeding disattivato" });
+                                        }>{move || if super_seeding.get() { "Super seeding ✓" } else { "Super seeding" }}</button>
                                         <button class="btn sm" title=ctx_tr("Pausa, riprende e richiede nuovi peer senza rimuovere dati o stato") on:click=move |_| { let path = restart_path.get_value(); run_post(data, &path, None, "Torrent riavviato"); }>{ctx_tr("Riavvia torrent")}</button>
                                         <button class="btn sm" title=ctx_tr("Fissa il torrent in cima alla coda") on:click=move |_| { let body = json!({"hash": hash_pin.get_value()}); run_post(data, "/api/torrents/pin", Some(body), "Torrent fissato in cima"); }>{ctx_tr("Pin")}</button>
                                         <button class="btn sm" title=ctx_tr("Assegna un tag al torrent") on:click=move |_| {
@@ -2962,6 +2991,14 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             }>{ctx_tr("Rimuovi")}</button>
                                         </div>
                                     </div>
+                                    <div class="field span-full" style="margin-top:12px" title=ctx_tr("Web seed HTTP/FTP: incolla uno o più URL separati da spazio per aggiungerli o rimuoverli")>
+                                        <span>{ctx_tr("Web seed")}</span>
+                                        <div class="path-picker">
+                                            <input prop:value=web_seeds on:input=move |event| web_seeds.set(event_target_value(&event)) placeholder="https://…/file.mkv" />
+                                            <button class="btn sm" on:click=move |_| { let path = format!("/api/torrents/{}/web-seeds", hash_web.get_value()); let urls: Vec<String> = web_seeds.get().split_whitespace().map(str::to_string).collect(); run_post(data, &path, Some(json!({"urls": urls, "remove": false})), "Web seed aggiunto"); }>{ctx_tr("Aggiungi")}</button>
+                                            <button class="btn sm danger" on:click=move |_| { let path = format!("/api/torrents/{}/web-seeds", hash_web.get_value()); let urls: Vec<String> = web_seeds.get().split_whitespace().map(str::to_string).collect(); run_post(data, &path, Some(json!({"urls": urls, "remove": true})), "Web seed rimosso"); }>{ctx_tr("Rimuovi")}</button>
+                                        </div>
+                                    </div>
                                 </Show>
                                 <Show when=move || detail_tab.get() == "trackers">
                                     <div class="table-wrap">
@@ -2975,14 +3012,51 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                         </table>
                                     </div>
                                     <Show when=move || trackers.get().is_empty()><Empty text="Nessun tracker disponibile (metadata non ancora risolti)." /></Show>
+                                    <div class="field span-full" style="margin-top:12px" title=ctx_tr("Un tracker per riga; prefisso opzionale tier|url. Salva per sostituire l'intera lista.")>
+                                        <span>{ctx_tr("Modifica tracker (tier|url per riga)")}</span>
+                                        <textarea rows="4" prop:value=move || trackers_edit.get() on:input=move |event| trackers_edit.set(event_target_value(&event))></textarea>
+                                    </div>
+                                    <div class="toolbar">
+                                        <button class="btn sm primary" on:click=move |_| {
+                                            let entries = trackers_edit.get().lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| {
+                                                match line.split_once('|') {
+                                                    Some((tier, url)) => json!({"tier": tier.trim().parse::<i32>().unwrap_or(0), "url": url.trim()}),
+                                                    None => json!({"tier": 0, "url": line}),
+                                                }
+                                            }).collect::<Vec<_>>();
+                                            let path = format!("/api/torrents/{}/trackers", hash_trackers.get_value());
+                                            run_post(data, &path, Some(json!({"trackers": entries})), "Tracker aggiornati");
+                                        }>{ctx_tr("Salva tracker")}</button>
+                                    </div>
                                 </Show>
                                 <Show when=move || detail_tab.get() == "files">
                                     <div class="table-wrap">
                                         <table class="data-table">
-                                            <thead><tr><th>{ctx_tr("File")}</th><th>{ctx_tr("Dimensione")}</th><th>{ctx_tr("Scaricato")}</th></tr></thead>
+                                            <thead><tr><th>{ctx_tr("File")}</th><th>{ctx_tr("Dimensione")}</th><th>{ctx_tr("Scaricato")}</th><th>{ctx_tr("Priorità")}</th></tr></thead>
                                             <tbody>
-                                                {move || files.get().iter().cloned().map(|file| view! {
-                                                    <tr><td class="truncate mono">{text(&file, "path", "-")}</td><td class="numeric">{size(&file, "size")}</td><td class="numeric">{size(&file, "downloaded")}</td></tr>
+                                                {move || files.get().iter().enumerate().map(|(index, file)| {
+                                                    let priority = file.get("priority").and_then(Value::as_i64).unwrap_or(4);
+                                                    view! {
+                                                        <tr>
+                                                            <td class="truncate mono">{text(file, "path", "-")}</td>
+                                                            <td class="numeric">{size(file, "size")}</td>
+                                                            <td class="numeric">{size(file, "downloaded")}</td>
+                                                            <td>
+                                                                <select prop:value=priority.to_string() on:change=move |event| {
+                                                                    let value = event_target_value(&event).parse::<i32>().unwrap_or(4);
+                                                                    files.update(|items| { if let Some(item) = items.get_mut(index) { item["priority"] = json!(value); } });
+                                                                    let priorities: Vec<i32> = files.get().iter().map(|item| item.get("priority").and_then(Value::as_i64).unwrap_or(4) as i32).collect();
+                                                                    let path = format!("/api/torrents/{}/files/priority", hash_files.get_value());
+                                                                    run_post(data, &path, Some(json!({"priorities": priorities})), "Priorità aggiornata");
+                                                                }>
+                                                                    <option value="0">{ctx_tr("Salta")}</option>
+                                                                    <option value="1">{ctx_tr("Normale")}</option>
+                                                                    <option value="6">{ctx_tr("Alta")}</option>
+                                                                    <option value="7">{ctx_tr("Massima")}</option>
+                                                                </select>
+                                                            </td>
+                                                        </tr>
+                                                    }
                                                 }).collect_view()}
                                             </tbody>
                                         </table>

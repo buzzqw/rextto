@@ -37,7 +37,10 @@ disk).
   episode search, calendar, manual search.
 - **Torrents** — embedded libtorrent: queue, limits, tags, peers, trackers,
   files, storage moves, seed policy, fastresume, VPN killswitch and restart
-  recovery.
+  recovery. Add options include pause, sequential, skip-check, queue-top,
+  first/last piece and metadata-only; per-file priorities, web seeds, tracker
+  editing, super seeding and `.torrent`/magnet export are in the torrent
+  details.
 - **Comics** — GetComics monitoring and weekly packs.
 - **Integrations** — Trakt, Simkl, Jellyfin, Plex, Telegram/e-mail/webhook
   notifications.

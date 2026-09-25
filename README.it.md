@@ -36,7 +36,9 @@ o disco locale).
   episodi mancanti, calendario, ricerca manuale.
 - **Torrent** — libtorrent embedded: coda, limiti, tag, peer, tracker, file,
   spostamento storage, politica di seeding, fastresume, killswitch VPN e recupero
-  dopo riavvio.
+  dopo riavvio. In aggiunta: pausa, sequenziale, salta-verifica, cima-coda,
+  primo/ultimo pezzo, solo-metadati; priorità per-file, web seed, modifica
+  tracker, super seeding ed export `.torrent`/magnet nel dettaglio torrent.
 - **Fumetti** — monitoraggio GetComics e weekly pack.
 - **Integrazioni** — Trakt, Simkl, Jellyfin, Plex, notifiche Telegram/e-mail/webhook.
 - **UI web** — single-page responsive, tema chiaro/scuro, **italiano e inglese**,

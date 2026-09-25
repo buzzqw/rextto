@@ -2,16 +2,20 @@
 //!
 //! These replace the former user-configurable release rules / size envelopes:
 //! the useful checks are hard-coded with values derived from a real archive
-//! instead of asking the user to guess numbers. They mirror the safe defaults
-//! Sonarr/Radarr apply out of the box.
+//! instead of asking the user to guess numbers.
 //!
 //! Two checks are implemented:
 //!
 //! * **Hardcoded subtitles** — Radarr rejects them by default. A release that
 //!   carries burned-in subs is refused with a clear reason.
-//! * **Absurd size** — a per-resolution sanity floor (MiB) derived from a real
-//!   4962-file archive (median and 5th percentile). It drops fake/truncated
-//!   releases without touching legitimate short episodes.
+//! * **Absurd size** — a per-resolution sanity floor (MiB). It has two tiers
+//!   so it can never exclude a healthy episode:
+//!   - a very low **hard floor** applied globally to drop obvious fakes;
+//!   - a **sane floor** applied per title, and only when the series already has
+//!     archived episodes: it is *lowered* to half the smallest archived episode
+//!     when that is below the sane floor. It is never raised, and when a series
+//!     has no history the hard floor is used. So a smaller-but-healthy episode
+//!     is never rejected just because the series has larger ones.
 //!
 //! A small size preference is added to the score so, within the same
 //! resolution, a healthier bitrate is preferred; it is capped so it can never
@@ -19,65 +23,116 @@
 
 use crate::models::Release;
 
-/// Size sanity floor in MiB for a resolution, derived from a real archive with
-/// a generous margin. The aggregate percentiles were skewed by high-bitrate
-/// series, so the floor sits well below the *smallest real file*: efficient
-/// 2160p Web-DL encodes legitimately land around 1.5 GiB (e.g. The Pitt S02,
-/// Wonder Man) and must never be rejected.
+/// Very low absolute floor: only obvious fakes/truncated files. Applied
+/// globally, before a release is matched to a title.
+pub fn hard_floor_mb(resolution: &str) -> i64 {
+    match resolution {
+        "2160p" => 300,
+        "1080p" => 80,
+        "720p" => 60,
+        "576p" => 50,
+        "480p" => 40,
+        _ => 40,
+    }
+}
+
+/// Sane per-resolution floor derived from a real archive (smallest real file
+/// with margin, after trimming the large extremes).
 ///
-/// | resolution | smallest real file | median | floor |
-/// |------------|--------------------|--------|-------|
-/// | 2160p      | ~1539 MiB          | 6440   | 800   |
-/// | 1080p      | ~236 MiB           | 1578   | 120   |
-/// | 720p       | ~437 MiB           | 760    | 100   |
-/// | 576p       | —                  | —      | 60    |
-/// | 480p       | ~236 MiB           | 496    | 60    |
-pub fn size_floor_mb(resolution: &str) -> i64 {
+/// | resolution | smallest real file | sane floor |
+/// |------------|--------------------|------------|
+/// | 2160p      | ~1539 MiB          | 800        |
+/// | 1080p      | ~236 MiB           | 120        |
+/// | 720p       | ~437 MiB           | 100        |
+/// | 576p       | —                  | 60         |
+/// | 480p       | ~236 MiB           | 60         |
+pub fn sane_floor_mb(resolution: &str) -> i64 {
     match resolution {
         "2160p" => 800,
         "1080p" => 120,
         "720p" => 100,
         "576p" => 60,
         "480p" => 60,
-        _ => 40,
+        _ => 50,
     }
 }
 
-pub fn size_floor_bytes(resolution: &str) -> u64 {
-    (size_floor_mb(resolution).max(0) as u64) * 1_048_576
+pub fn hard_floor_bytes(resolution: &str) -> u64 {
+    (hard_floor_mb(resolution).max(0) as u64) * 1_048_576
 }
 
-/// Reason a release is refused by a built-in rule, or `None` when it passes.
-/// Unknown sizes are never rejected (the value simply is not known).
+pub fn sane_floor_bytes(resolution: &str) -> u64 {
+    (sane_floor_mb(resolution).max(0) as u64) * 1_048_576
+}
+
+/// Effective sane floor for a title. Lower-only: it can never exceed
+/// [`sane_floor_mb`], and a series with no archived history falls back to the
+/// permissive hard floor so a healthy episode is not excluded just because the
+/// series has no large file yet.
+///
+/// `series_min_mb` is the smallest archived episode of the series, when known.
+pub fn effective_floor_mb(resolution: &str, series_min_mb: Option<i64>) -> i64 {
+    match series_min_mb {
+        Some(min) if min > 0 => sane_floor_mb(resolution).min(min / 2),
+        _ => hard_floor_mb(resolution),
+    }
+}
+
+/// Global reason a release is refused by a built-in rule (hardcoded subtitles
+/// or the hard size floor), or `None` when it passes.
 pub fn denied_reason(release: &Release) -> Option<String> {
     if release.quality.hardcoded_subs {
         return Some("hardcoded subtitles".into());
     }
     if release.size_bytes > 0 {
-        let floor = size_floor_bytes(&release.quality.resolution);
+        let floor = hard_floor_bytes(&release.quality.resolution);
         if (release.size_bytes as u64) < floor {
-            let resolution = if release.quality.resolution.trim().is_empty() {
-                "unknown".to_string()
-            } else {
-                release.quality.resolution.clone()
-            };
             return Some(format!(
-                "size {} MiB below the {} sanity floor of {} MiB",
+                "size {} MiB below the {} hard floor of {} MiB",
                 release.size_bytes / 1_048_576,
-                resolution,
-                size_floor_mb(&release.quality.resolution)
+                display_resolution(&release.quality.resolution),
+                hard_floor_mb(&release.quality.resolution)
             ));
         }
     }
     None
 }
 
+/// Per-title sane size reason, using the adaptive floor. Returns `None` when
+/// the size is unknown or acceptable.
+pub fn sane_size_denied_reason(
+    release: &Release,
+    series_min_mb: Option<i64>,
+) -> Option<String> {
+    if release.quality.hardcoded_subs || release.size_bytes <= 0 {
+        return None;
+    }
+    let floor = effective_floor_mb(&release.quality.resolution, series_min_mb);
+    if (release.size_bytes as u64) < (floor.max(0) as u64) * 1_048_576 {
+        return Some(format!(
+            "size {} MiB below the {} sanity floor of {} MiB",
+            release.size_bytes / 1_048_576,
+            display_resolution(&release.quality.resolution),
+            floor
+        ));
+    }
+    None
+}
+
+fn display_resolution(resolution: &str) -> String {
+    if resolution.trim().is_empty() {
+        "unknown".into()
+    } else {
+        resolution.to_string()
+    }
+}
+
 /// Logs a rejected release. A rejection caused by a built-in rule (size floor
 /// or hardcoded subtitles) is logged at `INFO` with the name and basic data so
 /// the user can see *why* an otherwise-valid release was dropped; every other
-/// filter stays at `DEBUG` to keep cycles quiet.
+/// filter stays at `DEBUG`.
 pub fn log_rejection(release: &Release, reason: &str) {
-    if denied_reason(release).is_some() {
+    if denied_reason(release).is_some() || reason.contains("sanity floor") {
         tracing::info!(
             title = %release.title,
             source = %release.source,
@@ -99,13 +154,13 @@ pub fn log_rejection(release: &Release, reason: &str) {
 }
 
 /// Small preference for a healthier bitrate within the same resolution:
-/// +1 per 100 MiB above the sanity floor, capped. It can never bridge a
-/// quality gap (resolution/source/codec deltas are far larger).
+/// +1 per 100 MiB above the sane floor, capped. It can never bridge a quality
+/// gap (resolution/source/codec deltas are far larger).
 pub fn size_score_bonus(release: &Release) -> i64 {
     if release.size_bytes <= 0 {
         return 0;
     }
-    let floor = size_floor_bytes(&release.quality.resolution);
+    let floor = sane_floor_bytes(&release.quality.resolution);
     let size = release.size_bytes as u64;
     if size <= floor {
         return 0;
@@ -144,16 +199,31 @@ mod tests {
     }
 
     #[test]
-    fn size_floor_rejects_only_absurd_sizes() {
+    fn hard_floor_rejects_only_obvious_fakes() {
         assert!(denied_reason(&release("1080p", 1500)).is_none());
-        let tiny = denied_reason(&release("1080p", 40)).unwrap();
-        assert!(tiny.contains("sanity floor"));
+        assert!(denied_reason(&release("1080p", 40)).is_some());
         assert!(denied_reason(&release("2160p", 1200)).is_none());
-        assert!(denied_reason(&release("2160p", 300)).is_some());
+        assert!(denied_reason(&release("2160p", 200)).is_some());
         // Unknown size is never rejected.
         let mut unknown = release("1080p", 1500);
         unknown.size_bytes = 0;
         assert!(denied_reason(&unknown).is_none());
+    }
+
+    #[test]
+    fn adaptive_floor_never_excludes_healthy_episodes() {
+        // No history: the permissive hard floor is used, never the sane one.
+        assert_eq!(effective_floor_mb("2160p", None), hard_floor_mb("2160p"));
+        // History with large episodes: stays at the sane floor (not raised).
+        assert_eq!(effective_floor_mb("2160p", Some(6440)), sane_floor_mb("2160p"));
+        // History with small episodes: lowered below the sane floor.
+        assert_eq!(effective_floor_mb("2160p", Some(1000)), 500);
+        assert_eq!(effective_floor_mb("1080p", Some(200)), 100);
+        // A healthy small episode of a small series passes.
+        let small = release("2160p", 600);
+        assert!(sane_size_denied_reason(&small, Some(1000)).is_none());
+        // An episode far below the series scale is refused.
+        assert!(sane_size_denied_reason(&small, Some(6000)).is_some());
     }
 
     #[test]
@@ -166,9 +236,9 @@ mod tests {
 
     #[test]
     fn size_bonus_is_capped_and_never_negative() {
-        assert_eq!(size_score_bonus(&release("1080p", 100)), 0); // below floor
-        assert_eq!(size_score_bonus(&release("1080p", 180)), 0); // at floor
-        assert_eq!(size_score_bonus(&release("1080p", 280)), 1);
+        assert_eq!(size_score_bonus(&release("1080p", 100)), 0); // below sane floor
+        assert_eq!(size_score_bonus(&release("1080p", 120)), 0); // at sane floor
+        assert_eq!(size_score_bonus(&release("1080p", 220)), 1);
         assert_eq!(size_score_bonus(&release("1080p", 100_000)), 100);
         let mut unknown = release("1080p", 5000);
         unknown.size_bytes = 0;

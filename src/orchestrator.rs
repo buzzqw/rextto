@@ -429,6 +429,8 @@ pub async fn run_cycle_domain(
     }
     stats.scraped = releases.len();
     let mut best = Vec::<Release>::new();
+    // Smallest archived episode per series, for the adaptive size floor.
+    let mut series_min_cache = std::collections::HashMap::<String, Option<i64>>::new();
     for mut release in releases {
         stats.candidates += 1;
         if release.kind == "series" {
@@ -448,6 +450,16 @@ pub async fn run_cycle_domain(
                 continue;
             }
             release.series = Some(series.name.clone());
+            let series_min = *series_min_cache.entry(series.name.clone()).or_insert_with(|| {
+                db.lock()
+                    .unwrap()
+                    .series_archived_min_size(&series.name)
+                    .unwrap_or(None)
+            });
+            if let Some(reason) = crate::rules::sane_size_denied_reason(&release, series_min) {
+                crate::rules::log_rejection(&release, &reason);
+                continue;
+            }
         } else {
             let Some(movie) = cfg.find_movie_match(&release.title, release.year) else {
                 // Not monitored: never log these, they are pure noise.
@@ -462,6 +474,15 @@ pub async fn run_cycle_domain(
             }
             release.title = movie.name.clone();
             release.year = movie.year.parse::<i64>().ok().or(release.year);
+            let movie_min = db
+                .lock()
+                .unwrap()
+                .movie_archived_size(&movie.name, release.year)
+                .unwrap_or(None);
+            if let Some(reason) = crate::rules::sane_size_denied_reason(&release, movie_min) {
+                crate::rules::log_rejection(&release, &reason);
+                continue;
+            }
         }
         let score = cfg.release_score(&release);
         if release.kind == "series" {

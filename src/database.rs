@@ -1493,6 +1493,38 @@ impl Database {
         Ok(())
     }
 
+    /// Smallest archived episode size (bytes) for a series, used by the
+    /// adaptive size floor. `None` when the series has no sized episode yet.
+    pub fn series_archived_min_size(&self, series_name: &str) -> Result<Option<i64>> {
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(e.size_bytes) FROM episodes e JOIN series s ON s.id=e.series_id \
+                 WHERE s.name=?1 AND e.size_bytes>0 \
+                 AND (e.downloaded_at IS NOT NULL OR COALESCE(e.archive_path,'')<>'')",
+                params![series_name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value.filter(|value| *value > 0))
+    }
+
+    /// Archived file size for a movie, used by the adaptive size floor.
+    pub fn movie_archived_size(&self, name: &str, year: Option<i64>) -> Result<Option<i64>> {
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT size_bytes FROM movies WHERE name=?1 AND year IS ?2 \
+                 AND size_bytes>0 AND removed_at IS NULL",
+                params![name, year],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value.filter(|value| *value > 0))
+    }
+
     /// Highest resolution rank among archived episodes *after* the given one
     /// (same season or later). Used to let the opt-in smart-episode guard still
     /// accept a genuine quality upgrade below the profile cutoff.

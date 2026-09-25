@@ -1,0 +1,84 @@
+# Bundled English translations for strings introduced after the original
+# dictionary. Merged at startup with INSERT OR IGNORE, so an existing user
+# translation is never overwritten. Keys are the Italian source strings used
+# with `ctx_tr`.
+eng:
+  # Acquisition tab
+  "Acquisizione": "Acquisition"
+  "Acquisizione automatica": "Automatic acquisition"
+  "Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. Le regole di sanità (sottotitoli hardcoded e dimensione anomala) sono automatiche.": "Wait before downloading, protection from older episodes and periodic cleanup. Sanity rules (hardcoded subtitles and absurd sizes) are automatic."
+  "Delay serie (minuti, 0 = nessuno)": "Series delay (minutes, 0 = none)"
+  "Delay film (minuti, 0 = nessuno)": "Movie delay (minutes, 0 = none)"
+  "Bypassa il delay sopra questo punteggio (0 = mai)": "Bypass the delay above this score (0 = never)"
+  "Rextto non scarica mai un episodio più vecchio fuori dai buchi riconosciuti quando possiede già episodi successivi: è una regola fissa, non disattivabile. Un vero upgrade di qualità resta permesso, e gap-fill e azioni manuali passano sempre.": "Rextto never downloads an older episode outside a recognised gap while it already owns later ones: this is a fixed rule that cannot be disabled. A real quality upgrade is still allowed, and gap-fill and manual actions always pass."
+  "Housekeeping periodico attivo": "Periodic housekeeping enabled"
+  "Housekeeping — intervallo (ore)": "Housekeeping — interval (hours)"
+  "Housekeeping — cicli conservati": "Housekeeping — cycles kept"
+  "Housekeeping — visti nel feed (giorni, 0 = mai)": "Housekeeping — feed-seen entries (days, 0 = never)"
+  "Housekeeping — storico download (giorni, 0 = conserva)": "Housekeeping — download history (days, 0 = keep)"
+  "Esegui housekeeping ora": "Run housekeeping now"
+  "Azzera backoff sorgenti": "Reset source backoff"
+  "Esegue subito pulizia tabelle e compattazione dei database": "Runs table cleanup and database compaction now"
+  "Azzera i periodi di disattivazione di tutte le sorgenti": "Clears the disabled windows of every source"
+
+  # Watched folders
+  "Cartelle osservate": "Watched folders"
+  "Rextto controlla queste cartelle ogni 15 secondi e aggiunge i file .torrent e .magnet che vi vengono copiati. Dopo un'aggiunta riuscita il file viene rimosso (o rinominato in .imported se \"Rimuovi dopo\" è disattivo).": "Rextto scans these folders every 15 seconds and adds copied .torrent and .magnet files. After a successful add the file is removed (or renamed to .imported when \"Remove after\" is off)."
+  "Percorso": "Path"
+  "Attiva": "Enabled"
+  "Ricorsiva": "Recursive"
+  "Rimuovi dopo l'aggiunta": "Remove after adding"
+  "Rimuovi cartella": "Remove folder"
+  "Aggiungi cartella": "Add folder"
+  "Salva cartelle": "Save folders"
+
+  # Event hooks
+  "Hook eventi": "Event hooks"
+  "Esegue un programma esterno su eventi Rextto (download_started, torrent_completed, season_pack_completed, torrent_error, ...). Nei campi sono disponibili i segnaposto {event}, {title}, {hash}, {path}, {series}, {season}, {episode}, {kind}, {source}, {quality_score}. Gli stessi valori sono esportati come variabili REXTTO_*.": "Runs an external program on Rextto events (download_started, torrent_completed, season_pack_completed, torrent_error, ...). Placeholders such as {event}, {title}, {hash}, {path}, {series}, {season}, {episode}, {kind}, {source}, {quality_score} are available; the same values are exported as REXTTO_* variables."
+  "Nome": "Name"
+  "Eventi (separati da virgola, vuoto = tutti)": "Events (comma-separated, empty = all)"
+  "Programma (percorso eseguibile)": "Program (executable path)"
+  "Argomenti (supportano i segnaposto)": "Arguments (support placeholders)"
+  "Timeout (secondi)": "Timeout (seconds)"
+  "Rimuovi hook": "Remove hook"
+  "Aggiungi hook": "Add hook"
+  "Salva hook": "Save hooks"
+
+  # Add-torrent options
+  "Sequenziale": "Sequential"
+  "Salta verifica": "Skip check"
+  "In cima alla coda": "Queue top"
+  "Primo/ultimo pezzo": "First/last piece"
+  "Solo metadati": "Metadata only"
+  "Scarica i file in ordine sequenziale (utile per la visione immediata)": "Download files in sequential order (useful for immediate playback)"
+  "Salta la verifica dell'hash: da usare solo se i dati sono già completi": "Skip the hash check: only use when the data is already complete"
+  "Metti il torrent in cima alla coda": "Move the torrent to the top of the queue"
+  "Dai priorità al primo e all'ultimo pezzo di ogni file": "Prioritise the first and last piece of every file"
+  "Scarica solo i metadati e metti in pausa: utile per valutare la release prima di partire": "Download only the metadata and pause: useful to inspect the release first"
+
+  # Per-title upgrade switch
+  "Consenti aggiornamenti": "Allow upgrades"
+  "Se disattivo, una release migliore non sostituirà mai il file già archiviato per questa serie": "When off, a better release never replaces the file already archived for this series"
+  "Se disattivo, una release migliore non sostituirà mai il file già archiviato per questo film": "When off, a better release never replaces the file already archived for this movie"
+
+  # Torrent options (AddOptions completion)
+  "Esporta .torrent": "Export .torrent"
+  "Scarica il file .torrent di questo torrent": "Download this torrent's .torrent file"
+  "Super seeding": "Super seeding"
+  "Attiva o disattiva il super seeding (initial seeding)": "Enable or disable super seeding (initial seeding)"
+  "Super seeding attivo": "Super seeding enabled"
+  "Super seeding disattivato": "Super seeding disabled"
+  "Web seed": "Web seed"
+  "Web seed HTTP/FTP: incolla uno o più URL separati da spazio per aggiungerli o rimuoverli": "Web seed HTTP/FTP: paste one or more space-separated URLs to add or remove them"
+  "Web seed aggiunto": "Web seed added"
+  "Web seed rimosso": "Web seed removed"
+  "Modifica tracker (tier|url per riga)": "Edit trackers (tier|url per line)"
+  "Un tracker per riga; prefisso opzionale tier|url. Salva per sostituire l'intera lista.": "One tracker per line; optional tier|url prefix. Save to replace the whole list."
+  "Salva tracker": "Save trackers"
+  "Tracker aggiornati": "Trackers updated"
+  "Priorità": "Priority"
+  "Salta": "Skip"
+  "Normale": "Normal"
+  "Alta": "High"
+  "Massima": "Maximum"
+  "Priorità aggiornata": "Priority updated"

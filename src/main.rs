@@ -134,6 +134,8 @@ async fn main() -> Result<()> {
     let i18n = Arc::new(rextto::i18n::I18nDb::open(
         &cfg.data_dir.join("rextto_config.db"),
     )?);
+    // Merge the bundled translations (never overwrites user edits).
+    let _ = i18n.seed_default_translations();
     if let Ok(language) = i18n.language() {
         rextto::messages::set_language(&language);
     }

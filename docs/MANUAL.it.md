@@ -51,7 +51,10 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
 - **Azioni riga**: pausa/riprendi, recheck, dettagli, rimuovi.
 - **Dettagli** (tab Generale, Tracker, Contenuto, Peers, Limiti, Storage):
   copia magnet, limiti per torrent/giorni di seed, reannounce, pin, riavvia,
-  segna come fallito, sposta storage.
+  segna come fallito, sposta storage. In **Generale** trovi anche **Esporta
+  .torrent**, **Super seeding** e l'aggiunta/rimozione di **web seed**; in
+  **Tracker** puoi modificare l'intera lista (`tier|url` per riga); in
+  **Contenuto** imposti la **priorità per file** (Salta/Normale/Alta/Massima).
 - **Storico download**: elenca i download conclusi (nativi e migrati). Colonne:
   nome (con badge **NAS** quando il file è archiviato), tipo/stagione/episodio,
   **tag NAS** (regola di cartella), score, stato (*Completato*), **percorso

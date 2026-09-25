@@ -51,7 +51,10 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
 - **Row actions**: pause/resume, recheck, details, remove.
 - **Details** tabs: General, Tracker, Content, Peers, Limits, Storage; includes
   copy magnet, per-torrent limits/seed-days, reannounce, pin, restart,
-  mark-failed, move storage.
+  mark-failed, move storage. **General** also offers **Export .torrent**,
+  **Super seeding** and web-seed add/remove; **Tracker** lets you edit the whole
+  list (`tier|url` per line); **Content** sets the **per-file priority**
+  (Skip/Normal/High/Maximum).
 - **Download history** lists finished downloads (native completions and
   migrated ones). Columns: name (with a **NAS** badge when the file has been
   archived), type/season/episode, **NAS tag** (folder rule), score, status

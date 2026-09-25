@@ -135,6 +135,36 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> usize;
+    fn rextto_lt_set_file_priorities(
+        session: *mut c_void,
+        hash: *const c_char,
+        priorities: *const i32,
+        count: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_add_web_seeds(
+        session: *mut c_void,
+        hash: *const c_char,
+        urls: *const c_char,
+        remove: i32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_set_trackers(
+        session: *mut c_void,
+        hash: *const c_char,
+        tiered: *const c_char,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+    fn rextto_lt_set_super_seeding(
+        session: *mut c_void,
+        hash: *const c_char,
+        enabled: i32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
     fn rextto_lt_move_storage(
         session: *mut c_void,
         hash: *const c_char,
@@ -377,6 +407,7 @@ struct NativeFile {
     path: [c_char; 1024],
     size: i64,
     downloaded: i64,
+    priority: i32,
 }
 
 impl Default for NativeFile {
@@ -385,6 +416,7 @@ impl Default for NativeFile {
             path: [0; 1024],
             size: 0,
             downloaded: 0,
+            priority: 4,
         }
     }
 }
@@ -1181,6 +1213,112 @@ impl LibtorrentClient {
         Ok(true)
     }
 
+    /// Sets the per-file download priority (0 skipped … 7 maximum).
+    pub fn set_file_priorities(&self, hash: &str, priorities: &[i32]) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_set_file_priorities(
+                session.0,
+                hash.as_ptr(),
+                priorities.as_ptr(),
+                priorities.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent file priorities failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Adds or removes HTTP/FTP web seeds (one URL per line in `urls`).
+    pub fn web_seeds(&self, hash: &str, urls: &str, remove: bool) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let urls = CString::new(urls)?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_add_web_seeds(
+                session.0,
+                hash.as_ptr(),
+                urls.as_ptr(),
+                remove as i32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent web seed failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Replaces the tracker list. `trackers` are `(tier, url)` pairs.
+    pub fn set_trackers(&self, hash: &str, trackers: &[(i32, String)]) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let payload = trackers
+            .iter()
+            .map(|(tier, url)| format!("{}|{}", tier, url.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = CString::new(payload)?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_set_trackers(
+                session.0,
+                hash.as_ptr(),
+                payload.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent tracker update failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Enables/disables libtorrent super seeding on a torrent.
+    pub fn set_super_seeding(&self, hash: &str, enabled: bool) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let hash = CString::new(hash.to_ascii_lowercase())?;
+        let mut error = [0_i8; 512];
+        let ok = unsafe {
+            rextto_lt_set_super_seeding(
+                session.0,
+                hash.as_ptr(),
+                enabled as i32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            bail!("libtorrent super seeding failed: {}", native_error(&error));
+        }
+        Ok(true)
+    }
+
+    /// Path of the `.torrent` metadata saved on the metadata-received event, if
+    /// any. Used to export a torrent file back to the user.
+    pub fn torrent_file_path(&self, hash: &str) -> Option<std::path::PathBuf> {
+        let path = self
+            .state_dir
+            .join(format!("{}.torrent", hash.to_ascii_lowercase()));
+        path.is_file().then_some(path)
+    }
+
     /// Come [`Self::add_file_with_path`], ma restituisce l'infohash del torrent
     /// aggiunto: serve all'accoda manuale di un URL `.torrent` (Jackett/Prowlarr)
     /// per registrare i metadati sotto l'hash reale.
@@ -1494,6 +1632,7 @@ impl LibtorrentClient {
                     path: native_string(&file.path),
                     size: file.size,
                     downloaded: file.downloaded,
+                    priority: file.priority,
                 })
                 .collect(),
         ))
