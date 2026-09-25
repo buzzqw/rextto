@@ -166,8 +166,13 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   backoffs. The databases are compacted with `VACUUM` afterwards. Archive
   retention is separate and is configured under **Configuration → Advanced**.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
-  A selected RAM-disk path remains configured, but a directory created under
-  `/dev/shm` must be recreated after a reboot.
+   A selected RAM-disk path remains configured, but a directory created under
+   `/dev/shm` must be recreated after a reboot.
+ - **Translations** — advanced panel to export saved Italian or English
+   translations as YAML, edit them, and import them again. The format is a
+   `key: value` map, for example `"Testa porte": "Test ports"`.
+   Import updates or adds keys present in the file and does not delete missing
+   keys. It does not change the active language; use the selector at the top.
 
 Release sanity checks are **automatic** and not configurable: hardcoded
 subtitles (`HC`) and absurd sizes (a per-resolution floor derived from a real

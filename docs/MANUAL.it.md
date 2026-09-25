@@ -172,8 +172,14 @@ la barra “Salva tutte”.
   La retention dell'Archivio è separata e si trova in **Configurazione →
   Avanzate**.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
-  per tag. Il percorso RAM disk selezionato resta configurato, ma la directory
-  creata sotto `/dev/shm` va ricreata dopo un riavvio.
+   per tag. Il percorso RAM disk selezionato resta configurato, ma la directory
+   creata sotto `/dev/shm` va ricreata dopo un riavvio.
+ - **Traduzioni** — pannello avanzato per esportare in YAML le traduzioni
+   salvate per italiano o inglese, modificarle e reimportarle. Il formato è una
+   mappa `chiave: valore`, ad esempio `"Testa porte": "Test ports"`.
+   L'importazione aggiorna o aggiunge le chiavi presenti e non cancella quelle
+   assenti dal file. Non cambia la lingua attiva: quella si sceglie dal
+   selettore in alto.
 
 I controlli di sanità delle release sono **automatici** e non configurabili:
 sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione

@@ -7958,21 +7958,24 @@ fn ScoreField(
 
 #[component]
 fn TranslationTools() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let lang = RwSignal::new("it".to_string());
     let yaml = RwSignal::new(String::new());
     let message = RwSignal::new(String::new());
     view! {
-        <Panel title="Traduzioni YAML">
+        <Panel title="Importa/esporta traduzioni interfaccia">
+            <p class="hint">{ctx_tr("Questo pannello serve a fare una copia o una modifica avanzata delle traduzioni dell'interfaccia. Scegli una lingua e premi Esporta per caricare nell'editor le coppie chiave/valore salvate; modifica il testo YAML e premi Importa per aggiornare o aggiungere le traduzioni. Le chiavi non presenti nel file importato non vengono cancellate. Esempio: \"Testa porte\": \"Test ports\". Non cambia la lingua attiva dell'interfaccia: per quella usa il selettore in alto.")}</p>
             <div class="toolbar">
+                <label>{ctx_tr("Lingua delle traduzioni")}</label>
                 <select prop:value=lang on:change=move |event| lang.set(event_target_value(&event))>
                     <option value="it">{ctx_tr("Italiano")}</option>
                     <option value="en">{ctx_tr("English")}</option>
                 </select>
-                <button class="btn sm" on:click=move |_| { let selected = lang.get(); let output = yaml; let status = message; spawn_local(async move { match get_text(&format!("/api/i18n/export/{selected}")).await { Ok(value) => { output.set(value); status.set("Esportato".into()); } Err(error) => status.set(error) } }); }>{ctx_tr("Esporta")}</button>
-                <button class="btn sm" on:click=move |_| { let selected = lang.get(); let value = yaml.get(); let status = message; spawn_local(async move { match send("POST", &format!("/api/i18n/import/{selected}"), Some(json!({"yaml": value}))).await { Ok(_) => status.set("Importato".into()), Err(error) => status.set(error) } }); }>{ctx_tr("Importa")}</button>
+                <button class="btn sm" title=ctx_tr("Carica nell'editor le traduzioni salvate per la lingua scelta") on:click=move |_| { let selected = lang.get(); let output = yaml; let status = message; spawn_local(async move { match get_text(&format!("/api/i18n/export/{selected}")).await { Ok(value) => { output.set(value); status.set(tr(data, "Traduzioni esportate")); } Err(error) => status.set(error) } }); }>{ctx_tr("Esporta YAML")}</button>
+                <button class="btn sm" title=ctx_tr("Aggiorna o aggiunge le traduzioni della lingua scelta usando il testo YAML nell'editor") on:click=move |_| { let selected = lang.get(); let value = yaml.get(); let status = message; spawn_local(async move { match send("POST", &format!("/api/i18n/import/{selected}"), Some(json!({"yaml": value}))).await { Ok(_) => status.set(tr(data, "Traduzioni importate")), Err(error) => status.set(error) } }); }>{ctx_tr("Importa YAML")}</button>
                 <small class="muted">{message}</small>
             </div>
-            <textarea style="width:100%;min-height:220px;margin-top:10px" prop:value=yaml on:input=move |event| yaml.set(event_target_value(&event)) placeholder=ctx_tr("Traduzioni YAML")></textarea>
+            <textarea style="width:100%;min-height:220px;margin-top:10px" prop:value=yaml on:input=move |event| yaml.set(event_target_value(&event)) placeholder=ctx_tr("Incolla qui le traduzioni nel formato YAML chiave: valore")></textarea>
         </Panel>
     }
 }
