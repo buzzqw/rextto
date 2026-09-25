@@ -2242,6 +2242,29 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Come `series_season_counts`, ma per tutte le serie in una sola query:
+    /// evita una SELECT per serie nel caricamento della libreria.
+    pub fn series_season_counts_bulk(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<(i64, i64)>>> {
+        let mut statement = self.conn.prepare(
+            "SELECT series_name, season, episode_count FROM series_metadata ORDER BY series_name, season",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        let mut counts: std::collections::HashMap<String, Vec<(i64, i64)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (name, pair) = row?;
+            counts.entry(name).or_default().push(pair);
+        }
+        Ok(counts)
+    }
+
     pub fn gap_recently_searched(
         &self,
         series_name: &str,
@@ -3912,6 +3935,42 @@ mod tests {
             aux.get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").cloned().unwrap(),
             "la versione bulk deve combaciare con quella singola"
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn series_season_counts_bulk_matches_single_lookup() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-season-bulk-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let now = Utc::now().to_rfc3339();
+        for (name, season, count) in [("A", 1, 10), ("A", 2, 8), ("B", 1, 3)] {
+            db.conn
+                .execute(
+                    "INSERT INTO series_metadata(series_name,season,episode_count,updated_at) VALUES (?1,?2,?3,?4)",
+                    params![name, season, count, now],
+                )
+                .unwrap();
+        }
+        let bulk = db.series_season_counts_bulk().unwrap();
+        assert_eq!(bulk.get("A").cloned().unwrap_or_default(), vec![(1, 10), (2, 8)]);
+        assert_eq!(bulk.get("B").cloned().unwrap_or_default(), vec![(1, 3)]);
+        assert_eq!(
+            bulk.get("A").cloned().unwrap_or_default(),
+            db.series_season_counts("A").unwrap(),
+            "la versione bulk deve combaciare con quella per singola serie"
+        );
+        assert!(db.series_season_counts("C").unwrap().is_empty());
+        assert!(!bulk.contains_key("C"));
 
         drop(db);
         let _ = std::fs::remove_file(&path);

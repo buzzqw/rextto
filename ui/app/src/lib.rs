@@ -1206,72 +1206,91 @@ pub fn App() -> impl IntoView {
         }
     });
     let next_cycle = Signal::derive(move || {
-        let refresh = data.get().config.get("refresh_secs").and_then(Value::as_u64).unwrap_or(0);
+        let (refresh, parsed) = data.with(|current| {
+            let refresh = current
+                .config
+                .get("refresh_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let parsed = current
+                .status
+                .get("last_cycle")
+                .and_then(|cycle| cycle.get("last_started_at"))
+                .and_then(Value::as_str)
+                .map(js_sys::Date::parse)
+                .filter(|value| !value.is_nan())
+                .unwrap_or_else(|| now_ms.get());
+            (refresh, parsed)
+        });
         if refresh == 0 {
             return "—".to_string();
         }
-        let parsed = data
-            .get()
-            .status
-            .get("last_cycle")
-            .and_then(|cycle| cycle.get("last_started_at"))
-            .and_then(Value::as_str)
-            .map(js_sys::Date::parse)
-            .filter(|value| !value.is_nan())
-            .unwrap_or_else(|| now_ms.get());
         let remaining = parsed + refresh as f64 * 1000.0 - now_ms.get();
         tr(data, &format_remaining_seconds((remaining / 1000.0) as i64))
     });
-    // Live torrent figures, always visible in the top bar.
+    // Live torrent figures, always visible in the top bar. Lette con `with`
+    // per non clonare tutto `Data` ad ogni aggiornamento.
     let live_dl = Signal::derive(move || {
         size_str(
-            data.get()
-                .torrents
-                .iter()
-                .map(|item| value_f64(item, "download_rate"))
-                .sum(),
+            data.with(|current| {
+                current
+                    .torrents
+                    .iter()
+                    .map(|item| value_f64(item, "download_rate"))
+                    .sum()
+            }),
         )
     });
     let live_ul = Signal::derive(move || {
         size_str(
-            data.get()
-                .torrents
-                .iter()
-                .map(|item| value_f64(item, "upload_rate"))
-                .sum(),
+            data.with(|current| {
+                current
+                    .torrents
+                    .iter()
+                    .map(|item| value_f64(item, "upload_rate"))
+                    .sum()
+            }),
         )
     });
     let live_cpu = Signal::derive(move || {
-        data.get()
-            .health
-            .get("process_cpu_percent")
-            .and_then(Value::as_f64)
-            .map(|value| format!("{value:.1}%"))
-            .unwrap_or_else(|| "—".into())
+        data.with(|current| {
+            current
+                .health
+                .get("process_cpu_percent")
+                .and_then(Value::as_f64)
+                .map(|value| format!("{value:.1}%"))
+                .unwrap_or_else(|| "—".into())
+        })
     });
     let live_ram = Signal::derive(move || {
-        size_str(
-            data.get()
-                .health
-                .get("resident_bytes")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0),
-        )
+        data.with(|current| {
+            size_str(
+                current
+                    .health
+                    .get("resident_bytes")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+            )
+        })
     });
-    let live_count = Signal::derive(move || data.get().torrents.len());
+    let live_count = Signal::derive(move || data.with(|current| current.torrents.len()));
     let live_peers = Signal::derive(move || {
-        data.get()
-            .torrents
-            .iter()
-            .map(|item| value_f64(item, "num_peers"))
-            .sum::<f64>() as i64
+        data.with(|current| {
+            current
+                .torrents
+                .iter()
+                .map(|item| value_f64(item, "num_peers"))
+                .sum::<f64>() as i64
+        })
     });
     let live_seeds = Signal::derive(move || {
-        data.get()
-            .torrents
-            .iter()
-            .map(|item| value_f64(item, "num_seeds"))
-            .sum::<f64>() as i64
+        data.with(|current| {
+            current
+                .torrents
+                .iter()
+                .map(|item| value_f64(item, "num_seeds"))
+                .sum::<f64>() as i64
+        })
     });
     // Su mobile la voce "Sistema" è comprimibile: evita che la barra di
     // navigazione diventi una fila interminabile di voci poco usate.
@@ -1283,7 +1302,7 @@ pub fn App() -> impl IntoView {
                 <aside class="sidebar">
                     <div class="brand">
                         <span class="brand-mark">R</span>
-                        <div><strong>Rextto</strong><small title=ctx_tr("Versione applicazione")>{move || format!("Media daemon · v{}", text(&data.get().status, "version", "?"))}</small></div>
+                        <div><strong>Rextto</strong><small title=ctx_tr("Versione applicazione")>{move || data.with(|current| format!("Media daemon · v{}", text(&current.status, "version", "?")))}</small></div>
                     </div>
                     <nav>
                         <SettingsSearch />
@@ -1510,14 +1529,16 @@ fn SettingsSearchOverlay(page: RwSignal<String>) -> impl IntoView {
 
 #[component]
 fn SidebarCount(page: RwSignal<String>, id: &'static str, data: RwSignal<Data>) -> impl IntoView {
-    let count = Signal::derive(move || match id {
-        "downloads" => data.get().torrents.len(),
-        "series" => array(&data.get().library, "series").len(),
-        "movies" => array(&data.get().library, "movies").len(),
-        "comics" => data.get().comics.len(),
-        "gaps" => data.get().gaps.len(),
-        "blocklist" => data.get().blocklist.len(),
-        _ => 0,
+    let count = Signal::derive(move || {
+        data.with(|current| match id {
+            "downloads" => current.torrents.len(),
+            "series" => array(&current.library, "series").len(),
+            "movies" => array(&current.library, "movies").len(),
+            "comics" => current.comics.len(),
+            "gaps" => current.gaps.len(),
+            "blocklist" => current.blocklist.len(),
+            _ => 0,
+        })
     });
     view! {
         <Show when=move || { count.get() > 0 }>
@@ -9247,12 +9268,15 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
         loop {
             let requested = limit.get_untracked().parse::<usize>().unwrap_or(400).clamp(50, 2000);
             if let Ok(value) = get(&format!("/api/logs?limit={requested}")).await {
-                lines.set(
-                    array(&value, "items")
-                        .into_iter()
-                        .filter_map(|item| item.as_str().map(str::to_owned))
-                        .collect(),
-                );
+                let next: Vec<String> = array(&value, "items")
+                    .into_iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect();
+                // Evita di ri-renderizzare (e ri-evidenziare) tutto il log ad
+                // ogni poll quando non è cambiato nulla.
+                if lines.get_untracked() != next {
+                    lines.set(next);
+                }
             }
             loading.set(false);
             TimeoutFuture::new(5_000).await;
@@ -9273,12 +9297,13 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
             let result = get(&format!("/api/logs?limit={requested}")).await;
             if limit.get() == requested.to_string() {
                 if let Ok(value) = result {
-                    lines.set(
-                        array(&value, "items")
-                            .into_iter()
-                            .filter_map(|item| item.as_str().map(str::to_owned))
-                            .collect(),
-                    );
+                    let next: Vec<String> = array(&value, "items")
+                        .into_iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect();
+                    if lines.get_untracked() != next {
+                        lines.set(next);
+                    }
                 }
                 loading.set(false);
             }

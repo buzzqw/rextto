@@ -40,8 +40,8 @@ use std::{
 /// Short-lived response cache for endpoints that call TMDB (calendar, recent
 /// downloads). Avoids repeating dozens of TMDB requests on every UI load/poll.
 /// The payload is stored behind an `Arc` so a cache hit does not deep-clone it.
-static RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<serde_json::Value>)>>> =
-    OnceLock::new();
+type ResponseCache = Mutex<HashMap<String, (Instant, Arc<serde_json::Value>)>>;
+static RESPONSE_CACHE: OnceLock<ResponseCache> = OnceLock::new();
 
 /// Health may stat NFS paths and walk a large trash directory. Permit only one
 /// such blocking operation at a time; callers wait asynchronously rather than
@@ -2122,6 +2122,7 @@ async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
     let db = s.db.lock().unwrap();
     let statuses = db.series_statuses().unwrap_or_default();
+    let season_counts = db.series_season_counts_bulk().unwrap_or_default();
     let series = cfg
         .series
         .iter()
@@ -2131,7 +2132,7 @@ async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
             // downloads. Il vecchio COUNT(episodes) mostrava falsi 140/140
             // mentre il dettaglio, correttamente, riportava 140/143.
             let mut ignored_seasons = series.ignored_seasons.clone();
-            for (season, _) in db.series_season_counts(&series.name).unwrap_or_default() {
+            for (season, _) in season_counts.get(&series.name).cloned().unwrap_or_default() {
                 if !Config::season_allowed_for_scan(&series.seasons, season)
                     && !ignored_seasons.contains(&season)
                 {
@@ -6463,21 +6464,11 @@ async fn search_missing(
         Json(serde_json::json!({"ok":true,"query":query,"results":results})),
     )
 }
-async fn calendar(State(s): State<AppState>) -> Response {
-    let cfg = latest_config(&s);
-    if cfg.tmdb_api_key.is_none() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"ok":false,"error":"TMDB API key is not configured"})),
-        )
-            .into_response();
-    }
-    if let Some(cached) = cache_get("calendar", Duration::from_secs(120)) {
-        return Json(cached).into_response();
-    }
+/// Calcola il payload del calendario (una chiamata TMDB per serie, in
+/// parallelo). Estratto così anche il worker di warm-up può precalcolarlo e la
+/// prima apertura della UI non paga i ~3 s di chiamate TMDB.
+async fn build_calendar(cfg: &Config) -> serde_json::Value {
     let tmdb = TmdbClient::with_language(cfg.tmdb_api_key.clone(), cfg.tmdb_language());
-    // Una chiamata TMDB per serie (id + prossimo episodio + poster) in
-    // parallelo: prima erano ~2 chiamate sequenziali per serie (~2,6 s).
     let mut set = tokio::task::JoinSet::new();
     for series in cfg.series.iter().filter(|series| series.enabled).cloned() {
         let tmdb = tmdb.clone();
@@ -6513,7 +6504,38 @@ async fn calendar(State(s): State<AppState>) -> Response {
         }
     }
     sort_calendar_items(&mut items);
-    let response = serde_json::json!({"ok":true,"items":items});
+    serde_json::json!({"ok":true,"items":items})
+}
+
+/// Tiene caldo il calendario: lo precalcola all'avvio e lo rinnova quando la
+/// cache scade, così l'endpoint risponde subito.
+async fn calendar_warmup_worker(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    loop {
+        let cfg = latest_config(&state);
+        if cfg.tmdb_api_key.is_some()
+            && cache_get("calendar", Duration::from_secs(120)).is_none()
+        {
+            let response = build_calendar(&cfg).await;
+            cache_put("calendar", &response);
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn calendar(State(s): State<AppState>) -> Response {
+    let cfg = latest_config(&s);
+    if cfg.tmdb_api_key.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"TMDB API key is not configured"})),
+        )
+            .into_response();
+    }
+    if let Some(cached) = cache_get("calendar", Duration::from_secs(120)) {
+        return Json(cached).into_response();
+    }
+    let response = build_calendar(&cfg).await;
     cache_put("calendar", &response);
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -13943,6 +13965,7 @@ pub async fn serve(
     let watched = tokio::spawn(watched_folders_worker(state.clone()));
     let housekeeping = tokio::spawn(housekeeping_worker(state.clone()));
     let media_backfill = tokio::spawn(media_info_backfill_worker(state.clone()));
+    let calendar_warmup = tokio::spawn(calendar_warmup_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -13957,6 +13980,7 @@ pub async fn serve(
         registry.push(watched);
         registry.push(housekeeping);
         registry.push(media_backfill);
+        registry.push(calendar_warmup);
     }
     let app = router(state);
     let result = tokio::try_join!(
