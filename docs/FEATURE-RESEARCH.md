@@ -277,8 +277,11 @@ numeri. Al loro posto, controlli automatici sempre attivi:
 
 - **Sottotitoli hardcoded** (`HC`/`hardcoded`): rifiutati, default di Radarr.
 - **Dimensione assurda**: soglia per risoluzione derivata da un archivio reale
-  (4962 file; 5° percentile con margine): 2160p 1200 MiB, 1080p 180, 720p 120,
-  576p 80, 480p 60. Dimensione sconosciuta = nessun rifiuto.
+  (4962 file) con statistica robusta (taglio del 5% degli estremi grandi), posta
+  sotto il **file più piccolo realmente presente** per non toccare gli encode 4K
+  efficienti: 2160p 800 MiB (min reale ~1539, mediana 6440), 1080p 120 (min 236,
+  mediana 1578), 720p 100 (min 437), 576p 60, 480p 60 (min 236). Dimensione
+  sconosciuta = nessun rifiuto.
 - **Preferenza dimensione**: piccolo bonus (max 100) per un bitrate più sano
   nella stessa risoluzione; non può mai colmare un divario di qualità.
 

@@ -19,23 +19,27 @@
 
 use crate::models::Release;
 
-/// Size sanity floor in MiB for a resolution. Values come from the 5th
-/// percentile of a real archive, rounded down with margin.
+/// Size sanity floor in MiB for a resolution, derived from a real archive with
+/// a generous margin. The aggregate percentiles were skewed by high-bitrate
+/// series, so the floor sits well below the *smallest real file*: efficient
+/// 2160p Web-DL encodes legitimately land around 1.5 GiB (e.g. The Pitt S02,
+/// Wonder Man) and must never be rejected.
 ///
-/// | resolution | p05 archive | floor |
-/// |------------|-------------|-------|
-/// | 2160p      | ~2668 MiB   | 1200  |
-/// | 1080p      | ~354 MiB    | 180   |
-/// | 720p       | ~497 MiB    | 120   |
-/// | 576p/480p  | ~289 MiB    | 60    |
+/// | resolution | smallest real file | median | floor |
+/// |------------|--------------------|--------|-------|
+/// | 2160p      | ~1539 MiB          | 6440   | 800   |
+/// | 1080p      | ~236 MiB           | 1578   | 120   |
+/// | 720p       | ~437 MiB           | 760    | 100   |
+/// | 576p       | —                  | —      | 60    |
+/// | 480p       | ~236 MiB           | 496    | 60    |
 pub fn size_floor_mb(resolution: &str) -> i64 {
     match resolution {
-        "2160p" => 1200,
-        "1080p" => 180,
-        "720p" => 120,
-        "576p" => 80,
+        "2160p" => 800,
+        "1080p" => 120,
+        "720p" => 100,
+        "576p" => 60,
         "480p" => 60,
-        _ => 50,
+        _ => 40,
     }
 }
 
