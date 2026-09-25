@@ -6451,8 +6451,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                      <SelectSetting label="Azione cleanup" setting_key="cleanup_action" value=Signal::derive(move || raw(&data.get().config, "cleanup_action", "move")) options=CLEANUP_ACTION_OPTIONS />
                      <PathSetting label="Download libtorrent" setting_key="libtorrent_dir" value=Signal::derive(move || text(&data.get().config.get("paths").cloned().unwrap_or_default(), "libtorrent_dir", "")) placeholder="/mnt/downloads" />
                     <PathSetting label="Cartella temporanea libtorrent" setting_key="libtorrent_temp_dir" value=Signal::derive(move || text(&data.get().config.get("paths").cloned().unwrap_or_default(), "libtorrent_temp_dir", "")) placeholder="/mnt/temp" />
-                    <PathSetting label="RAM disk libtorrent" setting_key="libtorrent_ramdisk_dir" value=Signal::derive(move || text(&data.get().config.get("paths").cloned().unwrap_or_default(), "libtorrent_ramdisk_dir", "")) placeholder="/mnt/ramdisk" />
-                </Panel>
+                 </Panel>
                 <Panel title="Percorsi NAS per categoria (tag)">
                     <p class="muted">{ctx_tr("Le release vengono archiviate nella cartella finale del tag corrispondente (es. tag 'Film' → /home/user/film). Le serie usano il percorso della serie.")}</p>
                     <NasPathsEditor />
