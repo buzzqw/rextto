@@ -127,12 +127,14 @@ fn display_resolution(resolution: &str) -> String {
     }
 }
 
-/// Logs a rejected release. A rejection caused by a built-in rule (size floor
-/// or hardcoded subtitles) is logged at `INFO` with the name and basic data so
-/// the user can see *why* an otherwise-valid release was dropped; every other
-/// filter stays at `DEBUG`.
+/// Logs a rejected release. A rejection caused directly by a built-in sanity
+/// rule (size floor or hardcoded subtitles) is logged at `INFO`; every other
+/// filter, including blacklist/content-filter matches, stays at `DEBUG`.
 pub fn log_rejection(release: &Release, reason: &str) {
-    if denied_reason(release).is_some() || reason.contains("sanity floor") {
+    let sanity_rejection = reason == "hardcoded subtitles"
+        || reason.contains("hard floor")
+        || reason.contains("sanity floor");
+    if sanity_rejection {
         tracing::info!(
             title = %release.title,
             source = %release.source,

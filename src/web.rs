@@ -3625,7 +3625,10 @@ async fn movie_search(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
     } else {
         format!("{} {}", movie.name, movie.year)
     };
-    let mut results = s.engine.search_query(&cfg, &query).await;
+    // Keep globally filtered releases visible in this interactive list: the
+    // user may inspect or manually queue one, while automatic acquisition
+    // continues to discard it.
+    let mut results = s.engine.search_query_manual_all(&cfg, &query).await;
     for (title, magnet, source) in s.archive.lock().unwrap().search(&query).unwrap_or_default() {
         if let Some(release) =
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))

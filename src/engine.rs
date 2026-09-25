@@ -234,6 +234,7 @@ impl Engine {
                             &ids,
                             None,
                             provider_db,
+                            false,
                         ),
                     )
                     .await
@@ -405,6 +406,23 @@ impl Engine {
             &[],
             Some(MANUAL_SEARCH_TIMEOUT),
             self.db.clone(),
+            false,
+        )
+        .await
+    }
+
+    /// Interactive movie choices keep globally rejected releases visible so
+    /// the user can inspect or manually queue them. Automatic acquisition still
+    /// uses the filtered methods above.
+    pub async fn search_query_manual_all(&self, cfg: &Config, query: &str) -> Vec<Release> {
+        search_one_with_db(
+            &self.client,
+            cfg,
+            query,
+            &[],
+            Some(MANUAL_SEARCH_TIMEOUT),
+            self.db.clone(),
+            true,
         )
         .await
     }
@@ -419,7 +437,7 @@ impl Engine {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        search_one_with_db(&self.client, cfg, query, &owned, None, self.db.clone()).await
+        search_one_with_db(&self.client, cfg, query, &owned, None, self.db.clone(), false).await
     }
 }
 
@@ -436,6 +454,7 @@ async fn search_one_with_db(
     external_ids: &[(String, String)],
     web_timeout: Option<Duration>,
     provider_db: Option<Arc<std::sync::Mutex<crate::database::Database>>>,
+    include_rejected: bool,
 ) -> Vec<Release> {
     let mut all = Vec::new();
     // Load the disabled set once, then exclude those providers from the fan-out.
@@ -547,11 +566,13 @@ async fn search_one_with_db(
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(all.len());
     for release in all {
-        if let Some(reason) = cfg.all_release_denied_reason(&release) {
-            if cfg.release_is_monitored(&release) {
-                crate::rules::log_rejection(&release, &reason);
+        if !include_rejected {
+            if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                if cfg.release_is_monitored(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                }
+                continue;
             }
-            continue;
         }
         if magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash)) {
             kept.push(release);
