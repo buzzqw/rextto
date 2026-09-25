@@ -3,6 +3,19 @@
 # translation is never overwritten. Keys are the Italian source strings used
 # with `ctx_tr`.
 eng:
+  # Comics — GetComics selection flow
+  "Aggiungi fumetto": "Add comic"
+  "Titolo": "Title"
+  "Trova": "Find"
+  "Nome fumetto, es. Poison Ivy #41": "Comic title, e.g. Poison Ivy #41"
+  "Scrivi il titolo, premi Trova e seleziona esattamente il fumetto desiderato. Rextto salverà automaticamente il post GetComics e i suoi metadati.": "Enter the title, click Find, and select the exact comic you want. Rextto will automatically save the GetComics post and its metadata."
+  "Risultato GetComics": "GetComics result"
+  "Seleziona": "Select"
+  "Fumetto selezionato": "Selected comic"
+  "Aggiungi fumetto selezionato": "Add selected comic"
+  "Annulla selezione": "Clear selection"
+  "Scrivi il nome del fumetto, poi scegli il risultato esatto trovato su GetComics": "Enter the comic name, then choose the exact result found on GetComics"
+
   # Acquisition tab
   "Acquisizione": "Acquisition"
   "Acquisizione automatica": "Automatic acquisition"

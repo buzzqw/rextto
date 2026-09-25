@@ -16,6 +16,7 @@ pub struct ComicMonitored {
     pub id: i64,
     pub title: String,
     pub tag_url: String,
+    pub post_url: String,
     pub cover_url: String,
     pub publisher: String,
     pub description: String,
@@ -33,7 +34,10 @@ pub struct ComicsDb {
 pub struct ComicPost {
     pub title: String,
     pub url: String,
+    pub tag_url: String,
     pub cover_url: String,
+    pub publisher: String,
+    pub description: String,
     pub date: String,
 }
 
@@ -369,6 +373,91 @@ fn matches_monitored_issue(monitored_title: &str, post_title: &str) -> bool {
     }
 }
 
+fn extract_tag_url(article: scraper::element_ref::ElementRef<'_>, page_url: &str, title: &str) -> String {
+    let Ok(selector) = scraper::Selector::parse("a[href*='/tag/']") else {
+        return String::new();
+    };
+    let title_slug = title
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character } else { '-' })
+        .collect::<String>();
+    let mut fallback = String::new();
+    for anchor in article.select(&selector) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let Ok(url) = url::Url::parse(page_url).and_then(|base| base.join(href)) else {
+            continue;
+        };
+        let value = url.to_string();
+        if fallback.is_empty() {
+            fallback = value.clone();
+        }
+        if url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .any(|segment| title_slug.contains(segment))
+        {
+            return value;
+        }
+    }
+    if !fallback.is_empty() {
+        return fallback;
+    }
+    let mut words = title_slug
+        .split('-')
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if words.last().is_some_and(|word| word.len() == 4 && word.chars().all(|c| c.is_ascii_digit())) {
+        words.pop();
+    }
+    if !words.is_empty() {
+        return format!("https://getcomics.org/tag/{}/", words.join("-"));
+    }
+    String::new()
+}
+
+fn extract_publisher(article: scraper::element_ref::ElementRef<'_>) -> String {
+    let Ok(selector) = scraper::Selector::parse("a[href*='/cat/'], a[href*='/tag/']") else {
+        return String::new();
+    };
+    let known = [
+        ("dc", "DC Comics"),
+        ("marvel", "Marvel"),
+        ("image", "Image Comics"),
+        ("dark-horse", "Dark Horse"),
+        ("idw", "IDW"),
+        ("dynamite", "Dynamite"),
+        ("boom", "BOOM! Studios"),
+    ];
+    for anchor in article.select(&selector) {
+        let value = format!(
+            "{} {}",
+            anchor.value().attr("href").unwrap_or_default(),
+            anchor.text().collect::<String>()
+        )
+        .to_ascii_lowercase();
+        if let Some((_, publisher)) = known.iter().find(|(needle, _)| value.contains(needle)) {
+            return (*publisher).to_owned();
+        }
+    }
+    String::new()
+}
+
+fn extract_description(article: scraper::element_ref::ElementRef<'_>) -> String {
+    let Ok(selector) = scraper::Selector::parse(".post-info p, .entry-content p") else {
+        return String::new();
+    };
+    article
+        .select(&selector)
+        .next()
+        .map(|element| element.text().collect::<String>().trim().chars().take(300).collect())
+        .unwrap_or_default()
+}
+
 fn parse_articles(html: &str, from_date: &str, page_url: &str) -> Vec<ComicPost> {
     let Ok(article_selector) = scraper::Selector::parse("article.post") else {
         return Vec::new();
@@ -434,9 +523,12 @@ fn parse_articles(html: &str, from_date: &str, page_url: &str) -> Vec<ComicPost>
                 return None;
             }
             Some(ComicPost {
-                title: title_text,
+                title: title_text.clone(),
                 url,
+                tag_url: extract_tag_url(article, page_url, &title_text),
                 cover_url,
+                publisher: extract_publisher(article),
+                description: extract_description(article),
                 date,
             })
         })
@@ -461,14 +553,39 @@ pub async fn run_cycle(
         // monitoring start date, so that date must not hide the requested issue.
         let exact_issue = issue_number(&comic.title).is_some();
         let tag_from_date = if exact_issue { "" } else { &comic.from_date };
+        // Un risultato scelto dalla ricerca è un post preciso: non va
+        // sostituito da una nuova ricerca generica dello stesso nome.
+        let exact_post_url = if !comic.post_url.trim().is_empty() {
+            Some(comic.post_url.clone())
+        } else if !comic.tag_url.contains("/tag/") {
+            // Compatibilità con le righe create dalle versioni precedenti.
+            Some(comic.tag_url.clone())
+        } else {
+            None
+        };
         // Anche col tag obsoleto (404) la ricerca per nome, come nel legacy
         // extto, trova comunque le nuove uscite: uniamo le due fonti.
-        let (mut posts, tag_error) = match client.tag_posts(&comic.tag_url, tag_from_date).await {
-            Ok(posts) => (posts, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
+        let (mut posts, tag_error) = if let Some(post_url) = exact_post_url.as_deref() {
+            (
+                vec![ComicPost {
+                    title: comic.title.clone(),
+                    url: post_url.to_owned(),
+                    tag_url: comic.tag_url.clone(),
+                    cover_url: comic.cover_url.clone(),
+                    publisher: comic.publisher.clone(),
+                    description: comic.description.clone(),
+                    date: comic.from_date.clone(),
+                }],
+                None,
+            )
+        } else {
+            match client.tag_posts(&comic.tag_url, tag_from_date).await {
+                Ok(posts) => (posts, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            }
         };
         let clean = clean_search_title(&comic.title);
-        let search_posts = if clean.is_empty() {
+        let search_posts = if exact_post_url.is_some() || clean.is_empty() {
             Vec::new()
         } else {
             match client.search_posts(&clean).await {
@@ -855,9 +972,9 @@ impl ComicsDb {
     pub fn list_monitored(&self, enabled_only: bool) -> Result<Vec<ComicMonitored>> {
         let conn = self.conn.lock().unwrap();
         let sql = if enabled_only {
-            "SELECT id,title,tag_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored WHERE enabled=1 ORDER BY title COLLATE NOCASE"
+            "SELECT id,title,tag_url,post_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored WHERE enabled=1 ORDER BY title COLLATE NOCASE"
         } else {
-            "SELECT id,title,tag_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored ORDER BY title COLLATE NOCASE"
+            "SELECT id,title,tag_url,post_url,cover_url,publisher,description,from_date,save_path,enabled,last_checked FROM comics_monitored ORDER BY title COLLATE NOCASE"
         };
         let mut statement = conn.prepare(sql)?;
         let rows = statement.query_map([], |row| {
@@ -865,13 +982,14 @@ impl ComicsDb {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 tag_url: row.get(2)?,
-                cover_url: row.get(3)?,
-                publisher: row.get(4)?,
-                description: row.get(5)?,
-                from_date: row.get(6)?,
-                save_path: row.get(7)?,
-                enabled: row.get::<_, i64>(8)? != 0,
-                last_checked: row.get(9)?,
+                post_url: row.get(3)?,
+                cover_url: row.get(4)?,
+                publisher: row.get(5)?,
+                description: row.get(6)?,
+                from_date: row.get(7)?,
+                save_path: row.get(8)?,
+                enabled: row.get::<_, i64>(9)? != 0,
+                last_checked: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -884,6 +1002,30 @@ impl ComicsDb {
         from_date: &str,
         save_path: &str,
     ) -> Result<i64> {
+        self.add_monitored_with_metadata(
+            title,
+            tag_url,
+            "",
+            "",
+            "",
+            "",
+            from_date,
+            save_path,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_monitored_with_metadata(
+        &self,
+        title: &str,
+        tag_url: &str,
+        post_url: &str,
+        cover_url: &str,
+        publisher: &str,
+        description: &str,
+        from_date: &str,
+        save_path: &str,
+    ) -> Result<i64> {
         let normalized = if let Ok(parsed) = url::Url::parse(tag_url) {
             if !matches!(parsed.scheme(), "http" | "https")
                 || !parsed.host_str().is_some_and(|host| {
@@ -893,14 +1035,19 @@ impl ComicsDb {
             {
                 anyhow::bail!("comic tag URL must belong to getcomics.org");
             }
-            parsed.to_string()
+            let mut path = parsed.path().to_owned();
+            if let Some(query) = parsed.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+            path
         } else if tag_url.starts_with('/') {
             tag_url.to_owned()
         } else {
             format!("/{tag_url}")
         };
         let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT INTO comics_monitored(title,tag_url,from_date,save_path) VALUES (?1,?2,?3,?4) ON CONFLICT(tag_url) DO UPDATE SET title=excluded.title,from_date=excluded.from_date,save_path=excluded.save_path,enabled=1", params![title, normalized, from_date, save_path])?;
+        conn.execute("INSERT INTO comics_monitored(title,tag_url,post_url,cover_url,publisher,description,from_date,save_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(tag_url) DO UPDATE SET title=excluded.title,post_url=CASE WHEN excluded.post_url<>'' THEN excluded.post_url ELSE comics_monitored.post_url END,cover_url=CASE WHEN excluded.cover_url<>'' THEN excluded.cover_url ELSE comics_monitored.cover_url END,publisher=CASE WHEN excluded.publisher<>'' THEN excluded.publisher ELSE comics_monitored.publisher END,description=CASE WHEN excluded.description<>'' THEN excluded.description ELSE comics_monitored.description END,from_date=excluded.from_date,save_path=excluded.save_path,enabled=1", params![title, normalized, post_url, cover_url, publisher, description, from_date, save_path])?;
         Ok(conn.query_row(
             "SELECT id FROM comics_monitored WHERE tag_url=?1",
             [normalized],
@@ -1309,6 +1456,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS comics_monitored (
             id INTEGER PRIMARY KEY, title TEXT NOT NULL, tag_url TEXT NOT NULL UNIQUE,
+            post_url TEXT DEFAULT '',
             cover_url TEXT DEFAULT '', publisher TEXT DEFAULT '', description TEXT DEFAULT '',
             from_date TEXT NOT NULL, save_path TEXT DEFAULT '', enabled INTEGER DEFAULT 1,
             added_at TEXT DEFAULT (datetime('now')), last_checked TEXT
@@ -1330,6 +1478,16 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS comics_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
+    let columns = conn
+        .prepare("PRAGMA table_info(comics_monitored)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "post_url") {
+        conn.execute(
+            "ALTER TABLE comics_monitored ADD COLUMN post_url TEXT DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1511,6 +1669,26 @@ mod tests {
             "Poison Ivy Vol. 7 – Amuse-Bouche (TPB) (2026)"
         ));
         assert!(matches_monitored_issue("Batman (2026)", "Batman Vol. 1 (2026)"));
+    }
+
+    #[test]
+    fn search_results_keep_the_selected_post_metadata() {
+        let html = r#"
+            <article class="post">
+              <h2 class="post-title"><a href="/dc/poison-ivy-41-2026/">Poison Ivy #41 (2026)</a></h2>
+              <img class="wp-post-image" src="/cover.jpg">
+              <time datetime="2026-02-04">February 4, 2026</time>
+              <div class="post-info"><p>Digital comic description.</p></div>
+              <a href="/tag/poison-ivy-41/">Poison Ivy #41</a>
+              <a href="/cat/dc/">DC Comics</a>
+            </article>
+        "#;
+        let posts = parse_articles(html, "", "https://getcomics.org/?s=Poison+Ivy");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].url, "https://getcomics.org/dc/poison-ivy-41-2026/");
+        assert_eq!(posts[0].tag_url, "https://getcomics.org/tag/poison-ivy-41/");
+        assert_eq!(posts[0].publisher, "DC Comics");
+        assert_eq!(posts[0].description, "Digital comic description.");
     }
 
     #[tokio::test]

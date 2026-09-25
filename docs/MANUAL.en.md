@@ -109,8 +109,11 @@ aliases, exclusions, NAS path, subtitles, timeframe).
 - **Seen from feed** — every release seen in the sources, grouped by title
   (movies/series) with count, best resolution and score; expand a group to
   queue a single release. Populated by each cycle, even for unmonitored titles.
-- **Comics** — GetComics explore + quick add, monitored list, link extraction
-  from a post, weekly-pack settings and history with resend/delete/force.
+- **Comics** — in **Add comic**, enter a title and click **Find**; choose the
+  exact GetComics result and confirm. Rextto saves the selected post, tag,
+  cover and metadata, then uses that post for downloading instead of replacing
+  it with a similarly named issue. The monitored list, post link extraction,
+  weekly-pack settings and resend/delete/force history are also available.
 
 ## 7. Configuration
 

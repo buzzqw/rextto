@@ -111,8 +111,12 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   (film/serie) con numero, risoluzione e score migliori; espandi un gruppo per
   accodare una singola release. Popolata ad ogni ciclo, anche per titoli non
   monitorati.
-- **Fumetti** — Esplora GetComics + quick add, lista monitorati, estrazione link
-  da un post, impostazioni weekly pack e storico con reinvia/elimina/forza.
+- **Fumetti** — in **Aggiungi fumetto** scrivi il titolo e premi **Trova**; scegli
+  il risultato esatto di GetComics e poi conferma. Rextto salva il post scelto,
+  il tag, la copertina e i metadati, e usa quel post per il download senza
+  sostituirlo con un albo omonimo. Sono inoltre disponibili lista monitorati,
+  estrazione link da un post, impostazioni weekly pack e storico con
+  reinvia/elimina/forza.
 
 ## 7. Configurazione
 

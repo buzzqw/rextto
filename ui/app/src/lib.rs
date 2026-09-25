@@ -5467,95 +5467,86 @@ fn archive_folder_label(path: &str) -> String {
 
 #[component]
 fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
-    let title = RwSignal::new(String::new());
-    let tag_url = RwSignal::new(String::new());
     let save_path = RwSignal::new(String::new());
     let post_url = RwSignal::new(String::new());
     let weekly_date = RwSignal::new(String::new());
     let weekly_from_date = RwSignal::new(data.get().comics_weekly_from_date.clone());
     let links = RwSignal::new(Vec::<Value>::new());
     let explore_query = RwSignal::new(String::new());
-    let explore_url = RwSignal::new(String::new());
     let explore_items = RwSignal::new(Vec::<Value>::new());
+    let selected_comic = RwSignal::new(Value::Null);
     let edit_comic = RwSignal::new(Value::Null);
     let edit_from_date = RwSignal::new(String::new());
     let edit_save_path = RwSignal::new(String::new());
     view! {
         <div class="view">
-            <Panel title="Esplora GetComics">
+            <Panel title="Aggiungi fumetto">
                 <form class="toolbar" on:submit=move |event| {
                     event.prevent_default();
                     let query = explore_query.get();
+                    selected_comic.set(Value::Null);
                     spawn_local(async move {
                         match send("POST", "/api/comics/explore", Some(json!({"query": query}))).await {
                             Ok(value) => {
-                                explore_url.set(text(&value, "query_url", ""));
                                 explore_items.set(array(&value, "items"));
                             }
                             Err(error) => data.update(|current| current.error = error),
                         }
                     });
                 }>
-                    <input style="flex:1" prop:value=explore_query on:input=move |event| explore_query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca fumetti su GetComics…") />
-                    <button class="btn primary">{ctx_tr("Cerca")}</button>
+                    <label class="field" style="flex:1" title=ctx_tr("Scrivi il nome del fumetto, poi scegli il risultato esatto trovato su GetComics")><span>{ctx_tr("Titolo")}</span><input prop:value=explore_query on:input=move |event| explore_query.set(event_target_value(&event)) placeholder=ctx_tr("Nome fumetto, es. Poison Ivy #41") /></label>
+                    <button class="btn primary">{ctx_tr("Trova")}</button>
                 </form>
+                <p class="hint">{ctx_tr("Scrivi il titolo, premi Trova e seleziona esattamente il fumetto desiderato. Rextto salverà automaticamente il post GetComics e i suoi metadati.")}</p>
                 <div class="table-wrap" style="margin-top:10px">
                     <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Titolo")}</th><th>{ctx_tr("Data")}</th><th></th></tr></thead>
+                        <thead><tr><th>{ctx_tr("Risultato GetComics")}</th><th>{ctx_tr("Data")}</th><th></th></tr></thead>
                          <tbody>{move || explore_items.get().iter().cloned().map(|item| {
                              let item_title = text(&item, "title", "Fumetto");
                              let item_url = text(&item, "url", "");
                              let item_date = text(&item, "date", "");
-                             let quick_title = item_title.clone();
-                             let quick_url = item_url.clone();
-                             let quick_date = item_date.clone();
+                             let item_for_select = item.clone();
                              view! { <tr>
                                  <td class="truncate"><a href=item_url target="_blank" rel="noopener">{item_title.clone()}</a></td>
                                  <td class="muted">{if item_date.is_empty() { "-".to_string() } else { item_date }}</td>
-                                 <td><button class="btn sm primary" on:click=move |_| {
-                                     let title = quick_title.clone();
-                                     let tag_url = quick_url.clone();
-                                     let from_date = quick_date.clone();
-                                     spawn_local(async move {
-                                         let result = send("POST", "/api/comics", Some(json!({"title":title,"tag_url":tag_url,"from_date":from_date,"save_path":""}))).await;
-                                         match result {
-                                             Ok(_) => match send("POST", "/api/comics/cycle", None).await {
-                                                 Ok(value) => {
-                                                     let downloaded = value.get("downloaded").and_then(Value::as_u64).unwrap_or(0);
-                                                     flash_text(data, "ok", if downloaded > 0 {
-                                                         format!("Fumetto aggiunto e scaricato ({} elemento/i)", downloaded)
-                                                     } else {
-                                                         "Fumetto aggiunto; nessun download disponibile (controlla la modalità dry-run o i link del post).".into()
-                                                     });
-                                                 }
-                                                 Err(error) => flash_text(data, "err", format!("Fumetto aggiunto, ma ciclo non riuscito: {error}")),
-                                             },
-                                             Err(error) => flash_text(data, "err", error),
-                                         }
-                                         trigger_refresh();
-                                     });
-                                 } >{ctx_tr("Quick-add")}</button></td>
-                             </tr> }
-                        }).collect_view()}</tbody>
+                                  <td><button class="btn sm primary" on:click=move |_| {
+                                      selected_comic.set(item_for_select.clone());
+                                  } >{ctx_tr("Seleziona")}</button></td>
+                              </tr> }
+                         }).collect_view()}</tbody>
                     </table>
                 </div>
-            </Panel>
-            <Panel title="Aggiungi fumetto">
-                <form class="form" on:submit=move |event| {
-                    event.prevent_default();
-                    let body = json!({"title": title.get(), "tag_url": tag_url.get(), "from_date": "", "save_path": save_path.get()});
-                    run_post(data, "/api/comics", Some(body), "Fumetto aggiunto");
-                }>
-                    <div class="form-grid">
-                        <label class="field" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=title on:input=move |event| title.set(event_target_value(&event)) placeholder=ctx_tr("Nome fumetto") /></label>
-                        <label class="field span-2" title=ctx_tr("URL tag GetComics")><span>{ctx_tr("URL tag GetComics")}</span><input prop:value=tag_url on:input=move |event| tag_url.set(event_target_value(&event)) placeholder=ctx_tr("https://getcomics.org/tag/…") /></label>
+                <Show when=move || selected_comic.get().is_object()>
+                    <div class="mode-banner active" style="margin-top:12px">
+                        <strong>{ctx_tr("Fumetto selezionato")}</strong>
+                        <span>{move || text(&selected_comic.get(), "title", "")}</span>
+                    </div>
+                    <div class="form-grid" style="margin-top:10px">
                         <PathPicker label="Percorso archivio" value=save_path placeholder="/mnt/nas/Comics" />
                     </div>
                     <div class="form-actions">
-                        <button class="btn primary">{ctx_tr("Aggiungi")}</button>
+                        <button class="btn primary" on:click=move |_| {
+                            let comic = selected_comic.get();
+                            let mut tag_url = text(&comic, "tag_url", "");
+                            let post_url = text(&comic, "url", "");
+                            if tag_url.is_empty() { tag_url = post_url.clone(); }
+                            let body = json!({
+                                "title": text(&comic, "title", "Fumetto"),
+                                "tag_url": tag_url,
+                                "post_url": post_url,
+                                "cover_url": text(&comic, "cover_url", ""),
+                                "publisher": text(&comic, "publisher", ""),
+                                "description": text(&comic, "description", ""),
+                                "from_date": text(&comic, "date", ""),
+                                "save_path": save_path.get(),
+                            });
+                            run_post(data, "/api/comics", Some(body), "Fumetto aggiunto");
+                            selected_comic.set(Value::Null);
+                        }>{ctx_tr("Aggiungi fumetto selezionato")}</button>
+                        <button type="button" class="btn" on:click=move |_| selected_comic.set(Value::Null)>{ctx_tr("Annulla selezione")}</button>
                         <button type="button" class="btn" on:click=move |_| { run_post(data, "/api/comics/cycle", None, "Ciclo fumetti avviato"); }>{ctx_tr("Esegui ciclo")}</button>
                     </div>
-                </form>
+                </Show>
             </Panel>
             <Panel title="Monitorati">
                 <div class="table-wrap">
@@ -5564,14 +5555,18 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                         <tbody>
                             {move || data.get().comics.iter().cloned().map(|item| {
                                 let id = item.get("id").and_then(Value::as_i64).unwrap_or(0);
-                                let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-                                let edit_item = item.clone();
-                                view! {
-                                    <tr>
-                                        <td>{text(&item, "title", "Comics")}</td>
-                                        <td class="truncate muted" title=text(&item, "tag_url", "")>
-                                            <a href=text(&item, "tag_url", "#") target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">{friendly_slug(&text(&item, "tag_url", "-"))}</a>
-                                        </td>
+                                 let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                                 let edit_item = item.clone();
+                                 let source_url = {
+                                     let post = text(&item, "post_url", "");
+                                     if post.is_empty() { text(&item, "tag_url", "") } else { post }
+                                 };
+                                 view! {
+                                     <tr>
+                                         <td>{text(&item, "title", "Comics")}</td>
+                                         <td class="truncate muted" title=source_url.clone()>
+                                             <a href=source_url.clone() target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">{friendly_slug(&source_url)}</a>
+                                         </td>
                                         <td><span class="badge" class:ok=enabled>{if enabled { "attivo" } else { "pausa" }}</span></td>
                                         <td class="muted">{text(&item, "last_checked", "-")}</td>
                                         <td>

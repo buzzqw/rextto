@@ -370,6 +370,14 @@ pub struct ComicInput {
     pub tag_url: String,
     pub from_date: String,
     pub save_path: String,
+    #[serde(default)]
+    pub post_url: String,
+    #[serde(default)]
+    pub cover_url: String,
+    #[serde(default)]
+    pub publisher: String,
+    #[serde(default)]
+    pub description: String,
 }
 #[derive(serde::Deserialize)]
 pub struct ComicLinksInput {
@@ -6991,9 +6999,13 @@ async fn add_comic(State(s): State<AppState>, Json(input): Json<ComicInput>) -> 
             Json(serde_json::json!({"ok":false,"error":"title and tag_url are required"})),
         );
     }
-    match s.comics.add_monitored(
+    match s.comics.add_monitored_with_metadata(
         &input.title,
         &input.tag_url,
+        &input.post_url,
+        &input.cover_url,
+        &input.publisher,
+        &input.description,
         &input.from_date,
         &input.save_path,
     ) {
