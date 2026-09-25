@@ -41,6 +41,11 @@ impl Archive {
                 [],
             )?;
         }
+        // Ricerca case-insensitive per hash (`lower(COALESCE(magnet_hash,''))`):
+        // un indice di espressione evita la scansione completa.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_archive_magnet_lower ON archive(lower(COALESCE(magnet_hash,'')));",
+        )?;
         Ok(Self { conn })
     }
     pub fn save_batch(&self, releases: &[Release], cfg: &Config) -> Result<()> {
@@ -118,6 +123,12 @@ impl Archive {
 
     pub fn size_bytes(&self) -> i64 {
         crate::database::connection_size_bytes(&self.conn)
+    }
+
+    /// Truncates the WAL after a checkpoint (see
+    /// `crate::database::checkpoint_connection`).
+    pub fn checkpoint(&self) -> Result<()> {
+        crate::database::checkpoint_connection(&self.conn)
     }
 
     pub fn count(&self) -> Result<i64> {

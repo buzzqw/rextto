@@ -365,7 +365,7 @@ struct Data {
     backups: Vec<Value>,
     setup: Value,
     language: String,
-    i18n: std::collections::BTreeMap<String, String>,
+    i18n: std::sync::Arc<std::collections::BTreeMap<String, String>>,
     net_history: Vec<f64>,
     net_history_up: Vec<f64>,
     torrent_history: std::collections::BTreeMap<String, Vec<f64>>,
@@ -394,13 +394,16 @@ fn text_tr(data: RwSignal<Data>, value: &Value, key: &str, fallback: &str) -> St
 }
 
 /// Traduce una stringa sorgente (italiana) con le traduzioni attive; se manca
-/// la traduzione restituisce la sorgente invariata.
+/// la traduzione restituisce la sorgente invariata. Usa `with` per leggere la
+/// mappa senza clonare l'intero `Data` (era il costo principale della UI).
 fn tr(data: RwSignal<Data>, source: &str) -> String {
-    data.get()
-        .i18n
-        .get(source)
-        .cloned()
-        .unwrap_or_else(|| source.to_string())
+    data.with(|current| {
+        current
+            .i18n
+            .get(source)
+            .cloned()
+            .unwrap_or_else(|| source.to_string())
+    })
 }
 
 fn tr_opt(data: Option<RwSignal<Data>>, source: &str) -> String {
@@ -1027,7 +1030,7 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
             current.setup = setup;
             current.language = language;
             if let Some(i18n) = i18n {
-                current.i18n = i18n;
+                current.i18n = std::sync::Arc::new(i18n);
             }
             current.error.clear();
         });

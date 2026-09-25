@@ -1064,6 +1064,12 @@ impl ComicsDb {
         crate::database::optimize_connection(&conn, action)
     }
 
+    /// Truncates the WAL after a checkpoint.
+    pub fn checkpoint(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        crate::database::checkpoint_connection(&conn)
+    }
+
     pub fn size_bytes(&self) -> i64 {
         let conn = self.conn.lock().unwrap();
         crate::database::connection_size_bytes(&conn)

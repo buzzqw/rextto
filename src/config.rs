@@ -7,7 +7,21 @@ use std::{
     collections::BTreeMap,
     env,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+/// Contatore monotono incrementato ad ogni modifica persistita della
+/// configurazione. Permette di cacheare `Config::load` finché nulla cambia,
+/// evitando di rileggere file e SQLite ad ogni richiesta HTTP.
+static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub fn config_generation() -> u64 {
+    CONFIG_GENERATION.load(Ordering::Relaxed)
+}
+
+pub fn touch_config_generation() {
+    CONFIG_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeriesConfig {
@@ -1964,12 +1978,16 @@ impl Config {
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
         conn.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![key, value])?;
+        touch_config_generation();
         Ok(())
     }
 
     pub fn delete_setting(data_dir: &Path, key: &str) -> Result<bool> {
         let conn = open_config_db(&data_dir.join("rextto_config.db"))?;
         let removed = conn.execute("DELETE FROM settings WHERE key=?1", [key])?;
+        if removed > 0 {
+            touch_config_generation();
+        }
         Ok(removed > 0)
     }
 
@@ -2040,6 +2058,7 @@ impl Config {
             }
         }
         tx.commit()?;
+        touch_config_generation();
         Ok(())
     }
 

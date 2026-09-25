@@ -98,13 +98,20 @@ async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
     if let Ok(language) = i18n.language() {
         rextto::messages::set_language(&language);
     }
+    // Reclaim any WAL left oversized by a previous run: SQLite's default
+    // autocheckpoint is PASSIVE and never shrinks the `-wal` file, and the fast
+    // `process::exit` path skips the clean close that would truncate it.
+    let _ = db.lock().unwrap().checkpoint();
+    let _ = archive.lock().unwrap().checkpoint();
+    let _ = comics.checkpoint();
+    let _ = i18n.checkpoint();
     let state = AppState {
         cfg: cfg.clone(),
         config_path,
-        i18n,
-        db,
-        archive,
-        comics,
+        i18n: i18n.clone(),
+        db: db.clone(),
+        archive: archive.clone(),
+        comics: comics.clone(),
         engine,
         torrents: torrents.clone(),
         torrent_events: Arc::new(Mutex::new(Vec::new())),
@@ -117,6 +124,7 @@ async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
         cycle_lock: Arc::new(tokio::sync::Mutex::new(())),
         log_reload: Arc::new(Mutex::new(log_reload)),
         rename_progress: Arc::new(Mutex::new(rextto::web::RenameProgress::default())),
+        config_cache: Arc::new(Mutex::new(None)),
     };
     if cfg.active && !cfg.dry_run {
         tracing::warn!(
@@ -163,6 +171,12 @@ async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
     if let Err(error) = &result {
         tracing::error!(%error, "web server stopped with error");
     }
+    // Truncate the WALs before the abrupt exit, otherwise the `-wal` files keep
+    // their high-water mark until the next startup checkpoint.
+    let _ = db.lock().unwrap().checkpoint();
+    let _ = archive.lock().unwrap().checkpoint();
+    let _ = comics.checkpoint();
+    let _ = i18n.checkpoint();
     // Flush dei log e uscita immediata: il teardown del runtime e della sessione
     // libtorrent può bloccarsi a lungo (osservato ~90 s in `stop-sigterm`),
     // rendendo lenti i riavvii. I resume data sono già stati salvati sopra.

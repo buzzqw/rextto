@@ -24,6 +24,7 @@ use axum::{
         Html, IntoResponse, Response,
     },
     routing::{delete, get, post},
+    serve::ListenerExt,
     Json, Router,
 };
 use std::{
@@ -38,7 +39,8 @@ use std::{
 
 /// Short-lived response cache for endpoints that call TMDB (calendar, recent
 /// downloads). Avoids repeating dozens of TMDB requests on every UI load/poll.
-static RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, serde_json::Value)>>> =
+/// The payload is stored behind an `Arc` so a cache hit does not deep-clone it.
+static RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<serde_json::Value>)>>> =
     OnceLock::new();
 
 /// Health may stat NFS paths and walk a large trash directory. Permit only one
@@ -46,7 +48,7 @@ static RESPONSE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, serde_json::Valu
 /// causing Tokio's blocking pool to create an unbounded number of threads.
 static HEALTH_CHECK_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-fn cache_get(key: &str, ttl: Duration) -> Option<serde_json::Value> {
+fn cache_get(key: &str, ttl: Duration) -> Option<Arc<serde_json::Value>> {
     let cache = RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = cache.lock().unwrap();
     guard
@@ -59,7 +61,7 @@ fn cache_put(key: &str, value: &serde_json::Value) {
     cache
         .lock()
         .unwrap()
-        .insert(key.to_string(), (Instant::now(), value.clone()));
+        .insert(key.to_string(), (Instant::now(), Arc::new(value.clone())));
 }
 
 /// Decode the octal escaping used for mount points in /proc/self/mountinfo.
@@ -308,6 +310,8 @@ pub struct AppState {
     pub cycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub log_reload: Arc<Mutex<reload::Handle<EnvFilter, tracing_subscriber::Registry>>>,
     pub rename_progress: Arc<Mutex<RenameProgress>>,
+    /// Cache della `Config` con la generazione al momento del caricamento.
+    pub config_cache: Arc<Mutex<Option<(u64, Config)>>>,
 }
 
 /// Progress of a background rename-all job, polled by `/api/rename-progress`.
@@ -902,7 +906,19 @@ fn setup_complete(cfg: &Config) -> bool {
     setup_marker(cfg).is_file()
 }
 fn latest_config(state: &AppState) -> Config {
-    Config::load(&state.config_path).unwrap_or_else(|_| state.cfg.clone())
+    let generation = crate::config::config_generation();
+    if let Ok(guard) = state.config_cache.lock() {
+        if let Some((cached_generation, cached)) = guard.as_ref() {
+            if *cached_generation == generation {
+                return cached.clone();
+            }
+        }
+    }
+    let loaded = Config::load(&state.config_path).unwrap_or_else(|_| state.cfg.clone());
+    if let Ok(mut guard) = state.config_cache.lock() {
+        *guard = Some((generation, loaded.clone()));
+    }
+    loaded
 }
 fn complete_setup(cfg: &Config) -> anyhow::Result<()> {
     std::fs::write(
@@ -1524,7 +1540,13 @@ async fn ui_no_cache(request: Request, next: Next) -> Response {
     }
     response
 }
-async fn health_api(State(s): State<AppState>) -> Json<health::Health> {
+async fn health_api(State(s): State<AppState>) -> Response {
+    // Walk del trash e stat dei percorsi (anche NFS) sono costosi: una cache
+    // breve evita di ripeterli ad ogni poll della dashboard, senza perdere
+    // reattività (il poll della UI è a 15 s).
+    if let Some(cached) = cache_get("health", Duration::from_secs(8)) {
+        return Json(cached).into_response();
+    }
     // Health gathers disk usage, walks the trash and stats configured paths.
     // Some of those paths are NFS mounts, so this must never run on an Axum /
     // Tokio worker: a slow stat or directory walk used to consume every worker
@@ -1563,7 +1585,9 @@ async fn health_api(State(s): State<AppState>) -> Json<health::Health> {
         tracing::error!(%error, "health check task failed");
         health::check(&s.cfg.data_dir)
     });
-    Json(report)
+    let value = serde_json::to_value(&report).unwrap_or_default();
+    cache_put("health", &value);
+    Json(value).into_response()
 }
 
 async fn process_metrics_api() -> Json<health::ProcessMetrics> {
@@ -1597,30 +1621,54 @@ async fn status(State(s): State<AppState>) -> Json<serde_json::Value> {
         "seen": {"movies": seen_movies, "series": seen_series, "groups": seen_movies + seen_series}
     }))
 }
+/// Legge le ultime `limit` righe di un file senza caricarlo tutto in memoria:
+/// apre solo una finestra finale proporzionale al numero di righe richieste.
+fn tail_lines(path: &FsPath, limit: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_WINDOW: u64 = 2 * 1024 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let window = (limit as u64)
+        .saturating_mul(512)
+        .saturating_add(4096)
+        .min(MAX_WINDOW);
+    let start = len.saturating_sub(window);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buffer = String::new();
+    if file.read_to_string(&mut buffer).is_err() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = buffer.lines().map(str::to_owned).collect();
+    if start > 0 && !lines.is_empty() {
+        // La prima riga della finestra può essere troncata a metà.
+        lines.remove(0);
+    }
+    let skip = lines.len().saturating_sub(limit);
+    lines.split_off(skip)
+}
+
 async fn logs(State(s): State<AppState>, Query(query): Query<LogQuery>) -> Json<serde_json::Value> {
     let limit = query.limit.unwrap_or(200).clamp(1, 2000);
     let current = s.cfg.data_dir.join("rextto.log");
-    let mut lines = std::fs::read_to_string(&current)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let mut lines = tail_lines(&current, limit);
     if lines.len() < limit {
         // Include the most recent rotated backup to fill the requested window.
         let backup = s.cfg.data_dir.join("rextto.log.1");
-        if let Ok(previous) = std::fs::read_to_string(&backup) {
-            let mut previous = previous.lines().map(str::to_owned).collect::<Vec<_>>();
-            previous.extend(lines);
-            lines = previous;
-        }
+        let mut previous = tail_lines(&backup, limit - lines.len());
+        previous.append(&mut lines);
+        lines = previous;
     }
     let start = lines.len().saturating_sub(limit);
     Json(serde_json::json!({"items":lines[start..].to_vec()}))
 }
 
-/// Stream SSE del log: invia le ultime righe alla connessione e poi segue il
-/// file (`rextto.log`) con un polling interno di 5 secondi, ripartendo da zero
-/// se il file viene troncato dalla rotazione.
+/// Stream SSE del log: invia la coda iniziale e poi segue il file
+/// (`rextto.log`) leggendo **solo i byte aggiunti** dal tick precedente,
+/// ripartendo da zero se la rotazione tronca il file.
 async fn logs_stream(
     State(s): State<AppState>,
     Query(query): Query<LogQuery>,
@@ -1628,41 +1676,53 @@ async fn logs_stream(
     let path = s.cfg.data_dir.join("rextto.log");
     let limit = query.limit.unwrap_or(200).clamp(1, 5000);
     let stream = async_stream::stream! {
-        let mut sent = 0usize;
-        if let Ok(contents) = tokio::fs::read_to_string(&path).await {
-            let lines: Vec<&str> = contents.lines().collect();
-            let start = lines.len().saturating_sub(limit);
-            // Invia lo snapshot iniziale come un singolo evento: un evento per
-            // riga costringe il frontend a rifiltrare e ridisegnare tutto il log
-            // centinaia di volte prima che la schermata sia pronta.
-            let snapshot = lines[start..]
-                .iter()
-                .map(|line| (*line).to_owned())
-                .collect::<Vec<_>>();
-            yield Ok::<Event, Infallible>(
-                Event::default()
-                    .id(lines.len().to_string())
-                    .data(serde_json::json!({"snapshot": snapshot}).to_string()),
-            );
-            sent = lines.len();
-        }
+        let snapshot = tail_lines(&path, limit);
+        let mut offset = tokio::fs::metadata(&path).await.map(|meta| meta.len()).unwrap_or(0);
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .id(offset.to_string())
+                .data(serde_json::json!({"snapshot": snapshot}).to_string()),
+        );
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+            let Ok(meta) = tokio::fs::metadata(&path).await else {
                 continue;
             };
-            let lines: Vec<&str> = contents.lines().collect();
-            if lines.len() < sent {
-                sent = 0;
+            if meta.len() < offset {
+                // Rotazione o troncamento: riparti dall'inizio del nuovo file.
+                offset = 0;
             }
-            for (offset, line) in lines.iter().enumerate().skip(sent) {
+            if meta.len() == offset {
+                continue;
+            }
+            let read_path = path.clone();
+            let read_from = offset;
+            let chunk = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = std::fs::File::open(&read_path)?;
+                file.seek(SeekFrom::Start(read_from))?;
+                let mut buffer = String::new();
+                file.read_to_string(&mut buffer)?;
+                Ok::<String, std::io::Error>(buffer)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+            // Emetti solo righe complete: l'ultima riga del file può essere
+            // ancora in scrittura (senza `\n`), quindi non avanzare oltre.
+            let complete = match chunk.rfind('\n') {
+                Some(index) => &chunk[..=index],
+                None => "",
+            };
+            for line in complete.lines() {
                 yield Ok::<Event, Infallible>(
                     Event::default()
                         .id(offset.to_string())
                         .data(serde_json::json!({"line": line}).to_string()),
                 );
             }
-            sent = lines.len();
+            offset += complete.len() as u64;
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -6403,16 +6463,17 @@ async fn search_missing(
         Json(serde_json::json!({"ok":true,"query":query,"results":results})),
     )
 }
-async fn calendar(State(s): State<AppState>) -> impl IntoResponse {
+async fn calendar(State(s): State<AppState>) -> Response {
     let cfg = latest_config(&s);
     if cfg.tmdb_api_key.is_none() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"ok":false,"error":"TMDB API key is not configured"})),
-        );
+        )
+            .into_response();
     }
     if let Some(cached) = cache_get("calendar", Duration::from_secs(120)) {
-        return (StatusCode::OK, Json(cached));
+        return Json(cached).into_response();
     }
     let tmdb = TmdbClient::with_language(cfg.tmdb_api_key.clone(), cfg.tmdb_language());
     // Una chiamata TMDB per serie (id + prossimo episodio + poster) in
@@ -6454,7 +6515,7 @@ async fn calendar(State(s): State<AppState>) -> impl IntoResponse {
     sort_calendar_items(&mut items);
     let response = serde_json::json!({"ok":true,"items":items});
     cache_put("calendar", &response);
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Ordina le voci del calendario per data di messa in onda (ISO, ordine
@@ -7465,10 +7526,14 @@ async fn setup_import(State(s): State<AppState>) -> impl IntoResponse {
         tokio::task::spawn_blocking(move || importer::import_extto(&source, &data_dir)).await;
     match imported {
         Ok(Ok(report)) => match complete_setup(&s.cfg) {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok":true,"report":report})),
-            ),
+            Ok(()) => {
+                // L'import ha scritto impostazioni/serie: invalida la cache.
+                crate::config::touch_config_generation();
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"ok":true,"report":report})),
+                )
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"ok":false,"error":e.to_string()})),
@@ -7506,12 +7571,23 @@ fn decorate_torrents(
     s: &AppState,
     items: Vec<crate::models::TorrentView>,
 ) -> Vec<serde_json::Value> {
-    let db = s.db.lock().unwrap();
+    // Una sola query per tutti i torrent (prima era una SELECT per torrent).
+    let hashes: Vec<String> = items
+        .iter()
+        .map(|torrent| torrent.hash.to_ascii_lowercase())
+        .collect();
+    let aux = s
+        .db
+        .lock()
+        .unwrap()
+        .torrent_aux_bulk(&hashes)
+        .unwrap_or_default();
     items
         .into_iter()
         .map(|torrent| {
-            let (processed_path, source, reason) = db
-                .torrent_aux(&torrent.hash)
+            let (processed_path, source, reason) = aux
+                .get(&torrent.hash.to_ascii_lowercase())
+                .cloned()
                 .unwrap_or_default();
             let archived = !processed_path.trim().is_empty();
             let mut value = serde_json::to_value(&torrent).unwrap_or_default();
@@ -13823,8 +13899,22 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let web_addr: SocketAddr = state.cfg.listen.parse()?;
     let engine_addr: SocketAddr = state.cfg.engine_listen.parse()?;
-    let web_listener = tokio::net::TcpListener::bind(web_addr).await?;
-    let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?;
+    let web_listener = tokio::net::TcpListener::bind(web_addr).await?.tap_io(
+        |stream| {
+            // Disable Nagle: without it the first response of every new
+            // connection waits for delayed-ACK (~40 ms) on loopback.
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(%error, "failed to set TCP_NODELAY");
+            }
+        },
+    );
+    let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?.tap_io(
+        |stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(%error, "failed to set TCP_NODELAY");
+            }
+        },
+    );
     tracing::info!(
         "🚀 Rextto started · UI http://{} · engine http://{} · libtorrent {} · {}",
         web_addr,
@@ -14192,10 +14282,27 @@ mod tests {
             cycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             log_reload: Arc::new(Mutex::new(log_reload)),
             rename_progress: Arc::new(Mutex::new(RenameProgress::default())),
+            config_cache: Arc::new(Mutex::new(None)),
             cfg,
             config_path,
         };
         (state, root)
+    }
+
+    #[test]
+    fn latest_config_cache_refreshes_after_a_saved_setting() {
+        let (state, root) = test_state();
+        let first = latest_config(&state);
+        assert_eq!(first.max_release_age_days, 0);
+        Config::save_setting(&state.cfg.data_dir, "max_release_age_days", "42").unwrap();
+        let second = latest_config(&state);
+        assert_eq!(
+            second.max_release_age_days, 42,
+            "la cache della config deve invalidarsi dopo un salvataggio"
+        );
+        let third = latest_config(&state);
+        assert_eq!(third.max_release_age_days, 42);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

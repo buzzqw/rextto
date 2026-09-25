@@ -17,6 +17,13 @@ pub struct Database {
     pub conn: Connection,
 }
 
+impl Database {
+    /// Truncates the WAL (see `checkpoint_connection`).
+    pub fn checkpoint(&self) -> Result<()> {
+        checkpoint_connection(&self.conn)
+    }
+}
+
 /// Real size and default quality score of a file on disk, derived from its
 /// name. Missing files yield zeros so callers can keep the stored values.
 fn file_stats(cfg: &Config, path: &str, kind: &str, title: &str) -> (i64, i64) {
@@ -65,6 +72,15 @@ pub fn optimize_connection(conn: &Connection, action: &str) -> Result<()> {
         other => anyhow::bail!("unsupported database action: {other}"),
     };
     conn.execute_batch(statement)?;
+    Ok(())
+}
+
+/// Checkpoints the WAL and truncates the `-wal` file. SQLite's default
+/// autocheckpoint is PASSIVE and never shrinks the file, so after a large import
+/// or many inserts it stays at its high-water mark (hundreds of MB). Safe to
+/// call when no other writer is active.
+pub fn checkpoint_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
 }
 
@@ -549,6 +565,14 @@ impl Database {
         let _ = self.conn.execute(
             "UPDATE torrent_meta SET source=COALESCE(json_extract(metadata_json,'$.release.source'),'') WHERE COALESCE(source,'')='' AND COALESCE(metadata_json,'')<>''",
             [],
+        );
+        // Indici di espressione per le ricerche case-insensitive sugli hash:
+        // senza di essi `lower(col)=lower(?)` non può usare gli indici e il join
+        // episodes/torrent_meta degenera in scansioni complete.
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_torrent_meta_hash_lower ON torrent_meta(lower(hash));
+             CREATE INDEX IF NOT EXISTS idx_episodes_magnet_lower ON episodes(lower(magnet_hash));
+             CREATE INDEX IF NOT EXISTS idx_movies_magnet_lower ON movies(lower(magnet_hash));",
         );
         Ok(())
     }
@@ -2296,6 +2320,45 @@ impl Database {
             .unwrap_or_default())
     }
 
+    /// Come `torrent_aux`, ma per molti hash in una sola query: evita l'N+1
+    /// del polling di `/api/torrents` (una SELECT per ogni torrent).
+    pub fn torrent_aux_bulk(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String, String)>> {
+        let mut aux = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(aux);
+        }
+        // Normalizza in minuscolo come fa `torrent_aux` (il confronto SQLite è
+        // case-sensitive senza COLLATE NOCASE).
+        let lowered: Vec<String> = hashes.iter().map(|h| h.to_ascii_lowercase()).collect();
+        // Chunk sotto il limite di parametri SQLite (default 999).
+        for chunk in lowered.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = self.conn.prepare(&format!(
+                "SELECT hash, COALESCE(processed_path,''), COALESCE(source,''), COALESCE(reason,'') FROM torrent_meta WHERE hash IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?.to_ascii_lowercase(),
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
+                ))
+            })?;
+            for row in rows {
+                let (hash, values) = row?;
+                aux.insert(hash, values);
+            }
+        }
+        Ok(aux)
+    }
+
     /// Motivo registrato per un torrent, se presente e non vuoto.
     pub fn torrent_reason(&self, hash: &str) -> Result<Option<String>> {
         Ok(self
@@ -3797,6 +3860,57 @@ mod tests {
         assert_eq!(
             db.torrent_status(&digest).unwrap().as_deref(),
             Some("queued")
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn torrent_aux_bulk_matches_per_hash_lookups() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-aux-bulk-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let now = Utc::now().to_rfc3339();
+        for (hash, processed, source, reason) in [
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/nas/a.mkv", "rss", "series"),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "indexer", "movie"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO torrent_meta(hash,processed_path,source,reason,updated_at) VALUES (?1,?2,?3,?4,?5)",
+                    params![hash, processed, source, reason, now],
+                )
+                .unwrap();
+        }
+        let aux = db
+            .torrent_aux_bulk(&[
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+            ])
+            .unwrap();
+        // Chiavi normalizzate in minuscolo, come la lookup singola.
+        assert_eq!(
+            aux.get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some(&("/nas/a.mkv".to_string(), "rss".to_string(), "series".to_string()))
+        );
+        assert_eq!(
+            aux.get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some(&(String::new(), "indexer".to_string(), "movie".to_string()))
+        );
+        assert!(!aux.contains_key("cccccccccccccccccccccccccccccccccccccccc"));
+        assert_eq!(
+            db.torrent_aux("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
+            aux.get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").cloned().unwrap(),
+            "la versione bulk deve combaciare con quella singola"
         );
 
         drop(db);

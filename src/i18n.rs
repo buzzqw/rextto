@@ -32,6 +32,12 @@ impl I18nDb {
         })
     }
 
+    /// Truncates the WAL after a checkpoint.
+    pub fn checkpoint(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        crate::database::checkpoint_connection(&conn)
+    }
+
     fn storage_language(lang: &str) -> &str {
         match lang {
             "it" | "ita" => "ita",
