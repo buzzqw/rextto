@@ -130,7 +130,11 @@ la barra “Salva tutte”.
   Nella sezione RAM disk Rextto mostra i `tmpfs`/`ramfs` disponibili e consente
   di sceglierne uno. Se non c'è un percorso configurato, il pulsante dedicato
   crea `/dev/shm/rextto` e lo configura automaticamente. Il contenuto di
-  `/dev/shm` è temporaneo e viene perso al riavvio della macchina.
+  `/dev/shm` è temporaneo e viene perso al riavvio della macchina. La scelta di
+  un percorso calcola automaticamente dimensione massima per torrent, margine
+  libero e spazio minimo; i valori restano modificabili. Il pulsante **Testa
+  porte** verifica inoltre il bind locale delle porte indicate: non sostituisce
+  il controllo del port-forwarding sul router/firewall.
 - **Punteggi** — pesi per categoria, gruppi custom e simulatore live. Il punteggio
   effettivo è unico per acquisizione, ricerche, upgrade, post-processing,
   archivio e rescore; comprende anche bonus dimensione e, per i film, sottotitoli

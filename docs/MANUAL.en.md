@@ -125,7 +125,10 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   The RAM disk section lists available `tmpfs`/`ramfs` mounts and lets you
   choose one. If no path is configured, its button creates and configures
   `/dev/shm/rextto`. The contents of `/dev/shm` are temporary and are lost
-  when the machine reboots.
+  when the machine reboots. Choosing a path automatically calculates the
+  maximum torrent size, free-space margin and minimum free space; the values
+  remain editable. The **Test ports** button also checks local port binding;
+  it does not replace router/firewall port-forwarding verification.
   Under *Security, proxy and network* the **VPN killswitch interface** binds
   listening and outgoing traffic to a chosen interface (e.g. `tun0`, `wg0`);
   the list is read from the server, and the change applies after a restart.

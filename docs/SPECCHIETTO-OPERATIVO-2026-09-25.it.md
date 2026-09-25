@@ -141,7 +141,14 @@ un percorso e premere **Usa questo percorso**.
 
 Se non è configurato alcun percorso e `/dev/shm` è disponibile, premere
 **Crea in /dev/shm**: Rextto crea `/dev/shm/rextto`, imposta i permessi privati,
-lo salva nella configurazione e abilita il RAM disk.
+lo salva nella configurazione e abilita il RAM disk. Quando si preme **Usa
+questo percorso**, Rextto calcola e compila anche dimensione massima per torrent,
+margine libero e spazio minimo in base alla capacità reale del percorso.
+
+In *RAM disk e porte* il pulsante **Testa porte** controlla quali porte
+dell'intervallo configurato sono libere per il bind locale. Una porta in uso dal
+listener libtorrent è normale mentre il servizio è attivo; il test non verifica
+da solo l'apertura sul router o la raggiungibilità da Internet.
 
 > `/dev/shm` è volatile: il contenuto e la directory creata non sopravvivono al
 > riavvio della macchina. Dopo il riavvio usare nuovamente il pulsante di

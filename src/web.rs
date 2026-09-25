@@ -113,6 +113,38 @@ fn directory_writable(path: &FsPath) -> bool {
     unsafe { libc::access(raw.as_ptr(), libc::W_OK) == 0 }
 }
 
+fn filesystem_space(path: &FsPath) -> Option<(u64, u64)> {
+    let raw = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    let ok = unsafe { libc::statvfs(raw.as_ptr(), &mut stats) } == 0;
+    ok.then(|| {
+        let block_size = stats.f_frsize as u64;
+        (
+            (stats.f_blocks as u64).saturating_mul(block_size),
+            (stats.f_bavail as u64).saturating_mul(block_size),
+        )
+    })
+}
+
+fn ramdisk_recommendation(path: &FsPath) -> serde_json::Value {
+    let gib = 1024_f64.powi(3);
+    let (total, free) = filesystem_space(path).unwrap_or((0, 0));
+    let margin_bytes = ((free as f64 * 0.10).max(0.5 * gib).min(4.0 * gib)) as u64;
+    let threshold_bytes = ((total as f64 * 0.50)
+        .min(free.saturating_sub(margin_bytes) as f64)
+        .max(0.5 * gib)) as u64;
+    let round_gib = |bytes: u64| ((bytes as f64 / gib) * 10.0).round() / 10.0;
+    serde_json::json!({
+        "threshold_gb": format!("{:.1}", round_gib(threshold_bytes)),
+        "margin_gb": format!("{:.1}", round_gib(margin_bytes)),
+        // 0 delegates the safety floor to margin_gb and keeps the setting
+        // understandable instead of exposing a machine-specific byte count.
+        "min_free_bytes": "0",
+        "total_bytes": total,
+        "free_bytes": free,
+    })
+}
+
 fn ramdisk_entry(
     path: &FsPath,
     filesystem: &str,
@@ -125,7 +157,32 @@ fn ramdisk_entry(
         "writable": path.is_dir() && directory_writable(path),
         "free_bytes": crate::libtorrent::free_space_bytes(path),
         "configured": configured.is_some_and(|value| value == path),
+        "recommended": ramdisk_recommendation(path),
     })
+}
+
+fn save_ramdisk_settings(data_dir: &FsPath, path: &FsPath) -> anyhow::Result<serde_json::Value> {
+    let recommendation = ramdisk_recommendation(path);
+    Config::save_setting(data_dir, "libtorrent_ramdisk_dir", &path.display().to_string())?;
+    Config::save_setting(data_dir, "libtorrent_ramdisk_enabled", "yes")?;
+    Config::save_setting(
+        data_dir,
+        "libtorrent_ramdisk_threshold_gb",
+        recommendation
+            .get("threshold_gb")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("3.5"),
+    )?;
+    Config::save_setting(
+        data_dir,
+        "libtorrent_ramdisk_margin_gb",
+        recommendation
+            .get("margin_gb")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0.5"),
+    )?;
+    Config::save_setting(data_dir, "libtorrent_ramdisk_min_free_bytes", "0")?;
+    Ok(recommendation)
 }
 
 async fn ramdisk_view(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -154,6 +211,29 @@ async fn ramdisk_view(State(s): State<AppState>) -> Json<serde_json::Value> {
         "create_available": create_root.is_dir() && directory_writable(create_root),
         "warning": "Il contenuto di /dev/shm e degli altri tmpfs non sopravvive al riavvio della macchina.",
     }))
+}
+
+async fn select_ramdisk(
+    State(s): State<AppState>,
+    Json(input): Json<RamDiskSelectInput>,
+) -> impl IntoResponse {
+    let path = FsPath::new(input.path.trim());
+    if !path.is_dir() || !directory_writable(path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"il percorso RAM disk non esiste o non è scrivibile"})),
+        );
+    }
+    match save_ramdisk_settings(&s.cfg.data_dir, path) {
+        Ok(recommended) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"path":path.display().to_string(),"recommended":recommended})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":format!("configurazione RAM disk fallita: {error}")})),
+        ),
+    }
 }
 
 async fn create_ramdisk(
@@ -188,19 +268,21 @@ async fn create_ramdisk(
             );
         }
     }
-    if let Err(error) = Config::save_setting(&s.cfg.data_dir, "libtorrent_ramdisk_dir", &requested)
-        .and_then(|_| Config::save_setting(&s.cfg.data_dir, "libtorrent_ramdisk_enabled", "yes"))
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":format!("RAM disk creato ma configurazione non salvata: {error}")})),
-        );
-    }
+    let recommendation = match save_ramdisk_settings(&s.cfg.data_dir, target) {
+        Ok(recommendation) => recommendation,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":format!("RAM disk creato ma configurazione non salvata: {error}")})),
+            );
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "path": requested,
+            "recommended": recommendation,
             "warning": "Il contenuto di /dev/shm non sopravvive al riavvio della macchina.",
         })),
     )
@@ -326,6 +408,10 @@ pub struct RamDiskCreateInput {
     /// cannot be used to create arbitrary directories outside /dev/shm.
     #[serde(default)]
     pub path: Option<String>,
+}
+#[derive(serde::Deserialize)]
+pub struct RamDiskSelectInput {
+    pub path: String,
 }
 #[derive(serde::Deserialize)]
 pub struct AuthCode {
@@ -837,6 +923,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/settings", post(save_setting))
         .route("/api/config/settings/{key}", delete(delete_setting))
         .route("/api/ramdisk", get(ramdisk_view))
+        .route("/api/ramdisk/select", post(select_ramdisk))
         .route("/api/ramdisk/create", post(create_ramdisk))
         .route(
             "/api/config/source-filters",
@@ -3791,8 +3878,14 @@ async fn check_ports(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = latest_config(&s);
     let mut ports = Vec::new();
     for port in cfg.libtorrent.port_min..=cfg.libtorrent.port_max {
-        let available = std::net::TcpListener::bind(("0.0.0.0", port)).is_ok();
-        ports.push(serde_json::json!({"port":port,"available":available}));
+        let tcp_available = std::net::TcpListener::bind(("0.0.0.0", port)).is_ok();
+        let udp_available = std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok();
+        ports.push(serde_json::json!({
+            "port":port,
+            "available":tcp_available && udp_available,
+            "tcp_available":tcp_available,
+            "udp_available":udp_available,
+        }));
     }
     (
         StatusCode::OK,

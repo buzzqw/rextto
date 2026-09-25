@@ -6368,9 +6368,10 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                              <TextSetting label="Dimensione massima per torrent (GB)" setting_key="libtorrent_ramdisk_threshold_gb" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_threshold_gb", "3.5")) placeholder="3.5" />
                             <TextSetting label="Margine libero da mantenere (GB)" setting_key="libtorrent_ramdisk_margin_gb" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_margin_gb", "0.5")) placeholder="0.5" />
                             <TextSetting label="Spazio minimo libero (byte, 0 = dal margine)" setting_key="libtorrent_ramdisk_min_free_bytes" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "ramdisk_min_free_bytes", "")) placeholder="0" />
-                            <TextSetting label="Porta minima" setting_key="libtorrent_port_min" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "port_min", "6881")) placeholder="6881" />
-                            <TextSetting label="Porta massima" setting_key="libtorrent_port_max" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "port_max", "6891")) placeholder="6891" />
-                        </SettingGroup>
+                             <TextSetting label="Porta minima" setting_key="libtorrent_port_min" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "port_min", "6881")) placeholder="6881" />
+                             <TextSetting label="Porta massima" setting_key="libtorrent_port_max" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "port_max", "6891")) placeholder="6891" />
+                             <PortCheckControl data />
+                         </SettingGroup>
                     </div>
                     <div class="field span-full" style="margin:18px 0 8px"><span>{ctx_tr("Velocità e programmazione")}</span><small class="hint">{ctx_tr("Limiti globali di banda e fasce orarie. Le modifiche si applicano entro un minuto, senza riavvio.")}</small></div>
                     <TextSetting label="Download globale (KiB/s, 0 = illimitato)" setting_key="libtorrent_dl_limit" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "download_limit_kib", "0")) placeholder="0" />
@@ -6526,11 +6527,14 @@ fn RamDiskControl() -> impl IntoView {
                             message.set(tr(data, "Seleziona prima un percorso RAM disk."));
                             return;
                         }
-                        match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_dir","value":path.clone()}))).await {
-                            Ok(_) => match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_enabled","value":"yes"}))).await {
-                                Ok(_) => { message.set(format!("{}: {path}", tr(data, "RAM disk configurato"))); trigger_refresh(); }
-                                Err(error) => message.set(error),
-                            },
+                        match send("POST", "/api/ramdisk/select", Some(json!({"path":path.clone()}))).await {
+                            Ok(value) => {
+                                let recommended = value.get("recommended").cloned().unwrap_or_default();
+                                let threshold = text(&recommended, "threshold_gb", "3.5");
+                                let margin = text(&recommended, "margin_gb", "0.5");
+                                message.set(format!("{}: {path} · {} {} GB · {} {} GB", tr(data, "RAM disk configurato"), tr(data, "massimo torrent"), threshold, tr(data, "margine"), margin));
+                                trigger_refresh();
+                            }
                             Err(error) => message.set(error),
                         }
                     });
@@ -6555,7 +6559,7 @@ fn RamDiskControl() -> impl IntoView {
                 </Show>
                 <small class="muted">{message}</small>
             </div>
-            <p class="hint">{ctx_tr("Rextto mostra i tmpfs/ramfs disponibili. Se non ne hai uno configurato puoi creare /dev/shm/rextto; il contenuto di /dev/shm non sopravvive al riavvio della macchina.")}</p>
+            <p class="hint">{ctx_tr("Rextto mostra i tmpfs/ramfs disponibili. Se non ne hai uno configurato puoi creare /dev/shm/rextto; scegliendo un percorso vengono proposti automaticamente dimensione massima e margine in base allo spazio reale. Il contenuto di /dev/shm non sopravvive al riavvio della macchina.")}</p>
         </div>
     }
 }
@@ -6946,6 +6950,50 @@ fn NetworkInterfaceSetting(data: RwSignal<Data>) -> impl IntoView {
                 }).collect_view()}
             </select>
             <small class="muted">{ctx_tr("Se impostata, libtorrent usa solo questa scheda: nessun traffico fuori dalla VPN.")}</small>
+        </div>
+    }
+}
+
+#[component]
+fn PortCheckControl(data: RwSignal<Data>) -> impl IntoView {
+    let ports = RwSignal::new(Vec::<Value>::new());
+    let message = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    view! {
+        <div class="settings-row" title=ctx_tr("Test locale delle porte libtorrent: verifica se il sistema può ascoltare su ogni porta dell'intervallo indicato.")>
+            <label>{ctx_tr("Test porte torrent")}</label>
+            <div class="toolbar">
+                <button class="btn sm" type="button" disabled=move || busy.get() on:click=move |_| {
+                    busy.set(true);
+                    let ports = ports;
+                    let message = message;
+                    spawn_local(async move {
+                        match get("/api/config/check-ports").await {
+                            Ok(value) => {
+                                let items = value.get("ports").and_then(Value::as_array).cloned().unwrap_or_default();
+                                let available = items.iter().filter(|item| item.get("available").and_then(Value::as_bool).unwrap_or(false)).count();
+                                message.set(format!("{}: {available}/{} {}", tr(data, "Test completato"), items.len(), tr(data, "libere localmente")));
+                                ports.set(items);
+                            }
+                            Err(error) => message.set(error),
+                        }
+                        busy.set(false);
+                    });
+                }>{move || if busy.get() { tr(data, "Verifica…") } else { tr(data, "Testa porte") }}</button>
+                <small class="muted">{message}</small>
+            </div>
+            <div class="toolbar">
+                {move || ports.get().into_iter().map(|item| {
+                    let port = number(&item, "port");
+                    let available = item.get("available").and_then(Value::as_bool).unwrap_or(false);
+                    let tcp = item.get("tcp_available").and_then(Value::as_bool).unwrap_or(false);
+                    let udp = item.get("udp_available").and_then(Value::as_bool).unwrap_or(false);
+                    let label = if available { format!("{port} · {}", tr(data, "libera")) } else { format!("{port} · {}", tr(data, "occupata")) };
+                    let title = format!("TCP: {} · UDP: {}", if tcp { tr(data, "libera") } else { tr(data, "occupata") }, if udp { tr(data, "libera") } else { tr(data, "occupata") });
+                    view! { <span class=if available { "badge ok" } else { "badge" } title=title>{label}</span> }
+                }).collect_view()}
+            </div>
+            <small class="hint">{ctx_tr("Il test verifica solo la disponibilità locale del bind. Non può confermare da solo l'apertura sul router/firewall o la raggiungibilità da Internet; una porta occupata dal listener libtorrent è normale quando il servizio è attivo.")}</small>
         </div>
     }
 }
