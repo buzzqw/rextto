@@ -923,6 +923,13 @@ pub fn App() -> impl IntoView {
             .map(|item| value_f64(item, "num_peers"))
             .sum::<f64>() as i64
     });
+    let live_seeds = Signal::derive(move || {
+        data.get()
+            .torrents
+            .iter()
+            .map(|item| value_f64(item, "num_seeds"))
+            .sum::<f64>() as i64
+    });
     // Su mobile la voce "Sistema" è comprimibile: evita che la barra di
     // navigazione diventi una fila interminabile di voci poco usate.
     let nav_more = RwSignal::new(false);
@@ -990,7 +997,7 @@ pub fn App() -> impl IntoView {
                              <div class="top-metric top-metric-rate" title=ctx_tr("Velocità di download")><span class="top-metric-label">{move || format!("↓ {}", tr(data, "Download"))}</span><strong>{move || format!("{}/s", live_dl.get())}</strong></div>
                              <div class="top-metric top-metric-rate" title=ctx_tr("Velocità di upload")><span class="top-metric-label">{move || format!("↑ {}", tr(data, "Upload"))}</span><strong>{move || format!("{}/s", live_ul.get())}</strong></div>
                              <div class="top-metric" title=ctx_tr("Torrent nella sessione")><span class="top-metric-label">{ctx_tr("Torrent")}</span><strong>{move || live_count.get()}</strong></div>
-                             <div class="top-metric" title=ctx_tr("Peer connessi")><span class="top-metric-label">{ctx_tr("Peer")}</span><strong>{move || live_peers.get()}</strong></div>
+                             <div class="top-metric" title=ctx_tr("Peer connessi / Seed")><span class="top-metric-label">{ctx_tr("P/S")}</span><strong>{move || format!("{}/{}", live_peers.get(), live_seeds.get())}</strong></div>
                              <div class="top-metric top-metric-cycle" title=move || tr(data, "Tempo stimato al prossimo ciclo automatico")><span class="top-metric-label">{ctx_tr("Prossimo ciclo")}</span><strong>{move || next_cycle.get()}</strong></div>
                             <button class="btn" title=ctx_tr("Testo più piccolo") on:click=move |_| font_scale.update(|value| *value = (*value - 5).max(85))>{ctx_tr("A−")}</button>
                             <button class="btn" title=ctx_tr("Dimensione testo predefinita (100%)") on:click=move |_| font_scale.set(100)>{move || format!("Testo {}%", font_scale.get())}</button>
