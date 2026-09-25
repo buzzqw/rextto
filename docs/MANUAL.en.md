@@ -158,8 +158,9 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
    each cycle—releases scanned, candidates, started downloads, filled gaps, and
    errors: with `200`, cycle 201 removes the oldest cycle's counters, not the
    downloaded release. *Feed-seen entries* removes only historical feed rows
-  older than the selected number of days (`0` = no cleanup); *download history*
-  removes only rows for torrents already removed (`0` = keep). Each run also
+   older than the selected number of days (`0` = no cleanup); *Download history*
+   in the **Downloads** section removes only rows for torrents already removed
+   (`0` = keep), without affecting the Archive. Each run also
   automatically removes torrents in error older than 7 days, gap logs older
   than 30 days, upgrade backups older than 30 days, and expired source
   backoffs. The databases are compacted with `VACUUM` afterwards. Archive

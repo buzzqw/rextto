@@ -163,8 +163,9 @@ la barra “Salva tutte”.
    201° ciclo elimina i contatori del ciclo più vecchio, non la release
    scaricata.
   *Visti nel feed* elimina solo le righe storiche dei feed oltre il numero di
-  giorni indicato (`0` = nessuna pulizia); *storico download* elimina solo le
-  righe dei torrent già rimossi (`0` = conserva). A ogni esecuzione vengono
+   giorni indicato (`0` = nessuna pulizia); lo *Storico download* della sezione
+   **Scarico** elimina solo le righe dei torrent già rimossi (`0` = conserva),
+   senza toccare l'Archivio. A ogni esecuzione vengono
   inoltre eliminati automaticamente torrent in errore oltre 7 giorni, log dei
   gap oltre 30 giorni, backup di upgrade oltre 30 giorni e backoff delle
   sorgenti scaduti. Alla fine i database vengono compattati con `VACUUM`.
