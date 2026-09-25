@@ -437,14 +437,7 @@ pub async fn run_cycle_domain(
             release.title = movie.name.clone();
             release.year = movie.year.parse::<i64>().ok().or(release.year);
         }
-        let score = release.quality.score_with_settings(&cfg.settings)
-            + if release.kind == "movie" {
-                cfg.find_movie_match(&release.title, release.year)
-                    .map(|movie| crate::config::Config::movie_subtitle_bonus(movie, &release.quality))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+        let score = cfg.release_score(&release);
         if release.kind == "series" {
             let series = release.series.as_deref().unwrap_or_default();
             let season = release.season.unwrap_or_default();
@@ -470,9 +463,9 @@ pub async fn run_cycle_domain(
                         ((complete && old_complete)
                             || (!complete
                                 && old_complete
-                                && incumbent_wins(&release, score, old, &cfg.settings))
+                                && incumbent_wins(&release, score, old, cfg))
                             || (!complete && !old_complete && old_range.is_superset(&range)))
-                            && incumbent_wins(&release, score, old, &cfg.settings)
+                            && incumbent_wins(&release, score, old, cfg)
                     }
             }) {
                 // Rejected because the selection already contains an equal or
@@ -500,7 +493,7 @@ pub async fn run_cycle_domain(
                     .collect::<std::collections::HashSet<_>>();
                 let old_complete = old.episode_range.contains(&0);
                 !((complete || (range.len() > 1 && range.is_superset(&old_range)))
-                    && !incumbent_wins(&release, score, old, &cfg.settings)
+                    && !incumbent_wins(&release, score, old, cfg)
                     && (!old_complete || complete))
             });
             if let Some(index) = best.iter().position(|old| {
@@ -509,7 +502,7 @@ pub async fn run_cycle_domain(
                     && old.season == Some(season)
                     && old.episode_range == release.episode_range
             }) {
-                if !incumbent_wins(&release, score, &best[index], &cfg.settings) {
+                if !incumbent_wins(&release, score, &best[index], cfg) {
                     best[index] = release;
                 }
             } else {
@@ -518,7 +511,7 @@ pub async fn run_cycle_domain(
         } else if let Some(index) = best.iter().position(|old| {
             old.kind == "movie" && old.title == release.title && old.year == release.year
         }) {
-            if !incumbent_wins(&release, score, &best[index], &cfg.settings) {
+            if !incumbent_wins(&release, score, &best[index], cfg) {
                 best[index] = release;
             }
         } else {
@@ -627,11 +620,7 @@ pub async fn run_cycle_domain(
                     );
                     db.lock()
                         .unwrap()
-                        .queue_pending_scored(
-                            &release,
-                            series.timeframe,
-                            release.quality.score_with_settings(&cfg.settings),
-                        )?;
+                        .queue_pending_scored(&release, series.timeframe, cfg.release_score(&release))?;
                     continue;
                 }
             }
@@ -668,7 +657,7 @@ pub async fn run_cycle_domain(
         };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
-            let score = release.quality.score_with_settings(&cfg.settings);
+            let score = cfg.release_score(&release);
             let min_diff = cfg.upgrade_min_score_diff;
             let result = if release.kind == "series" {
                 db.check_series_scored(&release, score, min_diff, &approval_context)?
@@ -965,9 +954,11 @@ fn incumbent_wins(
     candidate: &Release,
     candidate_score: i64,
     incumbent: &Release,
-    settings: &std::collections::BTreeMap<String, String>,
+    cfg: &Config,
 ) -> bool {
-    let incumbent_score = incumbent.quality.score_with_settings(settings);
+    // Use the same policy-aware score the candidate was ranked with, so score
+    // rules and custom formats cannot make the two sides inconsistent.
+    let incumbent_score = cfg.release_score(incumbent);
     incumbent_score > candidate_score
         || (incumbent_score == candidate_score
             && !(candidate.quality.is_remux() && !incumbent.quality.is_remux()))

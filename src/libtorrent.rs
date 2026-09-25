@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::{c_char, c_void, CStr, CString},
     fs,
     path::{Path, PathBuf},
@@ -403,6 +403,7 @@ fn native_state(state: i32, paused: bool) -> String {
 #[derive(Debug)]
 pub struct LibtorrentClient {
     torrents: RwLock<BTreeMap<String, TorrentView>>,
+    stalled: RwLock<HashSet<String>>,
     session: Option<NativeSession>,
     config_db: PathBuf,
     state_dir: PathBuf,
@@ -552,6 +553,7 @@ impl LibtorrentClient {
         };
         let client = Self {
             torrents: RwLock::new(BTreeMap::new()),
+            stalled: RwLock::new(HashSet::new()),
             session,
             config_db: cfg.data_dir.join("rextto_config.db"),
             state_dir: cfg.state_dir.clone(),
@@ -833,6 +835,7 @@ impl LibtorrentClient {
         } else {
             bail!("libtorrent session is unavailable");
         }
+        self.clear_stalled(&hash);
         self.torrents.write().unwrap().insert(
             hash.clone(),
             TorrentView {
@@ -862,6 +865,7 @@ impl LibtorrentClient {
                 torrent_version: String::new(),
                 total_size: 0,
                 total_done: 0,
+                stalled: false,
             },
         );
         Ok(true)
@@ -960,6 +964,7 @@ impl LibtorrentClient {
             .take(received)
             .map(|status| {
                 let hash = native_string(&status.hash).to_ascii_lowercase();
+                let stalled = self.stalled.read().unwrap().contains(&hash);
                 let has_limit = limits.contains_key(&hash);
                 let limit = limits.get(&hash).copied().unwrap_or_default();
                 TorrentView {
@@ -967,7 +972,11 @@ impl LibtorrentClient {
                     name: native_string(&status.name),
                     save_path: native_string(&status.save_path),
                     progress: status.progress.clamp(0.0, 100.0),
-                    state: native_state(status.state, status.paused != 0),
+                    state: if stalled && status.paused == 0 {
+                        "stalled".into()
+                    } else {
+                        native_state(status.state, status.paused != 0)
+                    },
                     download_rate: status.download_rate.max(0) as u64,
                     upload_rate: status.upload_rate.max(0) as u64,
                     download_limit: status.download_limit as i64,
@@ -990,6 +999,7 @@ impl LibtorrentClient {
                     },
                     total_size: status.total_size.max(0),
                     total_done: status.total_done.max(0),
+                    stalled,
                 }
             })
             .collect()
@@ -1250,7 +1260,21 @@ impl LibtorrentClient {
         self.control(hash, rextto_lt_set_paused, 1)
     }
     pub fn resume(&self, hash: &str) -> Result<bool> {
-        self.control(hash, rextto_lt_set_paused, 0)
+        let result = self.control(hash, rextto_lt_set_paused, 0)?;
+        self.clear_stalled(hash);
+        Ok(result)
+    }
+    pub fn mark_stalled(&self, hash: &str) {
+        self.stalled
+            .write()
+            .unwrap()
+            .insert(hash.to_ascii_lowercase());
+    }
+    pub fn clear_stalled(&self, hash: &str) {
+        self.stalled
+            .write()
+            .unwrap()
+            .remove(&hash.to_ascii_lowercase());
     }
     /// Restart a torrent without removing its handle, data, or resume state.
     /// A tracker announce follows the pause/resume transition to immediately
@@ -1502,6 +1526,7 @@ impl LibtorrentClient {
             self.control(hash, rextto_lt_remove, delete_files as i32)?;
         }
         let normalized = hash.to_ascii_lowercase();
+        self.clear_stalled(&normalized);
         let name = self
             .torrents
             .read()
@@ -1532,7 +1557,7 @@ impl LibtorrentClient {
             .as_ref()
             .map(|session| unsafe { rextto_lt_torrent_count(session.0) })
             .unwrap_or(0);
-        serde_json::json!({"count": list.len(), "native_count": native_count, "downloading": list.iter().filter(|torrent| torrent.state == "downloading").count(), "seeding": list.iter().filter(|torrent| torrent.state == "seeding").count(), "queued": list.iter().filter(|torrent| torrent.state == "paused" && torrent.has_metadata).count(), "metadata_pending": list.iter().filter(|torrent| !torrent.has_metadata).count(), "integrated": self.session.is_some(), "dry_run": self.dry_run})
+        serde_json::json!({"count": list.len(), "native_count": native_count, "downloading": list.iter().filter(|torrent| torrent.state == "downloading").count(), "stalled": list.iter().filter(|torrent| torrent.stalled).count(), "seeding": list.iter().filter(|torrent| torrent.state == "seeding").count(), "queued": list.iter().filter(|torrent| torrent.state == "paused" && torrent.has_metadata).count(), "metadata_pending": list.iter().filter(|torrent| !torrent.has_metadata).count(), "integrated": self.session.is_some(), "dry_run": self.dry_run})
     }
     pub fn state_dir(&self, cfg: &Config) -> PathBuf {
         cfg.state_dir.clone()

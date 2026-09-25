@@ -33,6 +33,9 @@ pub struct Notifier {
     email_to: Option<String>,
     email_password: Option<String>,
     last_telegram: Arc<Mutex<Option<Instant>>>,
+    /// External event hooks (see `crate::hooks`). Reloadable at runtime when
+    /// the user edits them in the UI.
+    hooks: Arc<std::sync::RwLock<Vec<crate::hooks::EventHook>>>,
 }
 
 #[derive(Serialize)]
@@ -62,6 +65,7 @@ impl Notifier {
             email_to: None,
             email_password: None,
             last_telegram: Arc::new(Mutex::new(None)),
+            hooks: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -79,7 +83,24 @@ impl Notifier {
             email_to: cfg.email_to.clone(),
             email_password: cfg.email_password.clone(),
             last_telegram: Arc::new(Mutex::new(None)),
+            hooks: Arc::new(std::sync::RwLock::new(crate::hooks::load_hooks(
+                &cfg.settings,
+            ))),
         }
+    }
+
+    /// Replaces the event hooks, e.g. after the settings API saved them.
+    pub fn reload_hooks(&self, hooks: Vec<crate::hooks::EventHook>) {
+        if let Ok(mut current) = self.hooks.write() {
+            *current = hooks;
+        }
+    }
+
+    pub fn event_hooks(&self) -> Vec<crate::hooks::EventHook> {
+        self.hooks
+            .read()
+            .map(|hooks| hooks.clone())
+            .unwrap_or_default()
     }
 
     pub fn enabled(&self) -> bool {
@@ -137,6 +158,12 @@ impl Notifier {
     }
 
     pub async fn notify_event(&self, event: &str, data: serde_json::Value) -> Result<()> {
+        // External hooks run on a detached task so they never delay the
+        // notification delivery or the caller.
+        let hooks = self.event_hooks();
+        if !hooks.is_empty() {
+            crate::hooks::dispatch(hooks, event.to_string(), data.clone());
+        }
         let mut first_error = None;
         if self.telegram_enabled {
             if let (Some(token), Some(chat)) = (&self.telegram_bot_token, &self.telegram_chat_id) {

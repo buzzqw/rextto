@@ -330,6 +330,20 @@ pub struct Release {
     pub episode_range: Vec<i64>,
     pub year: Option<i64>,
     pub discovered_at: DateTime<Utc>,
+    /// Size advertised by the indexer/feed, in bytes. `0` means unknown, in
+    /// which case size-based policy rules are skipped instead of guessing.
+    #[serde(default)]
+    pub size_bytes: i64,
+    /// Seeders advertised by the indexer/feed, or `-1` when unknown.
+    #[serde(default = "unknown_peer_count")]
+    pub seeders: i64,
+    /// Leechers advertised by the indexer/feed, or `-1` when unknown.
+    #[serde(default = "unknown_peer_count")]
+    pub peers: i64,
+}
+
+fn unknown_peer_count() -> i64 {
+    -1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +400,10 @@ pub struct TorrentView {
     /// Bytes already downloaded (0 while metadata is missing).
     #[serde(default)]
     pub total_done: i64,
+    /// True when Rextto has parked the torrent as stalled while retaining it
+    /// for periodic peer/seed discovery retries.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

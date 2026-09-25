@@ -676,6 +676,13 @@ pub fn router(state: AppState) -> Router {
             "/api/tag-dir-rules",
             get(tag_dir_rules).post(save_tag_dir_rules),
         )
+        .route("/api/policy", get(policy_view).post(save_policy))
+        .route("/api/policy/preview", post(policy_preview))
+        .route("/api/event-hooks", get(event_hooks_view).post(save_event_hooks))
+        .route(
+            "/api/watched-folders",
+            get(watched_folders_view).post(save_watched_folders),
+        )
         .route("/api/trakt/status", get(trakt_status))
         .route("/api/trakt/auth/start", post(trakt_auth_start))
         .route("/api/trakt/auth/poll", post(trakt_auth_poll))
@@ -1485,6 +1492,17 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
             "dynamic_queue_min": cfg.libtorrent.dynamic_queue_min,
             "dynamic_queue_max": cfg.libtorrent.dynamic_queue_max,
             "dont_count_slow_torrents": cfg.libtorrent.dont_count_slow_torrents,
+            "stall_after_min": cfg
+                .settings
+                .get("libtorrent_stall_after_min")
+                .cloned()
+                .unwrap_or_else(|| "60".into()),
+            "stall_retry_min": cfg
+                .settings
+                .get("libtorrent_stall_retry_min")
+                .cloned()
+                .unwrap_or_else(|| "60".into()),
+            "stall_giveup_min": configured_stall_giveup_minutes(&cfg).to_string(),
             "auto_remove_completed": cfg.libtorrent.auto_remove_completed,
             "dht": cfg.libtorrent.dht,
             "pex": cfg.libtorrent.pex,
@@ -1574,6 +1592,310 @@ async fn save_tag_dir_rules(
         ),
     }
 }
+/// Request body for `/api/policy`: the complete configurable release policy.
+#[derive(serde::Deserialize, Default)]
+pub struct PolicyInput {
+    #[serde(default)]
+    pub release_rules: Vec<crate::policy::ReleaseRule>,
+    #[serde(default)]
+    pub custom_formats: Vec<crate::policy::CustomFormat>,
+    #[serde(default)]
+    pub size_rules: Vec<crate::policy::SizeRule>,
+    #[serde(default)]
+    pub min_custom_format_score: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PolicyPreviewInput {
+    pub title: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub seeders: Option<i64>,
+    #[serde(default)]
+    pub peers: Option<i64>,
+    #[serde(default)]
+    pub year: Option<i64>,
+}
+
+async fn policy_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = latest_config(&s);
+    Json(serde_json::json!({
+        "ok": true,
+        "release_rules": cfg.release_rules,
+        "custom_formats": cfg.custom_formats,
+        "size_rules": cfg.size_rules,
+        "min_custom_format_score": cfg.min_custom_format_score,
+    }))
+}
+
+const POLICY_MAX_ITEMS: usize = 200;
+
+/// Validates the policy before persisting it. Broken regexes and oversized or
+/// unnamed items are rejected here so the engine never sees a half-valid rule.
+fn policy_validation_error(input: &PolicyInput) -> Option<String> {
+    if input.release_rules.len() > POLICY_MAX_ITEMS
+        || input.custom_formats.len() > POLICY_MAX_ITEMS
+        || input.size_rules.len() > POLICY_MAX_ITEMS
+    {
+        return Some(format!(
+            "too many policy items (max {POLICY_MAX_ITEMS} per category)"
+        ));
+    }
+    for rule in &input.release_rules {
+        if rule.name.trim().is_empty() {
+            return Some("a release rule has an empty name".into());
+        }
+        if rule.name.len() > 200
+            || rule.match_terms.len() > 100
+            || rule.required_terms.len() > 100
+            || rule.except_terms.len() > 100
+            || rule.resolutions.len() > 50
+            || rule.sources.len() > 50
+            || rule.codecs.len() > 50
+            || rule.audio.len() > 50
+            || rule.groups.len() > 200
+            || rule.languages.len() > 50
+        {
+            return Some(format!("release rule '{}' is too large", rule.name));
+        }
+        for term in rule
+            .match_terms
+            .iter()
+            .chain(rule.required_terms.iter())
+            .chain(rule.except_terms.iter())
+        {
+            if let Err(error) = crate::policy::validate_term(term) {
+                return Some(format!(
+                    "release rule '{}' has an invalid pattern '{term}': {error}",
+                    rule.name
+                ));
+            }
+        }
+    }
+    for format in &input.custom_formats {
+        if format.name.trim().is_empty() {
+            return Some("a custom format has an empty name".into());
+        }
+        if format.name.len() > 200 || format.conditions.len() > 100 {
+            return Some(format!("custom format '{}' is too large", format.name));
+        }
+        for condition in &format.conditions {
+            use crate::policy::ConditionKind;
+            if matches!(
+                condition.kind,
+                ConditionKind::Title
+                    | ConditionKind::Group
+                    | ConditionKind::Codec
+                    | ConditionKind::Audio
+                    | ConditionKind::Language
+                    | ConditionKind::Indexer
+            ) {
+                if let Err(error) = crate::policy::validate_term(&condition.value) {
+                    return Some(format!(
+                        "custom format '{}' has an invalid pattern '{}': {error}",
+                        format.name, condition.value
+                    ));
+                }
+            }
+        }
+    }
+    for rule in &input.size_rules {
+        if rule.resolution.trim().is_empty() || rule.resolution.len() > 32 {
+            return Some("a size rule has an invalid resolution".into());
+        }
+        if rule.min_mb < 0 || rule.max_mb < 0 {
+            return Some("a size rule has a negative bound".into());
+        }
+        if rule.max_mb > 0 && rule.min_mb > 0 && rule.max_mb < rule.min_mb {
+            return Some(format!(
+                "size rule '{}' has max below min",
+                rule.resolution
+            ));
+        }
+    }
+    None
+}
+
+async fn save_policy(
+    State(s): State<AppState>,
+    Json(input): Json<PolicyInput>,
+) -> impl IntoResponse {
+    if let Some(error) = policy_validation_error(&input) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error})),
+        );
+    }
+    let serialized = [
+        ("release_rules", serde_json::to_string(&input.release_rules)),
+        ("custom_formats", serde_json::to_string(&input.custom_formats)),
+        ("size_rules", serde_json::to_string(&input.size_rules)),
+        (
+            "min_custom_format_score",
+            Ok(input
+                .min_custom_format_score
+                .map(|value| value.to_string())
+                .unwrap_or_default()),
+        ),
+    ];
+    for (key, value) in serialized {
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+                )
+            }
+        };
+        if let Err(error) = Config::save_setting(&s.cfg.data_dir, key, &value) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "release_rules": input.release_rules,
+            "custom_formats": input.custom_formats,
+            "size_rules": input.size_rules,
+            "min_custom_format_score": input.min_custom_format_score,
+        })),
+    )
+}
+
+async fn policy_preview(
+    State(s): State<AppState>,
+    Json(input): Json<PolicyPreviewInput>,
+) -> impl IntoResponse {
+    let title = input.title.trim();
+    if title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"empty title"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    let source = input
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("preview");
+    // A throwaway magnet lets the shared parser classify the title exactly as
+    // it would for a real release, without touching the network.
+    let magnet = format!("magnet:?xt=urn:btih:{}", "0".repeat(40));
+    let Some(mut release) =
+        crate::parser::parse_release_source(title, &magnet, None, source, chrono::Utc::now())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"could not parse the title"})),
+        );
+    };
+    if let Some(kind) = input.kind.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        release.kind = kind.to_string();
+    }
+    release.size_bytes = input.size_bytes.max(0);
+    release.seeders = input.seeders.unwrap_or(-1);
+    release.peers = input.peers.unwrap_or(-1);
+    if let Some(year) = input.year {
+        release.year = Some(year);
+    }
+    let decision = cfg.policy_decision(&release);
+    let base_score = release.quality.score_with_settings(&cfg.settings);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "allowed": decision.allowed,
+            "rejections": decision.rejections,
+            "matched_formats": decision.matched_formats,
+            "violated_rules": decision.violated_rules,
+            "policy_score_delta": decision.score_delta,
+            "base_score": base_score,
+            "total_score": cfg.release_score(&release),
+            "parsed": {
+                "kind": release.kind,
+                "series": release.series,
+                "season": release.season,
+                "episode": release.episode,
+                "resolution": release.quality.resolution,
+                "source": release.quality.source,
+                "codec": release.quality.codec,
+                "audio": release.quality.audio,
+                "group": release.quality.group,
+                "languages": release.quality.languages,
+            }
+        })),
+    )
+}
+
+async fn event_hooks_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"ok": true, "items": s.notifier.event_hooks()}))
+}
+
+async fn save_event_hooks(
+    State(s): State<AppState>,
+    Json(hooks): Json<Vec<crate::hooks::EventHook>>,
+) -> impl IntoResponse {
+    if let Some(error) = crate::hooks::validate_hooks(&hooks) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error})),
+        );
+    }
+    if let Err(error) = crate::hooks::save_hooks(&s.cfg.data_dir, &hooks) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        );
+    }
+    s.notifier.reload_hooks(hooks.clone());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "items": hooks})),
+    )
+}
+
+async fn watched_folders_view(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = latest_config(&s);
+    Json(serde_json::json!({
+        "ok": true,
+        "items": crate::watcher::load_watched_folders(&cfg.settings),
+    }))
+}
+
+async fn save_watched_folders(
+    State(s): State<AppState>,
+    Json(folders): Json<Vec<crate::watcher::WatchedFolder>>,
+) -> impl IntoResponse {
+    if let Some(error) = crate::watcher::validate_watched_folders(&folders) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":error})),
+        );
+    }
+    if let Err(error) = crate::watcher::save_watched_folders(&s.cfg.data_dir, &folders) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "items": folders})),
+    )
+}
+
 async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
     let db = s.db.lock().unwrap();
@@ -2472,6 +2794,9 @@ async fn series_rename_apply(
             is_pack: false,
             episode_range: vec![episode.episode],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         // Modalità "ripristina sorgente": rinomina solo i file il cui nome ha
@@ -2645,6 +2970,9 @@ async fn series_rename_apply(
                 is_pack: false,
                 episode_range: vec![episode_number],
                 year: None,
+                size_bytes: 0,
+                seeders: -1,
+                peers: -1,
                 discovered_at: chrono::Utc::now(),
             };
             if !force && postprocess::episode_name_conforms(&file, &release, &cfg) {
@@ -7067,6 +7395,7 @@ fn dry_run_session_preview(s: &AppState) -> Vec<crate::models::TorrentView> {
             torrent_version: String::new(),
             total_size: 0,
             total_done: 0,
+            stalled: false,
         })
         .collect()
 }
@@ -8079,9 +8408,7 @@ async fn add_parsed_release(
             Ok(Some(hash)) => {
                 // Registra sotto l'hash reale così il post-processing ha i metadati.
                 release.magnet = format!("magnet:?xt=urn:btih:{hash}");
-                let score = release
-                    .quality
-                    .score_with_settings(&latest_config(s).settings);
+                let score = latest_config(s).release_score(&release);
                 match s
                     .db
                     .lock()
@@ -8115,9 +8442,7 @@ async fn add_parsed_release(
     // verification or session state, so never run it in an Axum worker (or make
     // the user wait for it). Persist the intent first, then isolate the native
     // call in Tokio's blocking pool.
-    let score = release
-        .quality
-        .score_with_settings(&latest_config(s).settings);
+    let score = latest_config(s).release_score(&release);
     if let Err(error) = s
         .db
         .lock()
@@ -10131,7 +10456,7 @@ async fn torrent_event_worker(
     let mut post_seed_moves = HashSet::new();
     let mut metadata_wait_start = HashMap::new();
     let mut metadata_first_seen = HashMap::new();
-    let mut stall_wait_start = HashMap::new();
+    let mut stall_wait_start: HashMap<String, StallWatch> = HashMap::new();
     // Periodic RAM-disk reconciliation: the metadata event fires once, so a
     // missed event (restart/race) used to leave an oversized torrent on the
     // tmpfs forever. `ramdisk_attempts` rate-limits retries per hash.
@@ -10565,22 +10890,44 @@ async fn torrent_event_worker(
     }
 }
 
-/// Updates a download's stall timer. As in EXTTO, reset it when traffic arrives
-/// or even one peer is visible: a torrent with sources is not "dead" at 0 bytes.
-/// It expires only after `timeout` with no peers and no traffic.
+#[derive(Debug)]
+struct StallWatch {
+    /// Last time at which the completed byte count increased. A connected leecher
+    /// is not proof of progress: it can stay online forever while owning no
+    /// piece that we still need.
+    last_progress_at: Instant,
+    last_done: i64,
+    /// Once set, the torrent is stalled but retained in the session. It is
+    /// periodically reannounced instead of occupying the active download pool.
+    stalled_since: Option<Instant>,
+    next_retry_at: Instant,
+}
+
+fn configured_stall_giveup_minutes(cfg: &Config) -> f64 {
+    cfg.settings
+        .get("libtorrent_stall_giveup_min")
+        .and_then(|value| value.parse::<f64>().ok())
+        .or_else(|| {
+            cfg.settings
+                .get("libtorrent_stall_timeout_min")
+                .and_then(|value| value.parse::<f64>().ok())
+                .map(|value| if value > 0.0 { value.max(10080.0) } else { 0.0 })
+        })
+        .unwrap_or(20160.0)
+}
+
+/// Updates a download's progress timer. Peer presence and the instantaneous
+/// rate are deliberately ignored: a leecher can be connected at 0 B/s for
+/// days without making the torrent any more recoverable.
 fn stall_expired(
     entry: &mut (Instant, i64),
     now: Instant,
     done: i64,
-    download_rate: u64,
-    num_peers: i32,
     timeout: Duration,
 ) -> bool {
-    if done > entry.1 || download_rate > 0 || num_peers > 0 {
+    if done > entry.1 {
         entry.0 = now;
-        if done > entry.1 {
-            entry.1 = done;
-        }
+        entry.1 = done;
     }
     now.duration_since(entry.0) >= timeout
 }
@@ -10721,72 +11068,143 @@ async fn monitor_stalled(
     torrents: &LibtorrentClient,
     db: &Arc<Mutex<Database>>,
     notifier: &Notifier,
-    watch: &mut HashMap<String, (Instant, i64)>,
+    watch: &mut HashMap<String, StallWatch>,
 ) {
-    let stall_minutes = cfg
+    // `libtorrent_stall_timeout_min` was the old terminal timeout. Keep it as
+    // a compatibility fallback, but never allow that legacy value to make a
+    // torrent disappear after only a few days. The new give-up setting can be
+    // set to 0 to retain stalled torrents indefinitely.
+    let stall_after_minutes = cfg
         .settings
-        .get("libtorrent_stall_timeout_min")
+        .get("libtorrent_stall_after_min")
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(10080.0);
-    if stall_minutes <= 0.0 {
+        .unwrap_or(60.0);
+    let retry_minutes = cfg
+        .settings
+        .get("libtorrent_stall_retry_min")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(60.0);
+    let giveup_minutes = configured_stall_giveup_minutes(cfg);
+    if stall_after_minutes <= 0.0 {
         watch.clear();
         return;
     }
-    let timeout = Duration::from_secs_f64(stall_minutes * 60.0);
+    let stall_timeout = Duration::from_secs_f64(stall_after_minutes * 60.0);
+    let retry_timeout = Duration::from_secs_f64(retry_minutes.max(1.0) * 60.0);
+    let giveup_timeout = (giveup_minutes > 0.0)
+        .then(|| Duration::from_secs_f64(giveup_minutes * 60.0));
     let now = Instant::now();
     let mut live = HashSet::new();
     for torrent in torrents.list() {
         live.insert(torrent.hash.clone());
-        if torrent.state != "downloading" || torrent.progress >= 100.0 {
+        if !matches!(torrent.state.as_str(), "downloading" | "stalled")
+            || torrent.progress >= 100.0
+        {
+            torrents.clear_stalled(&torrent.hash);
             watch.remove(&torrent.hash);
             continue;
         }
-        let entry = watch
-            .entry(torrent.hash.clone())
-            .or_insert((now, torrent.total_done));
-        if !stall_expired(
-            entry,
-            now,
-            torrent.total_done,
-            torrent.download_rate,
-            torrent.num_peers,
-            timeout,
-        ) {
+        let entry = watch.entry(torrent.hash.clone()).or_insert_with(|| StallWatch {
+            last_progress_at: now,
+            last_done: torrent.total_done,
+            stalled_since: None,
+            next_retry_at: now,
+        });
+        let mut progress = (entry.last_progress_at, entry.last_done);
+        if !stall_expired(&mut progress, now, torrent.total_done, stall_timeout) {
+            entry.last_progress_at = progress.0;
+            entry.last_done = progress.1;
+            entry.stalled_since = None;
+            entry.next_retry_at = now;
+            torrents.clear_stalled(&torrent.hash);
             continue;
         }
-        let mut failed_title = String::new();
-        if let Some(metadata) = db
-            .lock()
-            .unwrap()
-            .torrent_meta(&torrent.hash)
-            .ok()
-            .flatten()
-        {
-            let _ = db.lock().unwrap().blocklist(&metadata.release, "stalled");
-            failed_title = metadata.release.title.clone();
+        entry.last_progress_at = progress.0;
+        entry.last_done = progress.1;
+        let first_stall = entry.stalled_since.is_none();
+        let stalled_since = *entry.stalled_since.get_or_insert(now);
+        torrents.mark_stalled(&torrent.hash);
+        if first_stall {
+            tracing::warn!(
+                hash = %torrent.hash,
+                name = %torrent.name,
+                progress = torrent.progress,
+                num_peers = torrent.num_peers,
+                num_seeds = torrent.num_seeds,
+                stall_after_minutes,
+                "⏸️ DOWNLOAD STALLED — excluded from active slots; retaining for periodic retry"
+            );
+            // Retry immediately on the first transition to stalled.
+            entry.next_retry_at = now;
         }
-        let restored = db
-            .lock()
-            .unwrap()
-            .restore_upgrade(&torrent.hash)
-            .unwrap_or(false);
-        let _ = db
-            .lock()
-            .unwrap()
-            .mark_torrent_error(&torrent.hash, "stalled download");
-        tracing::warn!(
-            hash = %torrent.hash,
-            name = %torrent.name,
-            title = %failed_title,
-            progress = torrent.progress,
-            stall_minutes,
-            "❌ DOWNLOAD FAILED — stalled (no peers or traffic within the timeout)"
-        );
-        if remove_failed_torrent(torrents, &torrent.hash) {
-            let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
+        if giveup_timeout.is_some_and(|timeout| now.duration_since(stalled_since) >= timeout) {
+            let mut failed_title = String::new();
+            if let Some(metadata) = db
+                .lock()
+                .unwrap()
+                .torrent_meta(&torrent.hash)
+                .ok()
+                .flatten()
+            {
+                failed_title = metadata.release.title.clone();
+            }
+            let restored = db
+                .lock()
+                .unwrap()
+                .restore_upgrade(&torrent.hash)
+                .unwrap_or(false);
+            let _ = db
+                .lock()
+                .unwrap()
+                .mark_torrent_error(&torrent.hash, "stalled download");
+            tracing::warn!(
+                hash = %torrent.hash,
+                name = %torrent.name,
+                title = %failed_title,
+                progress = torrent.progress,
+                giveup_minutes,
+                "❌ DOWNLOAD FAILED — stalled beyond the configured retry window"
+            );
+            if remove_failed_torrent(torrents, &torrent.hash) {
+                let _ = db.lock().unwrap().mark_torrent_removed_at(&torrent.hash);
+            }
+            let _ = notifier
+                .notify_event(
+                    "download_failed",
+                    serde_json::json!({
+                        "hash": torrent.hash,
+                        "title": failed_title,
+                        "error": "stalled download",
+                        "upgrade_restored": restored,
+                    }),
+                )
+                .await;
+            watch.remove(&torrent.hash);
+            torrents.clear_stalled(&torrent.hash);
+            continue;
         }
-        let _ = notifier.notify_event("download_failed", serde_json::json!({"hash":torrent.hash,"title":failed_title,"error":"stalled download","upgrade_restored":restored})).await;
-        watch.remove(&torrent.hash);
+        if now >= entry.next_retry_at {
+            match torrents.reannounce(&torrent.hash) {
+                Ok(true) => tracing::info!(
+                    hash = %torrent.hash,
+                    name = %torrent.name,
+                    retry_minutes,
+                    "🔁 stalled torrent reannounced"
+                ),
+                Ok(false) => tracing::debug!(
+                    hash = %torrent.hash,
+                    name = %torrent.name,
+                    "stalled torrent reannounce unavailable in current mode"
+                ),
+                Err(error) => tracing::debug!(
+                    hash = %torrent.hash,
+                    name = %torrent.name,
+                    %error,
+                    "stalled torrent reannounce failed"
+                ),
+            }
+            entry.next_retry_at = now + retry_timeout;
+        }
     }
     watch.retain(|hash, _| live.contains(hash));
 }
@@ -12582,6 +13000,91 @@ async fn temp_cleanup_worker(state: AppState) {
     }
 }
 
+/// Polls configured watched folders and adds dropped `.torrent`/`.magnet`
+/// files, mirroring qBittorrent's "watched folders". Files that cannot be
+/// added are retried a few times and then left alone.
+async fn watched_folders_worker(state: AppState) {
+    const PERIOD: Duration = Duration::from_secs(15);
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut processed: std::collections::HashSet<(String, u64, u64)> =
+        std::collections::HashSet::new();
+    let mut failures: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    loop {
+        tokio::time::sleep(PERIOD).await;
+        let cfg = latest_config(&state);
+        if cfg.dry_run {
+            continue;
+        }
+        let folders = crate::watcher::load_watched_folders(&cfg.settings);
+        for folder in folders.iter().filter(|folder| folder.enabled) {
+            for path in crate::watcher::scan_folder(folder) {
+                let Some((path_key, length, modified)) = std::fs::metadata(&path)
+                    .ok()
+                    .map(|meta| {
+                        (
+                            path.to_string_lossy().into_owned(),
+                            meta.len(),
+                            meta.modified()
+                                .ok()
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|duration| duration.as_secs())
+                                .unwrap_or(0),
+                        )
+                    })
+                else {
+                    continue;
+                };
+                if failures.get(&path_key).copied().unwrap_or(0) >= MAX_ATTEMPTS {
+                    continue;
+                }
+                let key = (path_key.clone(), length, modified);
+                if !folder.delete_after && processed.contains(&key) {
+                    continue;
+                }
+                let result = if path_key.to_ascii_lowercase().ends_with(".magnet") {
+                    match crate::watcher::magnet_from_file(&path) {
+                        Some(magnet) => state.torrents.add_with_path(&magnet, &cfg, None),
+                        None => Err(anyhow::anyhow!(
+                            "no magnet URI in {}",
+                            path.display()
+                        )),
+                    }
+                } else {
+                    state.torrents.add_file_with_path(&path, &cfg, None)
+                };
+                match result {
+                    Ok(true) => {
+                        failures.remove(&path_key);
+                        processed.insert(key);
+                        if folder.delete_after {
+                            if let Err(error) = std::fs::remove_file(&path) {
+                                tracing::warn!(file = %path.display(), %error, "watched folder: could not remove imported file");
+                            }
+                        } else if let Err(error) = crate::watcher::consume(&path, false) {
+                            tracing::warn!(file = %path.display(), %error, "watched folder: could not mark imported file");
+                        }
+                        tracing::info!(file = %path.display(), folder = %folder.path, "📥 watched folder: torrent added");
+                    }
+                    Ok(false) => {
+                        // Session disabled or dry-run: keep the file for later.
+                    }
+                    Err(error) => {
+                        let count = failures.entry(path_key.clone()).or_insert(0);
+                        *count += 1;
+                        tracing::warn!(file = %path.display(), %error, attempts = *count, "watched folder: could not add torrent");
+                    }
+                }
+            }
+        }
+        if processed.len() > 4096 {
+            processed.clear();
+        }
+        if failures.len() > 4096 {
+            failures.clear();
+        }
+    }
+}
+
 pub async fn serve(
     state: AppState,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -12615,6 +13118,7 @@ pub async fn serve(
     let backups = tokio::spawn(backup_worker(state.clone()));
     let optimize = tokio::spawn(optimize_worker(state.clone()));
     let temp_cleanup = tokio::spawn(temp_cleanup_worker(state.clone()));
+    let watched = tokio::spawn(watched_folders_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -12626,6 +13130,7 @@ pub async fn serve(
         registry.push(backups);
         registry.push(optimize);
         registry.push(temp_cleanup);
+        registry.push(watched);
     }
     let app = router(state);
     let result = tokio::try_join!(
@@ -12669,6 +13174,7 @@ mod tests {
             torrent_version: String::new(),
             total_size: 0,
             total_done: 0,
+            stalled: false,
         }
     }
 
@@ -12813,16 +13319,14 @@ mod tests {
     }
 
     #[test]
-    fn stall_timer_resets_on_peers_like_extto() {
+    fn stall_timer_requires_real_progress_not_peer_presence() {
         let timeout = Duration::from_secs(3600);
         let t0 = Instant::now();
-        // Nessun peer e nessun traffico per oltre il timeout: scade.
+        // Nessun progresso per oltre il timeout: scade.
         let mut entry = (t0, 0_i64);
         assert!(!stall_expired(
             &mut entry,
             t0 + Duration::from_secs(1800),
-            0,
-            0,
             0,
             timeout
         ));
@@ -12830,35 +13334,20 @@ mod tests {
             &mut entry,
             t0 + Duration::from_secs(3700),
             0,
-            0,
-            0,
             timeout
         ));
-        // Basta un peer (senza byte nuovi) per azzerare il timer, come EXTTO.
-        assert!(!stall_expired(
+        // Un peer collegato senza byte nuovi non riavvia il timer.
+        assert!(stall_expired(
             &mut entry,
             t0 + Duration::from_secs(3800),
             0,
-            0,
-            2,
             timeout
         ));
-        // Poi di nuovo senza peer per un altro timeout: scade.
-        assert!(stall_expired(
-            &mut entry,
-            t0 + Duration::from_secs(3800 + 3700),
-            0,
-            0,
-            0,
-            timeout
-        ));
-        // Byte nuovi azzerano comunque il timer.
+        // Byte nuovi azzerano il timer anche se il peer poi sparisce.
         assert!(!stall_expired(
             &mut entry,
             t0 + Duration::from_secs(8000),
             5,
-            0,
-            0,
             timeout
         ));
     }
@@ -13099,6 +13588,217 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["refresh_secs"],
             900
         );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn policy_endpoints_persist_validate_and_preview() {
+        let (state, root) = test_state();
+        let app = router(state);
+        let post = |uri: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("x-rextto-token", "test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        // Auth is enforced for the new surface as well.
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/policy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let save = app
+            .clone()
+            .oneshot(post(
+                "/api/policy",
+                r#"{
+                    "release_rules": [{
+                        "name": "block cam",
+                        "enabled": true,
+                        "match_terms": ["CAM"],
+                        "action": {"type": "reject", "reason": "cam rip"}
+                    }],
+                    "custom_formats": [{
+                        "name": "x265",
+                        "enabled": true,
+                        "score": 300,
+                        "conditions": [{"kind": "codec", "value": "x265"}]
+                    }],
+                    "size_rules": [{"resolution": "1080p", "min_mb": 500, "max_mb": 0}],
+                    "min_custom_format_score": null
+                }"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+
+        // Persisted: the view returns the saved policy.
+        let view = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/policy")
+                    .header("x-rextto-token", "test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(view.status(), StatusCode::OK);
+        let body = to_bytes(view.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["release_rules"][0]["name"], "block cam");
+        assert_eq!(value["custom_formats"][0]["score"], 300);
+
+        // Preview: the reject rule fires.
+        let blocked = app
+            .clone()
+            .oneshot(post(
+                "/api/policy/preview",
+                r#"{"title":"Movie.2026.CAM.1080p.x265","kind":"movie","size_bytes":5000000000}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::OK);
+        let body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["allowed"], false);
+        assert!(value["rejections"][0]
+            .as_str()
+            .unwrap()
+            .contains("cam rip"));
+
+        // Preview: the custom format adds its score.
+        let scored = app
+            .clone()
+            .oneshot(post(
+                "/api/policy/preview",
+                r#"{"title":"Movie.2026.1080p.WEB-DL.x265","kind":"movie","size_bytes":5000000000}"#,
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(scored.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["allowed"], true);
+        assert_eq!(value["policy_score_delta"], 300);
+        assert_eq!(value["matched_formats"][0], "x265");
+
+        // A broken regex is rejected at save time.
+        let invalid = app
+            .clone()
+            .oneshot(post(
+                "/api/policy",
+                r#"{"release_rules":[{"name":"bad","enabled":true,"match_terms":["/[/"],"action":{"type":"reject"}}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn event_hooks_endpoint_validates_and_reloads_runtime() {
+        let (state, root) = test_state();
+        let notifier = state.notifier.clone();
+        let app = router(state);
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/event-hooks")
+                .header("x-rextto-token", "test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        // A hook without a program is rejected.
+        let invalid = app
+            .clone()
+            .oneshot(post(r#"[{"name":"broken","program":""}]"#))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let valid = app
+            .clone()
+            .oneshot(post(
+                r#"[{"name":"notify","enabled":true,"events":["torrent_completed"],"program":"/bin/true","args":"{title}","timeout_secs":5}]"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
+        // The running Notifier was reloaded in place.
+        let hooks = notifier.event_hooks();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].program, "/bin/true");
+        assert_eq!(hooks[0].events, vec!["torrent_completed".to_string()]);
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn watched_folders_endpoint_roundtrips() {
+        let (state, root) = test_state();
+        let app = router(state);
+        let get_view = || {
+            Request::builder()
+                .uri("/api/watched-folders")
+                .header("x-rextto-token", "test-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        // An empty path is rejected.
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/watched-folders")
+                    .header("x-rextto-token", "test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"[{"path":"  ","enabled":true}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let watch = root.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/watched-folders")
+                    .header("x-rextto-token", "test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"[{{"path":{},"enabled":true,"recursive":true,"delete_after":true}}]"#,
+                        serde_json::to_string(&watch.to_string_lossy().to_string()).unwrap()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+
+        let view = app.clone().oneshot(get_view()).await.unwrap();
+        let body = to_bytes(view.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["items"][0]["path"], watch.to_string_lossy().as_ref());
+        assert_eq!(value["items"][0]["recursive"], true);
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }

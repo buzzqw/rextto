@@ -1649,7 +1649,7 @@ impl Database {
             [&normalized],
             |row| Ok((row.get::<_, Option<String>>(0)?.unwrap_or_default(), row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?.unwrap_or_default())),
         ).optional()? {
-            return Ok(Some(TorrentMeta { release: Release { torrent_url: None, title, magnet, source: "restored-db".into(), quality: Default::default(), kind: "series".into(), series: Some(series), season: Some(season), episode: Some(episode), is_pack: false, episode_range: vec![episode], year: None, discovered_at: Utc::now() } }));
+            return Ok(Some(TorrentMeta { release: Release { torrent_url: None, title, magnet, source: "restored-db".into(), quality: Default::default(), kind: "series".into(), series: Some(series), season: Some(season), episode: Some(episode), is_pack: false, episode_range: vec![episode], year: None, discovered_at: Utc::now(), size_bytes: 0, seeders: -1, peers: -1 } }));
         }
         if let Some((title, year, magnet)) = self
             .conn
@@ -1679,6 +1679,9 @@ impl Database {
                     is_pack: false,
                     episode_range: Vec::new(),
                     year: Some(year),
+                    size_bytes: 0,
+                    seeders: -1,
+                    peers: -1,
                     discovered_at: Utc::now(),
                 },
             }));
@@ -2950,6 +2953,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         }
     }
@@ -3096,6 +3102,9 @@ mod tests {
             is_pack: true,
             episode_range: vec![1, 2, 3, 4, 5, 6, 7, 8],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         db.register_torrent(&pack).unwrap();
@@ -3138,6 +3147,9 @@ mod tests {
             is_pack: true,
             episode_range: vec![0],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let fallback_hash = magnet_hash(&fallback.magnet).unwrap();
@@ -3529,6 +3541,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         assert_eq!(db.check_movie(&release).unwrap(), (true, "approved".into()));
@@ -3580,6 +3595,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         assert_eq!(db.check_movie(&old).unwrap(), (true, "approved".into()));
@@ -3631,6 +3649,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         db.check_movie(&movie).unwrap();
@@ -3682,6 +3703,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let mut series_release = release();
@@ -3814,6 +3838,9 @@ mod tests {
             is_pack: true,
             episode_range: vec![0],
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let score = pack.quality.score();
@@ -3854,6 +3881,7 @@ mod tests {
             quality: parse_quality("Neagley.S01E01-02.1080p.AMZN.WEB-DL.ITA.ENG.DDP5.1.H.264-G66"),
             kind: "series".into(), series: Some("Neagley".into()), season: Some(1), episode: Some(1),
             is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: Utc::now(),
+            size_bytes: 0, seeders: -1, peers: -1,
         };
         let (approved, reason) = db.check_series_manual_scored(
             &pack, pack.quality.score(), 200, &crate::models::ApprovalContext::default(),
@@ -3910,6 +3938,9 @@ mod tests {
             is_pack: true,
             episode_range: vec![1, 2],
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let score = pack.quality.score();

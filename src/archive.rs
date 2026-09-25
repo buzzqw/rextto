@@ -328,6 +328,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let releases: Vec<Release> = (1..=5).map(release).collect();
@@ -357,6 +360,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         let first = release(
@@ -405,6 +411,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         archive.save_batch(&[release]).unwrap();

@@ -42,6 +42,27 @@ fn attribute(start: &BytesStart<'_>, name: &str) -> Option<String> {
     })
 }
 
+/// Reads a Torznab `<...:attr name="seeders" value="5"/>` element into the
+/// per-item facts. Unknown or non-numeric values leave the current value
+/// untouched (they stay `None`).
+fn apply_torznab_attr(
+    start: &BytesStart<'_>,
+    size_bytes: &mut Option<f64>,
+    seeders: &mut Option<i64>,
+    peers: &mut Option<i64>,
+) {
+    let name = attribute(start, "name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let value = attribute(start, "value").unwrap_or_default();
+    match name.as_str() {
+        "seeders" => *seeders = value.trim().parse::<i64>().ok().filter(|value| *value >= 0),
+        "peers" | "leechers" => *peers = value.trim().parse::<i64>().ok().filter(|value| *value >= 0),
+        "size" => *size_bytes = value.trim().parse::<f64>().ok().filter(|value| *value > 0.0),
+        _ => {}
+    }
+}
+
 fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
@@ -52,6 +73,11 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
     let mut torrent_url = String::new();
     let mut description = String::new();
     let mut size_bytes: Option<f64> = None;
+    // Torznab attributes (`<torznab:attr name="seeders" value="5"/>`) or plain
+    // `<seeders>` elements. Unknown stays `None` so policy rules that need a
+    // peer count simply do not fire instead of rejecting a release.
+    let mut seeders: Option<i64> = None;
+    let mut peers: Option<i64> = None;
     let mut discovered_at = Utc::now();
     let mut out = Vec::new();
     loop {
@@ -76,6 +102,8 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                     torrent_url.clear();
                     description.clear();
                     size_bytes = None;
+                    seeders = None;
+                    peers = None;
                     discovered_at = Utc::now();
                 }
                 if in_item {
@@ -83,6 +111,9 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                         if let Some(value) = attribute(&start, "length") {
                             size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                         }
+                    }
+                    if name == "attr" {
+                        apply_torznab_attr(&start, &mut size_bytes, &mut seeders, &mut peers);
                     }
                     if let Some(value) =
                         attribute(&start, "href").or_else(|| attribute(&start, "url"))
@@ -102,6 +133,9 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                     if let Some(value) = attribute(&start, "length") {
                         size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                     }
+                }
+                if name == "attr" {
+                    apply_torznab_attr(&start, &mut size_bytes, &mut seeders, &mut peers);
                 }
                 if name == "link" || name == "enclosure" || name == "content" {
                     if let Some(value) =
@@ -126,6 +160,12 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                 }
                 if current == "size" {
                     size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
+                }
+                if current == "seeders" {
+                    seeders = value.trim().parse::<i64>().ok().filter(|v| *v >= 0);
+                }
+                if current == "peers" || current == "leechers" {
+                    peers = value.trim().parse::<i64>().ok().filter(|v| *v >= 0);
                 }
                 if matches!(
                     current.as_str(),
@@ -158,6 +198,12 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                 if current == "size" {
                     size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                 }
+                if current == "seeders" {
+                    seeders = value.trim().parse::<i64>().ok().filter(|v| *v >= 0);
+                }
+                if current == "peers" || current == "leechers" {
+                    peers = value.trim().parse::<i64>().ok().filter(|v| *v >= 0);
+                }
                 if matches!(
                     current.as_str(),
                     "pubdate" | "published" | "updated" | "date"
@@ -188,13 +234,19 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                             (mb > 0.0).then_some(mb)
                         });
                     if !size_mb.is_some_and(|mb| mb < 50.0) {
-                        if let Some(release) = parse_release_source(
+                        if let Some(mut release) = parse_release_source(
                             &title,
                             &magnet,
                             (!torrent_url.is_empty()).then_some(torrent_url.as_str()),
                             source,
                             discovered_at,
                         ) {
+                            release.size_bytes = size_bytes
+                                .map(|bytes| bytes.round() as i64)
+                                .filter(|bytes| *bytes > 0)
+                                .unwrap_or(0);
+                            release.seeders = seeders.unwrap_or(-1);
+                            release.peers = peers.unwrap_or(-1);
                             out.push(release);
                         }
                     }
@@ -969,7 +1021,23 @@ fn parse_prowlarr_json(body: &str, source: &str) -> Result<Vec<Release>> {
             .and_then(serde_json::Value::as_str)
             .map(|indexer| format!("prowlarr:{indexer}"))
             .unwrap_or_else(|| source.to_string());
-        if let Some(release) = crate::parser::parse_release(title, magnet, &label) {
+        if let Some(mut release) = crate::parser::parse_release(title, magnet, &label) {
+            release.size_bytes = item
+                .get("size")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|size| *size > 0)
+                .unwrap_or(0);
+            release.seeders = item
+                .get("seeders")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|value| *value >= 0)
+                .unwrap_or(-1);
+            release.peers = item
+                .get("leechers")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| item.get("peers").and_then(serde_json::Value::as_i64))
+                .filter(|value| *value >= 0)
+                .unwrap_or(-1);
             out.push(release);
         }
     }

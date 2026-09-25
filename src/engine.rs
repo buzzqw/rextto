@@ -286,16 +286,7 @@ impl Engine {
         let mut seen = std::collections::HashSet::new();
         let mut kept = Vec::with_capacity(all.len());
         for release in std::mem::take(&mut all) {
-            if let Some(reason) = cfg.release_denied_reason(&release) {
-                tracing::debug!(
-                    title = %release.title,
-                    source = %release.source,
-                    reason,
-                    "🚫 FILTER rejected"
-                );
-                continue;
-            }
-            if let Some(reason) = cfg.source_filter_denied_reason(&release) {
+            if let Some(reason) = cfg.all_release_denied_reason(&release) {
                 tracing::debug!(
                     title = %release.title,
                     source = %release.source,

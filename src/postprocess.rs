@@ -1618,6 +1618,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         // Gruppi vuoti `[]`: NON conforme, va rinominato per ripulirlo.
@@ -1667,6 +1670,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![10],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         let file = Path::new(
@@ -1723,6 +1729,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         assert_eq!(
@@ -1753,6 +1762,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![3],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         assert_eq!(
@@ -1780,6 +1792,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         assert_eq!(
@@ -1826,6 +1841,7 @@ mod tests {
             source: "test".into(), quality: Default::default(), kind: "series".into(),
             series: Some("Example".into()), season: Some(3), episode: Some(1),
             is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: chrono::Utc::now(),
+            size_bytes: 0, seeders: -1, peers: -1,
         };
         let files = matching_pack_files(&root, &release).unwrap();
         assert_eq!(files.len(), 2);
@@ -1845,6 +1861,7 @@ mod tests {
             source: "test".into(), quality: Default::default(), kind: "series".into(),
             series: Some("Example".into()), season: Some(3), episode: Some(0),
             is_pack: true, episode_range: vec![0], year: None, discovered_at: chrono::Utc::now(),
+            size_bytes: 0, seeders: -1, peers: -1,
         };
         assert!(matching_pack_files(&root, &release).unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
@@ -1861,6 +1878,7 @@ mod tests {
             source: "test".into(), quality: Default::default(), kind: "series".into(),
             series: Some("Example".into()), season: Some(3), episode: Some(1),
             is_pack: true, episode_range: vec![1, 2], year: None, discovered_at: chrono::Utc::now(),
+            size_bytes: 0, seeders: -1, peers: -1,
         };
         assert!(matching_pack_files(&root, &release).unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
@@ -1911,6 +1929,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         let renamed = rename_episode(&root, &release, &cfg, &TmdbClient::new(None))
@@ -1953,6 +1974,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![2],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         let target = preview_episode_rename(&root, &release, &cfg, &TmdbClient::new(None))
@@ -1993,6 +2017,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         let renamed = rename_movie(&root, &release, &cfg, &TmdbClient::new(None))
@@ -2045,6 +2072,9 @@ mod tests {
             is_pack: false,
             episode_range: vec![1],
             year: None,
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         assert_eq!(
@@ -2080,6 +2110,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2024),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: chrono::Utc::now(),
         };
         assert!(download_dir_for(&release, &cfg).is_none());

@@ -15,6 +15,8 @@ disk).
 > 🇮🇹 Italiano: [`README.it.md`](README.it.md)
 > 📖 Full manual: [`docs/MANUAL.en.md`](docs/MANUAL.en.md) ·
 > [`docs/MANUAL.it.md`](docs/MANUAL.it.md)
+> 🔬 Feature research (Sonarr/Radarr/qBittorrent/BiglyBT/autobrr):
+> [`docs/FEATURE-RESEARCH.md`](docs/FEATURE-RESEARCH.md)
 
 [![Donate](https://img.shields.io/badge/❤️_Support_Rextto-PayPal-00457C.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=azanzani@gmail.com&item_name=Support+Rextto+Project)
 
@@ -43,6 +45,10 @@ disk).
   English**, with log viewer, health, charts and maintenance tools.
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
+- **Release policy** — ordered accept/reject/score rules with
+  wildcard/regex terms, scored custom formats, per-quality size envelopes,
+  external event hooks and a live simulator, all editable from the new
+  *Automation* page.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
   They include databases and configuration, not media files or torrent state.
 
@@ -202,6 +208,7 @@ enabled.
 | **Archive** | Past releases; *Seen from feed* for movies/series |
 | **Comics** | GetComics and weekly packs |
 | **Configuration** | Sources, libtorrent, scoring, renaming, paths, notifications |
+| **Automation** | Release rules, custom formats, size limits, event hooks, watched folders |
 | **Integrations** | Trakt, Simkl, Jellyfin, Plex |
 | **Maintenance** | Backups, duplicates, scoring, restart |
 | **Health, Logs, Charts** | Diagnostics and monitoring |

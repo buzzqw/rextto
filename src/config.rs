@@ -254,6 +254,18 @@ pub struct Config {
     pub state_dir: PathBuf,
     #[serde(default = "default_api_token")]
     pub api_token: Option<String>,
+    // Release policy (rules, custom formats, size envelopes). Persisted in the
+    // `settings` table under the `release_rules`, `custom_formats`,
+    // `size_rules` and `min_custom_format_score` keys; the JSON config file
+    // remains a valid override for tests and one-off runs.
+    #[serde(default)]
+    pub release_rules: Vec<crate::policy::ReleaseRule>,
+    #[serde(default)]
+    pub custom_formats: Vec<crate::policy::CustomFormat>,
+    #[serde(default)]
+    pub size_rules: Vec<crate::policy::SizeRule>,
+    #[serde(default)]
+    pub min_custom_format_score: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -639,6 +651,10 @@ impl Default for Config {
             rename_format: "base".into(),
             rename_template: "{Serie} - {Stagione}{Episodio} - {Titolo} [{Risoluzione}][{Lingue}]".into(),
             api_token: default_api_token(),
+            release_rules: Vec::new(),
+            custom_formats: Vec::new(),
+            size_rules: Vec::new(),
+            min_custom_format_score: None,
         }
     }
 }
@@ -1131,8 +1147,65 @@ impl Config {
     }
 
     pub fn release_allowed(&self, release: &crate::models::Release) -> bool {
-        self.release_denied_reason(release).is_none()
-            && self.source_filter_denied_reason(release).is_none()
+        self.all_release_denied_reason(release).is_none()
+    }
+
+    /// Current release policy assembled from the configuration.
+    pub fn policy(&self) -> crate::policy::Policy {
+        crate::policy::Policy {
+            release_rules: self.release_rules.clone(),
+            custom_formats: self.custom_formats.clone(),
+            size_rules: self.size_rules.clone(),
+            min_custom_format_score: self
+                .min_custom_format_score
+                .unwrap_or_else(crate::policy::default_min_format_score),
+        }
+    }
+
+    /// Evaluate the configured policy for one release without cloning it.
+    pub fn policy_decision(
+        &self,
+        release: &crate::models::Release,
+    ) -> crate::policy::PolicyDecision {
+        crate::policy::Policy::evaluate_parts(
+            release,
+            &self.release_rules,
+            &self.custom_formats,
+            &self.size_rules,
+            self.min_custom_format_score
+                .unwrap_or_else(crate::policy::default_min_format_score),
+        )
+    }
+
+    /// Reason the configurable release policy refuses a release, if any.
+    pub fn policy_denied_reason(&self, release: &crate::models::Release) -> Option<String> {
+        self.policy_decision(release).reason()
+    }
+
+    /// Every global rejection reason combined (static filters, per-source
+    /// filters and the release policy). Used for logging and the manual search
+    /// `allowed` flag so all layers speak with one voice.
+    pub fn all_release_denied_reason(&self, release: &crate::models::Release) -> Option<String> {
+        if let Some(reason) = self.release_denied_reason(release) {
+            return Some(reason.to_string());
+        }
+        if let Some(reason) = self.source_filter_denied_reason(release) {
+            return Some(reason);
+        }
+        self.policy_denied_reason(release)
+    }
+
+    /// Score used for acquisition and upgrade decisions: the legacy additive
+    /// quality score, the movie subtitle bonus and the policy delta (score
+    /// rules + custom formats). Sorting and the upgrade threshold read this.
+    pub fn release_score(&self, release: &crate::models::Release) -> i64 {
+        let mut score = release.quality.score_with_settings(&self.settings);
+        if release.kind == "movie" {
+            if let Some(movie) = self.find_movie_match(&release.title, release.year) {
+                score += Self::movie_subtitle_bonus(movie, &release.quality);
+            }
+        }
+        score + self.policy_decision(release).score_delta
     }
 
     /// Reason a release is refused by a per-source filter, if any. Unlike the
@@ -1231,6 +1304,26 @@ impl Config {
             .or_else(|| self.settings.get("max_age_days"))
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        // Release policy. A present settings key is authoritative (it is what
+        // the UI writes); the JSON config remains a fallback for tests and
+        // one-off runs, so an absent key must not clear the JSON value.
+        if let Some(value) = self.settings.get("release_rules") {
+            self.release_rules = serde_json::from_str(value).unwrap_or_default();
+        }
+        if let Some(value) = self.settings.get("custom_formats") {
+            self.custom_formats = serde_json::from_str(value).unwrap_or_default();
+        }
+        if let Some(value) = self.settings.get("size_rules") {
+            self.size_rules = serde_json::from_str(value).unwrap_or_default();
+        }
+        if let Some(value) = self.settings.get("min_custom_format_score") {
+            let value = value.trim();
+            self.min_custom_format_score = if value.is_empty() {
+                None
+            } else {
+                value.parse::<i64>().ok()
+            };
+        }
         if let Some(value) = self.settings.get("_migrated_series") {
             self.series = serde_json::from_str(value).unwrap_or_default();
         }
@@ -2303,6 +2396,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now() - chrono::Duration::days(age_days),
         };
         assert!(cfg.release_allowed(&release("Movie.1080p.ITA", 1)));
@@ -2332,6 +2428,9 @@ mod tests {
             is_pack: false,
             episode_range: Vec::new(),
             year: Some(2026),
+            size_bytes: 0,
+            seeders: -1,
+            peers: -1,
             discovered_at: Utc::now(),
         };
         // Blocked: matching source and keyword.
@@ -2343,6 +2442,91 @@ mod tests {
         // Disabled filter never blocks.
         cfg.source_filters[0].enabled = false;
         assert!(cfg.release_allowed(&release("Film 1080p x265", "ExtTo - MIRCrewRS")));
+    }
+
+    #[test]
+    fn policy_rules_formats_and_size_envelopes_drive_decisions() {
+        let mut cfg = Config::default();
+        // Isolate the policy from the built-in blacklist (which already knows
+        // "cam") so the rule reason is the one under test.
+        cfg.blacklist = Vec::new();
+        cfg.release_rules = vec![
+            crate::policy::ReleaseRule {
+                name: "block cam".into(),
+                enabled: true,
+                match_terms: vec!["CAM".into()],
+                action: crate::policy::RuleAction::Reject {
+                    reason: "cam rip".into(),
+                },
+                ..Default::default()
+            },
+            crate::policy::ReleaseRule {
+                name: "prefer x265".into(),
+                enabled: true,
+                match_terms: vec!["x265".into()],
+                action: crate::policy::RuleAction::Score { score: 250 },
+                ..Default::default()
+            },
+        ];
+        cfg.custom_formats = vec![crate::policy::CustomFormat {
+            name: "remux".into(),
+            enabled: true,
+            score: 400,
+            conditions: vec![crate::policy::FormatCondition {
+                kind: crate::policy::ConditionKind::Source,
+                value: "remux".into(),
+                ..Default::default()
+            }],
+        }];
+        cfg.size_rules = vec![crate::policy::SizeRule {
+            resolution: "1080p".into(),
+            min_mb: 500,
+            max_mb: 0,
+        }];
+        let release = |title: &str| crate::models::Release { torrent_url: None,
+            title: title.into(),
+            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+            source: "test".into(),
+            quality: crate::parser::parse_quality(title),
+            kind: "movie".into(),
+            series: None,
+            season: None,
+            episode: None,
+            is_pack: false,
+            episode_range: Vec::new(),
+            year: Some(2026),
+            size_bytes: 4000 * 1_048_576,
+            seeders: -1,
+            peers: -1,
+            discovered_at: Utc::now(),
+        };
+
+        // A block rule rejects even though the score would otherwise be high.
+        let cam = release("Movie.2026.CAM.1080p.x265");
+        assert!(!cfg.release_allowed(&cam));
+        assert!(cfg
+            .all_release_denied_reason(&cam)
+            .unwrap()
+            .contains("cam rip"));
+
+        // Score rules and custom formats add to the acquisition score.
+        let plain = release("Movie.2026.1080p.WEB-DL");
+        let boosted = release("Movie.2026.1080p.REMUX.x265");
+        let base = plain.quality.score_with_settings(&cfg.settings);
+        assert_eq!(cfg.release_score(&plain), base);
+        assert_eq!(
+            cfg.release_score(&boosted),
+            boosted.quality.score_with_settings(&cfg.settings) + 250 + 400
+        );
+
+        // A 1080p release under the minimum size is rejected by the envelope.
+        let mut tiny = release("Movie.2026.1080p.WEB-DL");
+        tiny.size_bytes = 100 * 1_048_576;
+        assert!(!cfg.release_allowed(&tiny));
+        assert!(cfg
+            .all_release_denied_reason(&tiny)
+            .unwrap()
+            .contains("below the 1080p minimum"));
     }
 
     #[test]

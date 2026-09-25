@@ -759,6 +759,9 @@ pub fn parse_release_source(
         episode_range: range,
         year,
         discovered_at,
+        size_bytes: 0,
+        seeders: -1,
+        peers: -1,
     })
 }
 
