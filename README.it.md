@@ -51,8 +51,9 @@ o disco locale).
 - **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo,
   consultabile anche per ciò che non è monitorato.
 - **Regole di sanità automatiche** — sottotitoli hardcoded e dimensioni assurde
-  (soglie per risoluzione derivate da un archivio reale) vengono rifiutati con
-  una riga `INFO` chiara nel log; nessun numero da configurare.
+  (soglie per risoluzione derivate da un archivio reale) vengono rifiutati;
+  nessun numero da configurare. Gli scarti sono eventi ordinari e vengono
+  registrati a `DEBUG`, così il log `INFO` di produzione resta pulito.
 - **Regolazione acquisizione** — delay prima del download con coda di attesa e
   interruttore per-titolo "Consenti aggiornamenti".
 - **Ispezione reale dei file** — i dati `ffprobe` (HDR, codec, audio, lingue)
@@ -288,7 +289,8 @@ Le righe hanno formato `data ora LIVELLO [componente] messaggio · campo: valore
 Nome o titolo sono sempre presenti nei messaggi torrent; l'hash resta soltanto un
 campo tecnico per correlare un errore. `INFO` mostra il percorso normale, `WARN`/
 `ERROR` spiegano cosa non è riuscito e quale risorsa è coinvolta, `DEBUG` aggiunge
-i dettagli diagnostici quando è abilitato.
+i dettagli diagnostici quando è abilitato (anche gli scarti ordinari di filtro e
+sanità vivono qui).
 
 ### Le sezioni della UI
 

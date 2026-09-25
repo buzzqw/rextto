@@ -220,9 +220,10 @@ la barra “Salva tutte”.
 
 I controlli di sanità delle release sono **automatici** e non configurabili:
 sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione
-derivata da un archivio reale) vengono rifiutati, con una riga a `INFO` nel log
-che riporta titolo, risoluzione, dimensione e motivo solo per titoli monitorati;
-le release non pertinenti vengono scartate senza log. Anche la protezione dagli
+derivata da un archivio reale) vengono rifiutati. Gli scarti sono eventi
+ordinari e vengono registrati a `DEBUG` con titolo, risoluzione, dimensione e
+motivo, così il log `INFO` di produzione resta pulito; abilita il debug per
+vederli. Anche la protezione dagli
 episodi vecchi è fissa: Rextto non riscarica un episodio precedente fuori dai
 buchi riconosciuti quando possiede già episodi successivi (gap-fill e azioni
 manuali restano sempre permessi). Per congelare un titolo usa **Consenti

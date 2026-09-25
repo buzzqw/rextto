@@ -54,8 +54,9 @@ disk).
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
 - **Automatic sanity rules** — hardcoded subtitles and absurd file sizes
-  (per-resolution floors derived from a real archive) are rejected with a clear
-  `INFO` log line; no numbers to configure.
+  (per-resolution floors derived from a real archive) are rejected; no numbers
+  to configure. Rejections are routine and logged at `DEBUG`, so the production
+  `INFO` log stays clean.
 - **Acquisition tuning** — delay before grabbing with a pending queue and a
   per-title "allow upgrades" switch.
 - **Real media inspection** — `ffprobe` results (HDR, codec, audio, languages)
@@ -288,7 +289,7 @@ Each line uses `date time LEVEL [component] message · key: value`. Torrent line
 always include a readable name or title; the hash is only a technical correlation
 field for errors. `INFO` describes the normal path, `WARN`/`ERROR` explain the
 failed operation and affected resource, and `DEBUG` adds diagnostic detail when
-enabled.
+enabled (routine filter and sanity rejections live here too).
 
 ### UI sections
 
