@@ -1190,12 +1190,27 @@ impl LibtorrentClient {
         cfg: &Config,
         preferred_path: Option<&std::path::Path>,
     ) -> Result<Option<String>> {
+        self.add_torrent_file_with_options(torrent_path, cfg, preferred_path, &AddOptions::default())
+    }
+
+    /// Like [`Self::add_torrent_file_with_path`] but applies [`AddOptions`].
+    pub fn add_torrent_file_with_options(
+        &self,
+        torrent_path: &std::path::Path,
+        cfg: &Config,
+        preferred_path: Option<&std::path::Path>,
+        options: &AddOptions,
+    ) -> Result<Option<String>> {
         let save_path = preferred_path
             .filter(|path| path.is_dir())
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| Self::preferred_download_path(cfg));
         fs::create_dir_all(&save_path)?;
-        self.add_torrent_file(torrent_path, &save_path)
+        let hash = self.add_torrent_file_ex(torrent_path, &save_path, options)?;
+        if let Some(ref hash) = hash {
+            self.register_deferred_options(hash, "", options);
+        }
+        Ok(hash)
     }
 
     pub fn list(&self) -> Vec<TorrentView> {

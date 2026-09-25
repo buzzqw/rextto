@@ -4829,6 +4829,16 @@ async fn send_magnet(
         );
     }
     let cfg = latest_config(&s);
+    let start_paused = input.start_paused;
+    let no_rename = input.no_rename;
+    let options = crate::libtorrent::AddOptions {
+        paused: start_paused,
+        sequential: input.sequential,
+        seed_mode: input.seed_mode,
+        queue_top: input.queue_top,
+        first_last: input.first_last,
+        stop_at_metadata: input.stop_at_metadata,
+    };
     let target = input.magnet.trim().to_string();
     if target.starts_with("magnet:") {
         let preferred = input
@@ -4837,23 +4847,17 @@ async fn send_magnet(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(std::path::Path::new);
-        return match s.torrents.add_with_path(&target, &cfg, preferred) {
+        return match s.torrents.add_with_options(&target, &cfg, preferred, &options) {
             Ok(true) => {
                 let hash = crate::utils::magnet_hash(&target);
-                let mut paused = false;
-                if input.start_paused {
-                    if let Some(hash) = &hash {
-                        paused = s.torrents.pause(hash).unwrap_or(false);
-                    }
-                }
-                if input.no_rename {
+                if no_rename {
                     if let Some(hash) = &hash {
                         let _ = s.db.lock().unwrap().set_torrent_no_rename(hash, true);
                     }
                 }
                 (
                     StatusCode::ACCEPTED,
-                    Json(serde_json::json!({"ok":true,"kind":"magnet","start_paused":paused})),
+                    Json(serde_json::json!({"ok":true,"kind":"magnet","start_paused":start_paused})),
                 )
             }
             Ok(false) => (
@@ -4922,10 +4926,15 @@ async fn send_magnet(
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
         );
     }
-    match s.torrents.add_torrent_file(&path, &cfg.libtorrent_dir) {
+    match s.torrents.add_torrent_file_with_options(
+        &path,
+        &cfg,
+        Some(&cfg.libtorrent_dir),
+        &options,
+    ) {
         Ok(Some(hash)) => {
             let _ = std::fs::remove_file(&path);
-            if input.no_rename {
+            if no_rename {
                 let _ = s.db.lock().unwrap().set_torrent_no_rename(&hash, true);
             }
             (
@@ -8615,7 +8624,7 @@ async fn add_parsed_release(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let source = release.magnet.trim().to_string();
     if is_torrent_url(&source) {
-        return match download_and_add(s, &source).await {
+        return match download_and_add(s, &source, &crate::libtorrent::AddOptions::default()).await {
             Ok(Some(hash)) => {
                 // Registra sotto l'hash reale così il post-processing ha i metadati.
                 release.magnet = format!("magnet:?xt=urn:btih:{hash}");
@@ -8690,7 +8699,11 @@ fn is_torrent_url(value: &str) -> bool {
 /// Scarica un `.torrent` da un URL e lo aggiunge a libtorrent, restituendo
 /// l'infohash (o `None` se era un duplicato). Un file temporaneo evita di
 /// passare i byte al bridge nativo.
-async fn download_and_add(s: &AppState, url: &str) -> Result<Option<String>, String> {
+async fn download_and_add(
+    s: &AppState,
+    url: &str,
+    options: &crate::libtorrent::AddOptions,
+) -> Result<Option<String>, String> {
     let client = reqwest::Client::builder()
         .user_agent("rextto/0.1")
         .timeout(std::time::Duration::from_secs(60))
@@ -8709,7 +8722,9 @@ async fn download_and_add(s: &AppState, url: &str) -> Result<Option<String>, Str
         .state_dir
         .join(format!(".manual-{}.torrent", uuid::Uuid::new_v4()));
     std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
-    let result = s.torrents.add_torrent_file_with_path(&path, &s.cfg, None);
+    let result = s
+        .torrents
+        .add_torrent_file_with_options(&path, &s.cfg, None, options);
     let _ = std::fs::remove_file(&path);
     result.map_err(|error| error.to_string())
 }
@@ -8725,7 +8740,7 @@ async fn add_raw_magnet(s: &AppState, source: &str) -> (StatusCode, Json<serde_j
     }
     let source = source.trim();
     if is_torrent_url(source) {
-        return match download_and_add(s, source).await {
+        return match download_and_add(s, source, &crate::libtorrent::AddOptions::default()).await {
             Ok(Some(_)) => (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true}))),
             Ok(None) => (
                 StatusCode::CONFLICT,

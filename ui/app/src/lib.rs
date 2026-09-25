@@ -1066,6 +1066,43 @@ fn Panel(title: &'static str, children: Children) -> impl IntoView {
     }
 }
 
+/// Quality selector shared by the series/movie forms. Besides the legacy
+/// resolution ranges it lists every configured quality profile as
+/// `profile:<name>`, so profiles are first-class in the edit masks.
+#[component]
+fn QualitySelect(data: RwSignal<Data>, value: RwSignal<String>) -> impl IntoView {
+    let options = Signal::derive(move || {
+        let mut items: Vec<(String, String)> = QUALITY_OPTIONS
+            .iter()
+            .map(|(value, label)| ((*value).to_string(), (*label).to_string()))
+            .collect();
+        if let Some(profiles) = data
+            .get()
+            .config
+            .get("quality_profiles")
+            .and_then(Value::as_array)
+        {
+            for profile in profiles {
+                if let Some(name) = profile.get("name").and_then(Value::as_str) {
+                    if !name.trim().is_empty() {
+                        items.push((format!("profile:{name}"), format!("Profilo: {name}")));
+                    }
+                }
+            }
+        }
+        let current = value.get();
+        if !current.is_empty() && !items.iter().any(|(item, _)| item == &current) {
+            items.push((current, "Personalizzato".into()));
+        }
+        items
+    });
+    view! {
+        <select prop:value=move || value.get() on:change=move |event| value.set(event_target_value(&event))>
+            {move || options.get().into_iter().map(|(option, label)| view! { <option value=option>{label}</option> }).collect_view()}
+        </select>
+    }
+}
+
 #[component]
 fn Empty(text: &'static str) -> impl IntoView {
     let message = ctx_tr(text);
@@ -2312,6 +2349,11 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     let add_save_path = RwSignal::new(String::new());
     let add_start = RwSignal::new(true);
     let add_no_rename = RwSignal::new(false);
+    let add_sequential = RwSignal::new(false);
+    let add_seed_mode = RwSignal::new(false);
+    let add_queue_top = RwSignal::new(false);
+    let add_first_last = RwSignal::new(false);
+    let add_metadata_only = RwSignal::new(false);
     // Configured default download folder, proposed as the placeholder so an
     // empty field keeps the automatic RAM-disk/temp/final tier.
     let default_download_path = Signal::derive(move || {
@@ -2413,7 +2455,17 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     event.prevent_default();
                     let value = magnet.get();
                     if !value.trim().is_empty() {
-                        run_post(data, "/api/send-magnet", Some(json!({"magnet": value, "save_path": add_save_path.get(), "start_paused": !add_start.get(), "no_rename": add_no_rename.get()})), "Torrent accodato");
+                        run_post(data, "/api/send-magnet", Some(json!({
+                            "magnet": value,
+                            "save_path": add_save_path.get(),
+                            "start_paused": !add_start.get(),
+                            "no_rename": add_no_rename.get(),
+                            "sequential": add_sequential.get(),
+                            "seed_mode": add_seed_mode.get(),
+                            "queue_top": add_queue_top.get(),
+                            "first_last": add_first_last.get(),
+                            "stop_at_metadata": add_metadata_only.get()
+                        })), "Torrent accodato");
                         magnet.set(String::new());
                     }
                 }>
@@ -2444,9 +2496,14 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                             <button class="btn primary" title=ctx_tr("Aggiungi il magnet o il link .torrent alla sessione")>{ctx_tr("Aggiungi")}</button>
                         </div>
                     </div>
-                    <div class="toolbar" style="margin-top:10px">
+                    <div class="toolbar" style="margin-top:10px;flex-wrap:wrap">
                         <label class="check" title=ctx_tr("Se disattivato, il torrent viene aggiunto in pausa e non parte finché non lo riprendi")><input type="checkbox" prop:checked=add_start on:change=move |event| add_start.set(event_target_checked(&event)) /> <span>{ctx_tr("Scarica subito")}</span></label>
                         <label class="check" title=ctx_tr("Il torrent non verrà rinominato al termine del download")><input type="checkbox" prop:checked=add_no_rename on:change=move |event| add_no_rename.set(event_target_checked(&event)) /> <span>{ctx_tr("Non rinominare")}</span></label>
+                        <label class="check" title=ctx_tr("Scarica i file in ordine sequenziale (utile per la visione immediata)")><input type="checkbox" prop:checked=add_sequential on:change=move |event| add_sequential.set(event_target_checked(&event)) /> <span>{ctx_tr("Sequenziale")}</span></label>
+                        <label class="check" title=ctx_tr("Salta la verifica dell'hash: da usare solo se i dati sono già completi")><input type="checkbox" prop:checked=add_seed_mode on:change=move |event| add_seed_mode.set(event_target_checked(&event)) /> <span>{ctx_tr("Salta verifica")}</span></label>
+                        <label class="check" title=ctx_tr("Metti il torrent in cima alla coda")><input type="checkbox" prop:checked=add_queue_top on:change=move |event| add_queue_top.set(event_target_checked(&event)) /> <span>{ctx_tr("In cima alla coda")}</span></label>
+                        <label class="check" title=ctx_tr("Dai priorità al primo e all'ultimo pezzo di ogni file")><input type="checkbox" prop:checked=add_first_last on:change=move |event| add_first_last.set(event_target_checked(&event)) /> <span>{ctx_tr("Primo/ultimo pezzo")}</span></label>
+                        <label class="check" title=ctx_tr("Scarica solo i metadati e metti in pausa: utile per valutare la release prima di partire")><input type="checkbox" prop:checked=add_metadata_only on:change=move |event| add_metadata_only.set(event_target_checked(&event)) /> <span>{ctx_tr("Solo metadati")}</span></label>
                     </div>
                 </form>
             </Panel>
@@ -3241,7 +3298,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                 <Show when=move || mode == "movies">
                                     <label class="field" title=ctx_tr("Anno")><span>{ctx_tr("Anno")}</span><input prop:value=year on:input=move |event| year.set(event_target_value(&event)) placeholder=ctx_tr("2024") /></label>
                                 </Show>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
                                  <Show when=move || mode == "series">
                                      <label class="field" title=ctx_tr("Preset lingua o codici custom separati da virgola")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                                  </Show>
@@ -3813,7 +3870,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                             </div>
                             <label class="field" title=ctx_tr("Stagioni monitorate, es. 1-3,5+ (1+ = tutte)")><span>{ctx_tr("Stagioni")}</span><input prop:value=seasons on:input=move |event| seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
                             <label class="field" title=ctx_tr("Archivia gli episodi in una cartella Stagione 01, Stagione 02, … dentro la cartella archivio della serie")><span>{ctx_tr("Sottocartelle per stagione")}</span><input type="checkbox" prop:checked=move || season_subfolders.get() on:change=move |_| season_subfolders.update(|value| *value = !*value) /></label>
-                            <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                            <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
                             <label class="field" title=ctx_tr("Scegli un preset oppure inserisci codici custom separati da virgole; tutte le lingue indicate sono richieste")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                             <label class="field span-2" title=ctx_tr("Nomi alternativi con cui riconoscere la serie (separati da virgola)")><span>{ctx_tr("Alias / nomi alternativi (separati da virgola)")}</span><input prop:value=aliases on:input=move |event| aliases.set(event_target_value(&event)) /></label>
                             <label class="field" title=ctx_tr("ID TMDB della serie (per titoli episodi e poster)")><span>{ctx_tr("TMDB ID")}</span><input prop:value=tmdb_id on:input=move |event| tmdb_id.set(event_target_value(&event)) /></label>
@@ -4473,7 +4530,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                              metadata_open.set(true);
                                          }>{ctx_tr("Aggiorna da TMDB/TVDB")}</button>
                                      </div>
-                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <div class="grid-2" style="grid-column: 1 / -1">
                                     <label class="field" title=ctx_tr("ID numerico TMDB del film. Se impostato viene usato per i metadati (titolo, trama, locandina, cast) al posto della ricerca per nome.")><span>{ctx_tr("TMDB ID")}</span><input prop:value=movie_tmdb_id on:input=move |event| movie_tmdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 27205") /></label>
@@ -4897,7 +4954,7 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                                 });
                             }>
                                 <label class="field span-full" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=move || pending.get().map(|item| text(&item, "name", "")).unwrap_or_default() readonly /></label>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=add_quality on:change=move |event| add_quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=add_quality /></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=add_language on:change=move |event| add_language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <Show when=move || pending.get().map(|item| text(&item, "kind", "series") == "series").unwrap_or(true)>
                                     <label class="field" title=ctx_tr("Quali stagioni monitorare, es. 1-3,5+")><span>{ctx_tr("Stagioni")}</span><input prop:value=add_seasons on:input=move |event| add_seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
@@ -6233,6 +6290,21 @@ fn QualityProfilesPanel() -> impl IntoView {
                 }).collect_view()}
             </div>
             <div class="toolbar">
+                <button class="btn sm" title=ctx_tr("Aggiunge profili pronti all'uso come in Sonarr/Radarr, senza toccare quelli esistenti") on:click=move |_| profiles.update(|items| {
+                    let defaults = [
+                        json!({"name":"Qualsiasi","allowed":[],"cutoff":"","upgrade_allowed":true}),
+                        json!({"name":"Best","allowed":["2160p","1080p","720p"],"cutoff":"2160p","upgrade_allowed":true}),
+                        json!({"name":"4K","allowed":["2160p","1080p"],"cutoff":"2160p","upgrade_allowed":true}),
+                        json!({"name":"1080p","allowed":["1080p","720p"],"cutoff":"1080p","upgrade_allowed":true}),
+                        json!({"name":"720p","allowed":["720p","576p"],"cutoff":"720p","upgrade_allowed":true}),
+                    ];
+                    for candidate in defaults {
+                        let name = candidate.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                        if !items.iter().any(|item| raw(item, "name", "") == name) {
+                            items.push(candidate);
+                        }
+                    }
+                })>{ctx_tr("Profili predefiniti")}</button>
                 <button class="btn sm" on:click=move |_| profiles.update(|items| items.push(json!({"name":"Nuovo profilo","allowed":[],"cutoff":"","upgrade_allowed":true})))>{ctx_tr("Aggiungi profilo")}</button>
                 <button class="btn primary" on:click=move |_| {
                     let payload = Value::Array(profiles.get());

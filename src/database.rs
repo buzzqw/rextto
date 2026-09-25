@@ -1507,6 +1507,33 @@ impl Database {
         Ok(())
     }
 
+    /// Highest resolution rank among archived episodes *after* the given one
+    /// (same season or later). Used to let the opt-in smart-episode guard still
+    /// accept a genuine quality upgrade below the profile cutoff.
+    pub fn later_archived_max_resolution_rank(
+        &self,
+        series_name: &str,
+        season: i64,
+        episode: i64,
+    ) -> Result<Option<i32>> {
+        let mut statement = self.conn.prepare(
+            "SELECT COALESCE(e.title,'') FROM episodes e JOIN series s ON s.id=e.series_id \
+             WHERE s.name=?1 AND (e.season > ?2 OR (e.season = ?2 AND e.episode > ?3)) \
+             AND (e.downloaded_at IS NOT NULL OR COALESCE(e.archive_path,'') <> '')",
+        )?;
+        let rows = statement.query_map(params![series_name, season, episode], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut best: Option<i32> = None;
+        for row in rows {
+            let rank = crate::parser::parse_quality(&row?).resolution_rank();
+            if rank > 0 && best.is_none_or(|current| rank > current) {
+                best = Some(rank);
+            }
+        }
+        Ok(best)
+    }
+
     pub fn archive_gaps(&self) -> Result<Vec<(String, i64, i64)>> {
         let mut statement = self.conn.prepare("SELECT s.name,e.season,MAX(e.episode) FROM episodes e JOIN series s ON s.id=e.series_id GROUP BY s.name,e.season")?;
         let seasons = statement
@@ -4915,6 +4942,52 @@ mod tests {
         assert_eq!(db.ready_pending_movies().unwrap().len(), 1);
         db.remove_pending_movie("The Film", Some(2026)).unwrap();
         assert!(db.ready_pending_movies().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn later_archived_rank_reports_the_best_following_episode() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-later-rank-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Show')", [])
+            .unwrap();
+        let series_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Show'", [], |row| row.get(0))
+            .unwrap();
+        for (episode, title) in [
+            (5, "Show.S01E05.1080p.WEB-DL"),
+            (6, "Show.S01E06.720p.WEB-DL"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO episodes(series_id,season,episode,title,downloaded_at,archive_path) \
+                     VALUES (?1,1,?2,?3,'2024-01-01T00:00:00+00:00','/nas/f.mkv')",
+                    params![series_id, episode, title],
+                )
+                .unwrap();
+        }
+        // Best later episode for E01 is E05 (1080p, rank 5).
+        assert_eq!(
+            db.later_archived_max_resolution_rank("Show", 1, 1).unwrap(),
+            Some(5)
+        );
+        // For E05 the only later episode is E06 (720p, rank 4).
+        assert_eq!(
+            db.later_archived_max_resolution_rank("Show", 1, 5).unwrap(),
+            Some(4)
+        );
+        // Nothing after E06.
+        assert_eq!(db.later_archived_max_resolution_rank("Show", 1, 6).unwrap(), None);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

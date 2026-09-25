@@ -735,10 +735,30 @@ pub async fn run_cycle_domain(
         };
         // The smart episode guard must never block a deliberate backfill: a
         // candidate that fills a known archive gap is always allowed.
+        // A genuine quality upgrade over the later archived episode, while still
+        // below the profile cutoff, is allowed through even with the guard on.
         let smart_episode = release.kind == "series"
             && !release.is_pack
             && cfg.smart_episode_guard()
-            && !is_gap;
+            && !is_gap
+            && match (release.series.as_deref(), release.season, release.episode) {
+                (Some(series_name), Some(season), Some(episode)) => {
+                    let later_rank = db
+                        .lock()
+                        .unwrap()
+                        .later_archived_max_resolution_rank(series_name, season, episode)
+                        .unwrap_or(None);
+                    let candidate_rank = release.quality.resolution_rank();
+                    let cutoff = cfg
+                        .find_series_match(series_name, release.season)
+                        .and_then(|series| cfg.upgrade_cutoff_rank(&series.quality));
+                    let upgrade_and_below_cutoff = later_rank
+                        .is_some_and(|later_rank| candidate_rank > later_rank)
+                        && cutoff.is_none_or(|cutoff| candidate_rank < cutoff);
+                    !upgrade_and_below_cutoff
+                }
+                _ => true,
+            };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
             let score = cfg.release_score(&release);
