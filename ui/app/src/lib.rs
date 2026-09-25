@@ -1864,7 +1864,7 @@ fn setting_tooltip(key: &str) -> &'static str {
         "delay_bypass_score" => "Se una release raggiunge almeno questo punteggio, ignora il delay configurato. 0 disattiva il bypass e lascia attivo sempre il delay.",
         "housekeeping_enabled" => "Attiva la pulizia periodica dei dati tecnici e dello storico. Non cancella i file della libreria né le release dell'Archivio.",
         "housekeeping_interval_hours" => "Intervallo tra due housekeeping automatici, in ore. Esempio: 24 esegue la pulizia una volta al giorno; il comando manuale resta sempre disponibile.",
-        "housekeeping_retain_cycles" => "Numero di riepiloghi dei cicli di acquisizione da conservare. Esempio: 200 conserva gli ultimi 200 riepiloghi e, quando arriva il 201° ciclo, elimina solo il riepilogo più vecchio: non elimina release, torrent o file.",
+        "housekeeping_retain_cycles" => "Numero di statistiche dei cicli di ricerca da conservare. Ogni statistica conta release analizzate, candidate, download avviati, gap riempiti ed errori. Esempio: 200 conserva gli ultimi 200 cicli e, quando arriva il 201°, elimina solo i relativi contatori: non elimina release, torrent o file.",
         "housekeeping_seen_days" => "Elimina solo le righe storiche delle release già viste nei feed più vecchie di questo numero di giorni. Esempio: 30 pulisce i record dei feed oltre 30 giorni; 0 non applica questa pulizia.",
         "housekeeping_history_days" => "Elimina dallo storico i torrent rimossi più vecchi di questo numero di giorni, senza cancellare i file della libreria. Esempio: 90 rimuove solo le righe di download già rimossi oltre 90 giorni; 0 conserva lo storico.",
         "media_info_backfill_enabled" => "Analizza periodicamente con ffprobe i file già presenti che non hanno ancora MediaInfo. Non modifica né sposta i file.",
@@ -6240,13 +6240,13 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                     <TextSetting label="Housekeeping — intervallo (ore)" setting_key="housekeeping_interval_hours" value=Signal::derive(move || raw(&data.get().config, "housekeeping_interval_hours", "24")) placeholder="24" />
                     <p class="hint">{ctx_tr("Housekeeping: cosa pulisce e cosa non tocca")}</p>
                     <ul class="hint">
-                        <li>{ctx_tr("Cicli: conserva solo gli ultimi riepiloghi dei cicli di acquisizione. Con 200, quando arriva il 201° ciclo viene rimosso il riepilogo più vecchio, non la release.")}</li>
+                        <li>{ctx_tr("Cicli di ricerca: conserva solo le statistiche di ogni ciclo (release analizzate, candidate, download avviati, gap riempiti ed errori). Con 200, quando arriva il 201° ciclo vengono eliminati solo i contatori del ciclo più vecchio, non la release.")}</li>
                         <li>{ctx_tr("Visti nei feed: con 30 elimina le righe storiche dei feed oltre 30 giorni; con 0 non elimina nulla.")}</li>
                         <li>{ctx_tr("Storico download: con 90 elimina le righe dei torrent già rimossi oltre 90 giorni; con 0 conserva lo storico.")}</li>
                         <li>{ctx_tr("Automaticamente rimuove anche torrent in errore oltre 7 giorni, log dei gap oltre 30 giorni, backup di upgrade oltre 30 giorni e backoff delle sorgenti già scaduti.")}</li>
                         <li>{ctx_tr("Non cancella file della libreria, download completati o release dall'Archivio: la retention dell'Archivio è un'impostazione separata.")}</li>
                     </ul>
-                    <TextSetting label="Housekeeping — riepiloghi cicli acquisizione conservati" setting_key="housekeeping_retain_cycles" value=Signal::derive(move || raw(&data.get().config, "housekeeping_retain_cycles", "200")) placeholder="200" />
+                    <TextSetting label="Housekeeping — statistiche cicli di ricerca conservate" setting_key="housekeeping_retain_cycles" value=Signal::derive(move || raw(&data.get().config, "housekeeping_retain_cycles", "200")) placeholder="200" />
                     <TextSetting label="Housekeeping — visti nel feed (giorni, 0 = mai)" setting_key="housekeeping_seen_days" value=Signal::derive(move || raw(&data.get().config, "housekeeping_seen_days", "30")) placeholder="30" />
                     <TextSetting label="Housekeeping — storico download (giorni, 0 = conserva)" setting_key="housekeeping_history_days" value=Signal::derive(move || raw(&data.get().config, "housekeeping_history_days", "0")) placeholder="0" />
                     <BooleanSetting label="Backfill MediaInfo automatico" setting_key="media_info_backfill_enabled" value=Signal::derive(move || raw(&data.get().config, "media_info_backfill_enabled", "true")) />

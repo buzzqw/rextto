@@ -156,10 +156,12 @@ la barra “Salva tutte”.
   e il **backfill MediaInfo** automatico (file per volta e intervallo
   configurabili), oltre al pulsante in Manutenzione per una scansione immediata.
   L'**housekeeping non è la pulizia dell'Archivio**: mantiene ordinato il
-  database, ma non elimina i file della libreria, i download completati o le
-  release elencate nell'Archivio. Il campo *riepiloghi cicli acquisizione
-  conservati* riguarda solo le statistiche dei cicli: con valore `200`, il
-  201° ciclo elimina il riepilogo più vecchio, non la release scaricata.
+   database, ma non elimina i file della libreria, i download completati o le
+   release elencate nell'Archivio. Il campo *statistiche cicli di ricerca
+   conservate* riguarda solo i contatori di ogni ciclo — release analizzate,
+   candidate, download avviati, gap riempiti ed errori: con valore `200`, il
+   201° ciclo elimina i contatori del ciclo più vecchio, non la release
+   scaricata.
   *Visti nel feed* elimina solo le righe storiche dei feed oltre il numero di
   giorni indicato (`0` = nessuna pulizia); *storico download* elimina solo le
   righe dei torrent già rimossi (`0` = conserva). A ogni esecuzione vengono
