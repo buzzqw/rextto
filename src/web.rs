@@ -6739,10 +6739,10 @@ async fn comic_download(
     }
     let client = GetComicsClient::new();
     let result = match input.method.to_ascii_lowercase().as_str() {
-        "direct" | "http" => client
-            .download_direct(input.url.trim(), &target, input.title.trim())
+        "download_now" | "direct" | "http" => client
+            .start_direct_download(input.url.trim(), &target, input.title.trim())
             .await
-            .map(|path| serde_json::json!({"path":path,"method":"http"})),
+            .map(|id| serde_json::json!({"id":id,"method":"http","status":"downloading"})),
         "mega" => {
             let executable = std::env::var_os("REXTTO_MEGADL")
                 .map(PathBuf::from)
@@ -6754,7 +6754,7 @@ async fn comic_download(
                 Err(error) => Err(error),
             }
         }
-        "torrent" => match client.download_torrent(input.url.trim(), &target).await {
+        "torrent" | "torrents" => match client.download_torrent(input.url.trim(), &target).await {
             Ok(path) => match s.torrents.add_torrent_file(&path, &target) {
                 Ok(Some(hash)) => {
                     let _ = std::fs::remove_file(&path);
@@ -6773,7 +6773,7 @@ async fn comic_download(
             },
             Err(error) => Err(error),
         },
-        "magnet" => match s.torrents.add(&input.url, &cfg) {
+        "magnet" | "magnets" => match s.torrents.add(&input.url, &cfg) {
             Ok(true) => {
                 if let Some(hash) = crate::utils::magnet_hash(&input.url) {
                     let _ = s.comics.add_torrent(

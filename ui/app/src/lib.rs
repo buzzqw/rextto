@@ -5904,7 +5904,13 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                             <div>
                                                 <strong>{label}</strong>
                                                 {urls.into_iter().enumerate().map(|(index, url)| {
-                                                    let method = key;
+                                                        let method = match key {
+                                                            "download_now" | "direct" => "direct",
+                                                            "torrents" => "torrent",
+                                                            "magnets" => "magnet",
+                                                            "mega" => "mega",
+                                                            _ => "direct",
+                                                        };
                                                     let url_value = url.as_str().unwrap_or_default().to_string();
                                                     let title_value = format!("Comic {label} {index}");
                                                     view! {

@@ -496,6 +496,19 @@ fn format_event(event: &str, data: &serde_json::Value) -> String {
             text("title"),
             text("error")
         ),
+        "comic_pending" => format!(
+            "{}\n\n🏷️ {}: {}\n🔗 {}",
+            messages::pick(
+                "⏳ FUMETTO PRESENTE MA NON ANCORA SCARICABILE",
+                "⏳ COMIC FOUND BUT NOT YET DOWNLOADABLE"
+            ),
+            messages::pick("Titolo", "Title"),
+            text("title"),
+            messages::pick(
+                "GetComics non ha ancora pubblicato un pulsante Download Now o un link torrent. Rextto riproverà al prossimo ciclo.",
+                "GetComics has not published a Download Now button or torrent link yet. Rextto will retry on the next cycle."
+            )
+        ),
         "backup_completed" => format!(
             "Rextto: {} — {}",
             messages::pick("backup completato", "backup completed"),

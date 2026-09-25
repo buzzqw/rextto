@@ -48,6 +48,7 @@ pub struct ComicLinks {
     pub torrents: Vec<String>,
     pub mega: Vec<String>,
     pub direct: Vec<String>,
+    pub download_now: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +194,22 @@ impl GetComicsClient {
     ) -> Result<PathBuf> {
         let url = self.resolve_direct_url(url).await?;
         download_http(&self.client, &url, target_dir, title).await
+    }
+    /// Resolves a GetComics redirect and starts the HTTP download in the
+    /// background, returning the id used by the Comics download list.
+    pub async fn start_direct_download(
+        &self,
+        url: &str,
+        target_dir: &Path,
+        title: &str,
+    ) -> Result<String> {
+        let url = self.resolve_direct_url(url).await?;
+        Ok(start_http_download(
+            self.client.clone(),
+            url,
+            target_dir.to_path_buf(),
+            title.to_owned(),
+        ))
     }
     pub async fn download_torrent(&self, url: &str, target_dir: &Path) -> Result<PathBuf> {
         download_torrent_file(&self.client, url, target_dir).await
@@ -695,7 +712,17 @@ pub async fn run_cycle(
                     Err(error) => Err(error),
                 }
             } else {
-                tracing::debug!(post=%post.url, "comics post has no safe direct or Mega link; leaving it pending");
+                tracing::info!(post=%post.url, title=%post.title, "comics post found but has no Download Now or torrent link yet; leaving it pending");
+                let _ = notifier
+                    .notify_event(
+                        "comic_pending",
+                        serde_json::json!({
+                            "title": post.title,
+                            "post_url": post.url,
+                            "kind": "comic",
+                        }),
+                    )
+                    .await;
                 continue;
             };
             match download_result {
@@ -749,7 +776,16 @@ pub async fn run_cycle(
         // 1A. Ritenta i pack registrati ma mai inviati (come il legacy extto).
         for (date, magnet, torrent_url) in db.pending_weekly().unwrap_or_default() {
             match send_weekly_pack(
-                db, client, torrents, notifier, default_root, cfg, &date, &magnet, &torrent_url,
+                db,
+                client,
+                torrents,
+                notifier,
+                default_root,
+                cfg,
+                &date,
+                &magnet,
+                &torrent_url,
+                "",
             )
             .await
             {
@@ -796,17 +832,44 @@ pub async fn run_cycle(
                         .first()
                         .map(String::as_str)
                         .unwrap_or_default();
-                    if magnet.is_empty() && torrent_url.is_empty() {
-                        tracing::info!(date = %date, "comics: weekly pack found without magnet/torrent yet");
+                    let direct_url = links
+                        .download_now
+                        .first()
+                        .or_else(|| links.direct.first())
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if magnet.is_empty() && torrent_url.is_empty() && direct_url.is_empty() {
+                        let _ = db.upsert_weekly_links(&date, "", "")?;
+                        tracing::info!(date = %date, "comics: weekly pack found without Download Now or torrent link yet");
+                        let _ = notifier
+                            .notify_event(
+                                "comic_pending",
+                                serde_json::json!({
+                                    "title": format!("Weekly Pack {date}"),
+                                    "post_url": post.url,
+                                    "kind": "weekly",
+                                }),
+                            )
+                            .await;
                         continue;
                     }
                     let eligible = db.upsert_weekly_links(&date, magnet, torrent_url)?;
-                    tracing::info!(date = %date, eligible, "comics: weekly pack recorded");
-                    if !eligible {
+                    let should_send = !db.weekly_sent(&date)? && (eligible || !direct_url.is_empty());
+                    tracing::info!(date = %date, eligible = should_send, "comics: weekly pack recorded");
+                    if !should_send {
                         continue;
                     }
                     match send_weekly_pack(
-                        db, client, torrents, notifier, default_root, cfg, &date, magnet, torrent_url,
+                        db,
+                        client,
+                        torrents,
+                        notifier,
+                        default_root,
+                        cfg,
+                        &date,
+                        magnet,
+                        torrent_url,
+                        direct_url,
                     )
                     .await
                     {
@@ -847,7 +910,25 @@ async fn send_weekly_pack(
     date: &str,
     magnet: &str,
     torrent_url: &str,
+    direct_url: &str,
 ) -> Result<bool> {
+    if !direct_url.is_empty() {
+        let path = client
+            .download_direct(direct_url, default_root, &format!("Weekly Pack {date}"))
+            .await?;
+        db.mark_weekly_sent(date)?;
+        let _ = notifier
+            .notify_comic_complete(
+                &format!("Weekly Pack {date}"),
+                &path.display().to_string(),
+                std::fs::metadata(&path)
+                    .map(|value| value.len())
+                    .unwrap_or(0),
+                "http",
+            )
+            .await;
+        return Ok(true);
+    }
     if !magnet.is_empty() {
         if let Some(hash) = magnet_hash(magnet) {
             if torrents.add(magnet, cfg)? {
@@ -909,6 +990,13 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
         let href = joined.to_string();
         let text = anchor.text().collect::<String>().to_ascii_lowercase();
         let normalized_text = text.replace(['-', '_'], " ");
+        let title_attr = anchor
+            .value()
+            .attr("title")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_download_now = normalized_text.contains("download now")
+            || title_attr.replace(['-', '_'], " ").contains("download now");
         let path = joined.path().to_ascii_lowercase();
         // The site's help link contains "download" but is not a file. The
         // hyphen in "how-to" previously bypassed the text check and became
@@ -940,9 +1028,13 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
             || [".cbr", ".cbz", ".rar", ".zip"]
                 .iter()
                 .any(|extension| path.ends_with(extension))
-            || text.contains("download"))
+            || text.contains("download")
+            || is_download_now)
             && !links.direct.contains(&href)
         {
+            if is_download_now && !links.download_now.contains(&href) {
+                links.download_now.push(href.clone());
+            }
             links.direct.push(href);
         }
     }
@@ -1163,6 +1255,14 @@ impl ComicsDb {
         Ok(())
     }
 
+    pub fn weekly_sent(&self, pack_date: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM comics_weekly WHERE pack_date=?1 AND sent_at IS NOT NULL)",
+            [pack_date],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Registra i link di un weekly pack, **riempiendo** anche una riga già
     /// presente ma creata prima che il torrent fosse disponibile (caso previsto
     /// dal legacy extto). Ritorna `true` se la riga ora ha un link ed è ancora
@@ -1224,6 +1324,40 @@ pub async fn download_http(
     title: &str,
 ) -> Result<PathBuf> {
     let id = register_http_download(title, "http");
+    download_http_registered(client, url, target_dir, title, &id).await
+}
+
+fn start_http_download(
+    client: reqwest::Client,
+    url: String,
+    target_dir: PathBuf,
+    title: String,
+) -> String {
+    let id = register_http_download(&title, "http");
+    let download_id = id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = download_http_registered(
+            &client,
+            &url,
+            &target_dir,
+            &title,
+            &download_id,
+        )
+        .await
+        {
+            tracing::warn!(title=%title, download_id=%download_id, %error, "comic background download failed");
+        }
+    });
+    id
+}
+
+async fn download_http_registered(
+    client: &reqwest::Client,
+    url: &str,
+    target_dir: &Path,
+    title: &str,
+    id: &str,
+) -> Result<PathBuf> {
     let mut outcome: Option<PathBuf> = None;
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=HTTP_DOWNLOAD_ATTEMPTS {
@@ -1260,6 +1394,9 @@ pub async fn download_http(
             download.speed_bytes = 0;
             download.eta_seconds = None;
         }),
+    }
+    if let Ok(path) = &result {
+        tracing::info!(title=%title, download_id=%id, path=%path.display(), "comic HTTP download completed");
     }
     result
 }
@@ -1732,6 +1869,24 @@ mod tests {
             "https://getcomics.org/dls/pixeldrain-token",
             "https://datanodes.to/file/example.cbr",
         ]);
+    }
+
+    #[test]
+    fn parse_links_identifies_download_now_button() {
+        let html = r#"
+            <a href="/dls/download-now-token">Download Now</a>
+            <a href="/dls/download-now-title" title="Download Now">file host</a>
+            <a href="https://datanodes.to/file/example.cbr">Alternative download</a>
+        "#;
+        let links = parse_links(html, "https://getcomics.org/post/example").expect("parse");
+        assert_eq!(
+            links.download_now,
+            vec![
+                "https://getcomics.org/dls/download-now-token",
+                "https://getcomics.org/dls/download-now-title"
+            ]
+        );
+        assert_eq!(links.direct.len(), 3);
     }
 
     /// Riproduce lo stream troncato dietro Cloudflare ("error decoding response
