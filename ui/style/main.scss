@@ -151,32 +151,33 @@ a { color: var(--accent-2); }
   padding: 10px 20px; border-bottom: 1px solid var(--line-soft);
   background: var(--topbar); backdrop-filter: blur(12px);
 }
-.topbar h1 { margin: 0; font-size: 1.375rem; letter-spacing: -.02em; }
+.topbar h1 { margin: 0; font-size: 1.375rem; letter-spacing: -.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar .crumb { color: var(--muted); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .12em; }
-.topbar-title { flex: none; }
+.topbar-title { flex: 0 1 clamp(130px, 15vw, 230px); min-width: 0; overflow: hidden; }
 .topbar-message { flex: 1 1 auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; margin: 0 8px; }
 .alert.inline, .notice.inline {
   margin: 0; padding: 7px 12px; font-size: 0.7812rem; max-width: 560px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 @media (max-width: 1100px) { .topbar-message { display: none; } }
-.top-actions { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; flex: none; overflow-x: auto; scrollbar-width: thin; }
+.top-actions { display: flex; align-items: center; justify-content: flex-start; gap: 8px; flex-wrap: nowrap; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
 .top-actions > * { flex: none; white-space: nowrap; }
 .top-actions .btn { padding: 6px 10px; }
 .top-actions .lang-select, .top-actions .mode-badge, .top-actions .system-pill { padding: 6px 10px; }
 .lang-select { padding: 6px 8px; max-width: 110px; border-radius: 8px; background: var(--btn); color: var(--btn-text); border: 1px solid var(--btn-line); font-weight: 600; }
 .top-metric {
-  box-sizing: border-box; flex: 0 0 78px; width: 78px; height: 38px;
+  box-sizing: border-box; flex: 1 1 86px; width: auto; min-width: 78px; max-width: 170px; height: 42px;
   display: inline-flex; flex-direction: column; justify-content: center;
-  padding: 4px 9px; border: 1px solid var(--btn-line); border-radius: 8px;
+  padding: 5px 11px; border: 1px solid var(--btn-line); border-radius: 8px;
   background: var(--btn); color: var(--btn-text); font-variant-numeric: tabular-nums;
   overflow: hidden;
 }
-.top-metric-ram { flex-basis: 108px; width: 108px; }
-.top-metric-rate { flex-basis: 112px; width: 112px; }
-.top-metric-cycle { flex-basis: 124px; width: 124px; }
-.top-metric-label { color: var(--muted); font-size: 0.625rem; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.top-metric strong { display: block; margin-top: 2px; font-size: 0.77rem; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top-actions > .top-metric { flex: 1 1 86px; }
+.top-actions > .top-metric-ram { flex-basis: 116px; min-width: 108px; }
+.top-actions > .top-metric-rate { flex-basis: 120px; min-width: 112px; }
+.top-actions > .top-metric-cycle { flex-basis: 132px; min-width: 124px; }
+.top-metric-label { color: var(--muted); font-size: 0.6875rem; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top-metric strong { display: block; margin-top: 2px; font-size: 0.84rem; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Testata dettaglio serie: poster + titolo + badge + trama. */
 .series-hero { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 16px; align-items: start; }
 .series-poster img { width: 150px; border-radius: 8px; display: block; }

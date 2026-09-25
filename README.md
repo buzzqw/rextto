@@ -15,8 +15,6 @@ disk).
 > 🇮🇹 Italiano: [`README.it.md`](README.it.md)
 > 📖 Full manual: [`docs/MANUAL.en.md`](docs/MANUAL.en.md) ·
 > [`docs/MANUAL.it.md`](docs/MANUAL.it.md)
-> 🔬 Feature research (Sonarr/Radarr/qBittorrent/BiglyBT/autobrr):
-> [`docs/FEATURE-RESEARCH.md`](docs/FEATURE-RESEARCH.md)
 
 [![Donate](https://img.shields.io/badge/❤️_Support_Rextto-PayPal-00457C.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=azanzani@gmail.com&item_name=Support+Rextto+Project)
 
@@ -139,9 +137,6 @@ REXTTO_DATA_DIR="$PWD/data" REXTTO_ACTIVE=0 REXTTO_DRY_RUN=1 \
 ```
 
 For a real service installation, use the installer described above.
-
-See the [25 September 2026 operational change sheet](docs/SPECCHIETTO-OPERATIVO-2026-09-25.it.md)
-for the current behaviour, settings and code locations.
 
 ### Check it
 

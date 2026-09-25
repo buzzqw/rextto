@@ -155,6 +155,22 @@ fn tr(data: RwSignal<Data>, source: &str) -> String {
         .unwrap_or_else(|| source.to_string())
 }
 
+fn tr_opt(data: Option<RwSignal<Data>>, source: &str) -> String {
+    data.map(|signal| tr(signal, source))
+        .unwrap_or_else(|| source.to_string())
+}
+
+/// Translates a message template and then substitutes its runtime values.
+/// Keeping the template as the translation key lets formatted notices follow
+/// the active language just like static labels do.
+fn tr_format(data: RwSignal<Data>, source: &str, values: &[(&str, String)]) -> String {
+    let mut message = tr(data, source);
+    for (placeholder, value) in values {
+        message = message.replace(placeholder, value);
+    }
+    message
+}
+
 /// Traduce una stringa usando il context `Data` dell'app. Serve per i
 /// componenti riutilizzabili (Panel, Metric, StatLine, ...) che ricevono solo
 /// un letterale: la traduzione avviene senza toccare ogni punto di chiamata.
@@ -401,6 +417,7 @@ fn flash(data: RwSignal<Data>, result: Result<Value, String>, success: &'static 
             });
         }
         Err(error) => {
+            let error = tr(data, &error);
             push_toast(data, "err", error.clone());
             data.update(|current| {
                 current.notice.clear();
@@ -411,6 +428,7 @@ fn flash(data: RwSignal<Data>, result: Result<Value, String>, success: &'static 
 }
 
 fn flash_text(data: RwSignal<Data>, kind: &str, message: String) {
+    let message = tr(data, &message);
     push_toast(data, kind, message.clone());
     data.update(|current| {
         if kind == "ok" {
@@ -481,13 +499,9 @@ fn run_cleanup_completed(data: RwSignal<Data>) {
                 let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
                 let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
                 let message = if removed == 0 {
-                    format!(
-                        "Nessun torrent rimosso: {skipped} non hanno ancora raggiunto i limiti di seed (ratio/tempo) o sono in seed infinito."
-                    )
+                    tr_format(data, "Nessun torrent rimosso: {skipped} non hanno ancora raggiunto i limiti di seed (ratio/tempo) o sono in seed infinito.", &[("{skipped}", skipped.to_string())])
                 } else {
-                    format!(
-                        "Rimossi {removed} completati · saltati {skipped} (limiti di seed non raggiunti o seed infinito). Sono ora nello Storico download."
-                    )
+                    tr_format(data, "Rimossi {removed} completati · saltati {skipped} (limiti di seed non raggiunti o seed infinito). Sono ora nello Storico download.", &[("{removed}", removed.to_string()), ("{skipped}", skipped.to_string())])
                 };
                 flash_text(data, "ok", message);
             }
@@ -973,7 +987,7 @@ pub fn App() -> impl IntoView {
                     </nav>
                     <div class="sidebar-foot">
                         <span class="pulse"></span>
-                        <span>{move || if data.get().status.get("dry_run").and_then(Value::as_bool).unwrap_or(true) { "dry-run".to_string() } else { "attivo".to_string() }}</span>
+                         <span>{move || if data.get().status.get("dry_run").and_then(Value::as_bool).unwrap_or(true) { "dry-run".to_string() } else { tr(data, "attivo") }}</span>
                     </div>
                 </aside>
                 <main class="main-shell">
@@ -1000,7 +1014,7 @@ pub fn App() -> impl IntoView {
                              <div class="top-metric" title=ctx_tr("Peer connessi / Seed")><span class="top-metric-label">{ctx_tr("P/S")}</span><strong>{move || format!("{}/{}", live_peers.get(), live_seeds.get())}</strong></div>
                              <div class="top-metric top-metric-cycle" title=move || tr(data, "Tempo stimato al prossimo ciclo automatico")><span class="top-metric-label">{ctx_tr("Prossimo ciclo")}</span><strong>{move || next_cycle.get()}</strong></div>
                             <button class="btn" title=ctx_tr("Testo più piccolo") on:click=move |_| font_scale.update(|value| *value = (*value - 5).max(85))>{ctx_tr("A−")}</button>
-                            <button class="btn" title=ctx_tr("Dimensione testo predefinita (100%)") on:click=move |_| font_scale.set(100)>{move || format!("Testo {}%", font_scale.get())}</button>
+                             <button class="btn" title=ctx_tr("Dimensione testo predefinita (100%)") on:click=move |_| font_scale.set(100)>{move || format!("{} {}%", tr(data, "Testo"), font_scale.get())}</button>
                             <button class="btn" title=ctx_tr("Testo più grande") on:click=move |_| font_scale.update(|value| *value = (*value + 5).min(140))>{ctx_tr("A+")}</button>
                              <select class="lang-select" title=ctx_tr("Lingua dell'interfaccia") prop:value=move || data.get().language on:change=move |event| {
                                  let chosen = event_target_value(&event);
@@ -1350,7 +1364,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                     });
                 }>
                     <input prop:value=global_query on:input=move |event| global_query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca in archivio + indexer + motori web…") title=ctx_tr("Cerca contemporaneamente nell'archivio, negli indexer e nei motori web") />
-                    <button class="btn primary" disabled=move || global_loading.get()>{move || if global_loading.get() { "Cerco…" } else { "Cerca" }}</button>
+                     <button class="btn primary" disabled=move || global_loading.get()>{move || if global_loading.get() { tr(data, "Cerco…") } else { tr(data, "Cerca") }}</button>
                 </form>
                 <div class="toolbar cycle-actions">
                     <span class="cycle-label">{move || tr(data, "Avvia ciclo")}</span>
@@ -1362,7 +1376,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                 </div>
             </div>
              <Show when=move || global_loading.get()>
-                <div class="search-status"><span class="spinner"></span>{move || format!("Sto interrogando archivio, RSS, indexer e motori web… {}s", global_elapsed.get())}</div>
+                 <div class="search-status"><span class="spinner"></span>{move || format!("{} {}s", tr(data, "Interrogazione archivio, RSS, indexer e motori web…"), global_elapsed.get())}</div>
             </Show>
             <Show when=move || !global_loading.get() && global_searched.get() && global_results.get().is_empty()>
                 <div class="notice">{ctx_tr("Nessun risultato. Prova un termine più corto o verifica le sorgenti in Impostazioni → Sorgenti.")}</div>
@@ -1407,11 +1421,11 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
             </Panel>
             <div class="metrics">
                 <Metric label="Serie TV configurate" value=Signal::derive(move || series.get().len().to_string()) tone="mint"
-                    sub=Signal::derive(move || format!("{} abilitate · {} in pausa", series_enabled.get(), series.get().len().saturating_sub(series_enabled.get()))) />
+                     sub=Signal::derive(move || format!("{} {} · {} {}", series_enabled.get(), tr(data, "abilitate"), series.get().len().saturating_sub(series_enabled.get()), tr(data, "in pausa"))) />
                 <Metric label="Film configurati" value=Signal::derive(move || movies.get().len().to_string()) tone="blue"
-                    sub=Signal::derive(move || format!("{} scaricati", movies_downloaded.get())) />
+                     sub=Signal::derive(move || format!("{} {}", movies_downloaded.get(), tr(data, "scaricati"))) />
                 <Metric label="File scaricati" value=Signal::derive(move || episodes_downloaded.get().to_string()) tone="amber"
-                    sub=Signal::derive(move || format!("{} film · {}", movies_downloaded.get(), size(&consumption.get(), "total_bytes"))) />
+                     sub=Signal::derive(move || format!("{} {} · {}", movies_downloaded.get(), tr(data, "film"), size(&consumption.get(), "total_bytes"))) />
                 <Metric label="Spazio libero" value=Signal::derive(move || size(&data.get().health, "disk_free_bytes")) tone="violet"
                     sub=Signal::derive(move || {
                         let free = data.get().health.get("disk_free_bytes").and_then(Value::as_f64).unwrap_or(0.0);
@@ -1419,11 +1433,11 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         if total > 0.0 { format!("{:.0}% di {}", free / total * 100.0, size_str(total)) } else { String::new() }
                     }) />
                 <Metric label="Magnet in archivio" value=Signal::derive(move || data.get().archive_total.to_string()) tone="blue"
-                    sub=Signal::derive(move || format!("{} serie · {} film monitorati", series.get().len(), movies.get().len())) />
+                     sub=Signal::derive(move || format!("{} {} · {} {}", series.get().len(), tr(data, "serie"), movies.get().len(), tr(data, "film monitorati"))) />
                 <Metric label="Visti nei feed" value=Signal::derive(move || data.get().status.get("seen").and_then(|seen| seen.get("groups")).and_then(Value::as_i64).unwrap_or(0).to_string()) tone="violet"
                     sub=Signal::derive(move || {
                         let seen = data.get().status.get("seen").cloned().unwrap_or_default();
-                        format!("{} film · {} serie", number(&seen, "movies"), number(&seen, "series"))
+                         format!("{} {} · {} {}", number(&seen, "movies"), tr(data, "film"), number(&seen, "series"), tr(data, "serie"))
                     }) />
                 <Metric label="Torrent in sessione" value=Signal::derive(move || data.get().torrents.len().to_string()) tone="mint"
                     sub=Signal::derive(move || {
@@ -1433,7 +1447,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         let queued = torrents.iter().filter(|item| text(item, "state", "").contains("coda") || text(item, "state", "").contains("queued")).count();
                         let delta = data.get().torrent_delta;
                         let arrow = if delta > 0 { format!(" ▲{delta}") } else if delta < 0 { format!(" ▼{}", delta.abs()) } else { String::new() };
-                        format!("{downloading} scarico · {seeding} seed · {queued} coda{arrow}")
+                         format!("{downloading} {} · {seeding} {} · {queued} {}{arrow}", tr(data, "scarico"), tr(data, "seed"), tr(data, "coda"))
                     }) />
             </div>
             <Panel title="Rete e download attivi">
@@ -1477,7 +1491,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         <StatLine label="Candidati / avviati" value=Signal::derive(move || format!("{} / {}", number(&last.get(), "candidates"), number(&last.get(), "downloads_started"))) />
                         <StatLine label="Gap riempiti" value=Signal::derive(move || number(&last.get(), "gaps_filled")) />
                         <StatLine label="Feed RSS / Indexer" value=Signal::derive(move || format!("{} / {}", array(&data.get().config, "feed_urls").len(), array(&data.get().config, "indexers").len())) />
-                        <StatLine label="Cestino" value=Signal::derive(move || format!("{} · {} file", size(&data.get().health, "trash_bytes"), number(&data.get().health, "trash_file_count"))) />
+                         <StatLine label="Cestino" value=Signal::derive(move || tr_format(data, "{size} · {count} file", &[("{size}", size(&data.get().health, "trash_bytes")), ("{count}", number(&data.get().health, "trash_file_count"))])) />
                     </div>
                 </Panel>
                 <Panel title="Consumo banda e spazio disco">
@@ -1499,7 +1513,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                             view! {
                                 <div class="disk-row" title=format!("{} · {}", text(&disk, "filesystem", "-"), mount_hint)>
                                     <span class="mono truncate">{mount}</span>
-                                    <span class="muted">{format!("{} liberi / {} · {:.0}%", size_str(free), size_str(total), used)}</span>
+                                    <span class="muted">{tr_format(data, "{free} liberi / {total} · {used}%", &[("{free}", size_str(free)), ("{total}", size_str(total)), ("{used}", format!("{used:.0}"))])}</span>
                                 </div>
                             }
                         }).collect_view()}
@@ -1570,7 +1584,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                             feed_loaded.set(true);
                             feed_loading.set(false);
                         });
-                    }>{move || if feed_loading.get() { "Caricamento…" } else if feed_loaded.get() { "Aggiorna risultati" } else { "Carica risultati" }}</button>
+                    }>{move || if feed_loading.get() { tr(data, "Caricamento…") } else if feed_loaded.get() { tr(data, "Aggiorna risultati") } else { tr(data, "Carica risultati") }}</button>
                 </div>
                 <Show when=move || feed_loading.get()>
                     <div class="search-status"><span class="spinner"></span>{ctx_tr("Cerco le release archiviate per le serie e i film monitorati…")}</div>
@@ -1585,7 +1599,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                             <tbody>
                                 {move || feed_items.get().iter().cloned().flat_map(|item| {
                                     let name = text(&item, "name", "Libreria");
-                                    let kind = if text(&item, "kind", "") == "movie" { "Film" } else { "Serie TV" };
+                                    let kind = if text(&item, "kind", "") == "movie" { tr(data, "Film") } else { tr(data, "Serie TV") };
                                     array(&item, "matches").into_iter().map(move |release| {
                                         let title = text(&release, "title", "Release");
                                         let magnet = text(&release, "magnet", "");
@@ -1596,7 +1610,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                                         view! {
                                             <tr>
                                                 <td>{name.clone()}</td>
-                                                <td class="muted">{kind}</td>
+                                                <td class="muted">{kind.clone()}</td>
                                                 <td class="truncate" title=title.clone()>{title.clone()}</td>
                                                 <td class="muted">{source}</td>
                                                 <td><button class="btn sm primary" disabled=magnet.is_empty() on:click=move |_| run_post(data, "/api/archive/add", Some(json!({"title": add_title.clone(), "magnet": add_magnet.clone(), "source": add_source.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button></td>
@@ -1631,12 +1645,12 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                         <div class="modal-body">
                             <p class="muted mono truncate" title=move || trash_path.get()>{move || trash_path.get()}</p>
                             <div class="toolbar" style="margin:8px 0 10px">
-                                <span class="muted">{move || format!("{} elementi · {}", trash_items.get().len(), size_str(trash_total.get() as f64))}</span>
+                                <span class="muted">{move || tr_format(data, "{count} elementi · {size}", &[("{count}", trash_items.get().len().to_string()), ("{size}", size_str(trash_total.get() as f64))])}</span>
                                 <button class="btn sm danger" disabled=move || trash_busy.get() || trash_items.get().is_empty() on:click=move |_| {
                                     trash_busy.set(true);
                                     spawn_local(async move {
                                         match send("POST", "/api/trash/delete", Some(json!({"all": true}))).await {
-                                            Ok(value) => push_toast(data, "ok", format!("Cestino svuotato: {} elementi", number(&value, "removed"))),
+                                            Ok(value) => push_toast(data, "ok", tr_format(data, "Cestino svuotato: {count} elementi", &[("{count}", number(&value, "removed"))])),
                                             Err(error) => push_toast(data, "err", error),
                                         }
                                         if let Ok(value) = get("/api/trash").await {
@@ -1664,7 +1678,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                                             view! {
                                                 <tr>
                                                     <td class="truncate mono" title=name_title>{name}</td>
-                                                    <td class="muted">{if is_dir { "cartella" } else { "file" }}</td>
+                                                     <td class="muted">{if is_dir { tr(data, "cartella") } else { tr(data, "file") }}</td>
                                                     <td class="numeric">{size(&item, "size_bytes")}</td>
                                                     <td>
                                                         <button class="btn sm danger" disabled=move || trash_busy.get() on:click=move |_| {
@@ -1672,7 +1686,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                                                             trash_busy.set(true);
                                                             spawn_local(async move {
                                                                 match send("POST", "/api/trash/delete", Some(json!({"names": [name]}))).await {
-                                                                    Ok(_) => push_toast(data, "ok", "Elemento eliminato dal cestino".into()),
+                                                                     Ok(_) => push_toast(data, "ok", tr(data, "Elemento eliminato dal cestino")),
                                                                     Err(error) => push_toast(data, "err", error),
                                                                 }
                                                                 if let Ok(value) = get("/api/trash").await {
@@ -1814,7 +1828,7 @@ fn language_row(lang: RwSignal<String>, req: RwSignal<bool>) -> impl IntoView {
         <div class="lang-row">
             <select prop:value=lang on:change=move |event| lang.set(event_target_value(&event))>
                 <option value="">{ctx_tr("—")}</option>
-                {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
+                {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}
             </select>
             <label class="check" title=ctx_tr("La release deve contenere questa lingua")><input type="checkbox" disabled=move || lang.get().is_empty() prop:checked=move || !lang.get().is_empty() && req.get() on:change=move |event| req.set(event_target_checked(&event)) /> <span>{ctx_tr("obbligatoria")}</span></label>
         </div>
@@ -2255,12 +2269,12 @@ fn torrent_reason_label(data: RwSignal<Data>, reason: &str) -> String {
     }
 }
 
-fn torrent_version_label(version: &str) -> String {
+fn torrent_version_label(data: RwSignal<Data>, version: &str) -> String {
     match version {
-        "v1" => "BitTorrent v1".into(),
-        "v2" => "BitTorrent v2".into(),
-        "hybrid" => "Hybrid (v1 + v2)".into(),
-        _ => "non disponibile".into(),
+        "v1" => tr(data, "BitTorrent v1"),
+        "v2" => tr(data, "BitTorrent v2"),
+        "hybrid" => tr(data, "Hybrid (v1 + v2)"),
+        _ => tr(data, "non disponibile"),
     }
 }
 
@@ -2447,7 +2461,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             let buffer = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
                 Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                 Err(_) => {
-                    message.set("Lettura file fallita".into());
+                    message.set(tr(data, "Lettura file fallita"));
                     return;
                 }
             };
@@ -2459,10 +2473,10 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             match builder.body(js_sys::Uint8Array::from(buffer.as_slice())) {
                 Ok(request) => match request.send().await {
                     Ok(response) if response.ok() => {
-                        message.set("Torrent caricato".into());
+                        message.set(tr(data, "Torrent caricato"));
                         trigger_refresh();
                     }
-                    Ok(response) => message.set(format!("Errore upload ({})", response.status())),
+                    Ok(response) => message.set(tr_format(data, "Errore upload ({status})", &[("{status}", response.status().to_string())])),
                     Err(error) => message.set(error.to_string()),
                 },
                 Err(error) => message.set(error.to_string()),
@@ -2511,7 +2525,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                 <input prop:value=add_save_path on:input=move |event| add_save_path.set(event_target_value(&event)) placeholder=move || default_download_path.get() />
                                 <BrowseButton value=add_save_path />
                             </div>
-                            <small class="hint">{move || format!("Vuoto = predefinita ({})", default_download_path.get())}</small>
+                            <small class="hint">{move || format!("{} ({})", tr(data, "Vuoto = predefinita"), default_download_path.get())}</small>
                         </label>
                         <div class="add-torrent-action">
                             <button class="btn primary" title=ctx_tr("Aggiungi il magnet o il link .torrent alla sessione")>{ctx_tr("Aggiungi")}</button>
@@ -2562,7 +2576,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         let message = temp_message;
                         spawn_local(async move {
                             match send("POST", "/api/torrents/temp-limits", Some(body)).await {
-                                Ok(_) => message.set("Limite temporaneo applicato".into()),
+                                Ok(_) => message.set(tr(data, "Limite temporaneo applicato")),
                                 Err(error) => message.set(error),
                             }
                         });
@@ -2571,7 +2585,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         let message = temp_message;
                         spawn_local(async move {
                          match send("POST", "/api/torrents/temp-limits", Some(json!({"clear": true}))).await {
-                                Ok(_) => message.set("Limite temporaneo rimosso".into()),
+                                Ok(_) => message.set(tr(data, "Limite temporaneo rimosso")),
                                 Err(error) => message.set(error),
                             }
                         });
@@ -2579,7 +2593,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     <small class="muted">{temp_message}</small>
                 </div>
                 <div class="toolbar" style="margin-bottom:10px">
-                    <span class="muted">{move || format!("{} selezionati", selected_torrents.get().len())}</span>
+                    <span class="muted">{move || tr_format(data, "{count} selezionati", &[("{count}", selected_torrents.get().len().to_string())])}</span>
                     <button class="btn sm" title=ctx_tr("Metti in pausa i torrent selezionati") on:click=move |_| bulk_post("pause", None)>{ctx_tr("Pausa")}</button>
                     <button class="btn sm" title=ctx_tr("Riprendi i torrent selezionati") on:click=move |_| bulk_post("resume", None)>{ctx_tr("Riprendi")}</button>
                     <button class="btn sm" title=ctx_tr("Riavvia il check dei torrent selezionati") on:click=move |_| bulk_post("recheck", None)>{ctx_tr("Recheck")}</button>
@@ -2656,23 +2670,23 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                                 let path = text(&item, "processed_path", "");
                                 let archived = !path.is_empty();
                                 let (state_label, state_tone) = if status == "error" || !error.is_empty() {
-                                    ("Errore", "danger")
+                                    (tr(data, "Errore"), "danger")
                                 } else if status == "completed" || progress >= 1.0 {
-                                    ("Completato", "ok")
+                                    (tr(data, "Completato"), "ok")
                                 } else {
-                                    ("In corso", "")
+                                    (tr(data, "In corso"), "")
                                 };
                                 let kind = text(&item, "kind", "");
                                 let season = item.get("season").and_then(Value::as_i64).unwrap_or(0);
                                 let episode = item.get("episode").and_then(Value::as_i64).unwrap_or(0);
                                 let year = item.get("year").and_then(Value::as_i64).unwrap_or(0);
                                 let type_label = if kind == "series" {
-                                    if season > 0 && episode > 0 { format!("Serie · S{season:02}E{episode:02}") }
-                                    else if season > 0 { format!("Serie · S{season:02}") }
-                                    else { "Serie".to_string() }
+                                     if season > 0 && episode > 0 { format!("{} · S{season:02}E{episode:02}", tr(data, "Serie")) }
+                                     else if season > 0 { format!("{} · S{season:02}", tr(data, "Serie")) }
+                                     else { tr(data, "Serie") }
                                 } else if kind == "movie" {
-                                    if year > 0 { format!("Film · {year}") } else { "Film".to_string() }
-                                 } else { "—".to_string() };
+                                     if year > 0 { format!("{} · {year}", tr(data, "Film")) } else { tr(data, "Film") }
+                                  } else { tr(data, "—") };
                                  let tag = text(&item, "tag", "");
                                 let tag_empty = tag.is_empty();
                                 let tag_label = tag.clone();
@@ -2744,7 +2758,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     </table>
                 </div>
                 <div class="toolbar" style="margin-top:8px">
-                    <span class="muted">{move || format!("{} download", data.get().history_total)}</span>
+                    <span class="muted">{move || tr_format(data, "{count} download", &[("{count}", data.get().history_total.to_string())])}</span>
                     <button class="btn sm" disabled=move || { data.get().history_page <= 1 } on:click=move |_| history_goto(data, data.get().history_page.saturating_sub(1))>{ctx_tr("Precedente")}</button>
                     <span>{move || format!("Pagina {} / {}", data.get().history_page.max(1), data.get().history_pages.max(1))}</span>
                     <button class="btn sm" disabled=move || { data.get().history_page >= data.get().history_pages } on:click=move |_| history_goto(data, data.get().history_page + 1)>{ctx_tr("Successiva")}</button>
@@ -2794,7 +2808,10 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
         parts.join(" · ")
     });
     let state = Signal::derive(move || text(&item.get(), "state", "queued"));
-    let state_label = Signal::derive(move || torrent_state_label(&state.get()).0);
+    let state_label = Signal::derive(move || {
+        let (label, _) = torrent_state_label(&state.get());
+        tr(data, label)
+    });
     let state_tone = Signal::derive(move || torrent_state_label(&state.get()).1);
     // Seeding infinito: ratio o giorni a 0 nella configurazione del torrent.
     let seed_infinite = Signal::derive(move || {
@@ -2811,7 +2828,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
             if is_paused.get() { "resume" } else { "pause" }
         )
     });
-    let toggle_label = Signal::derive(move || if is_paused.get() { "Riprendi" } else { "Pausa" });
+    let toggle_label = Signal::derive(move || if is_paused.get() { tr(data, "Riprendi") } else { tr(data, "Pausa") });
     let check_path = format!("/api/torrents/{hash}/recheck");
     let restart_path = StoredValue::new(format!("/api/torrents/{hash}/restart"));
     let announce_path = StoredValue::new(format!("/api/torrents/{hash}/reannounce"));
@@ -2914,7 +2931,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                         >{move || state_label.get()}</span>
                     }
                 >
-                    <span class="badge warn" title=move || format!("Seeding infinito — stato: {}", state.get())>{ctx_tr("seed ∞")}</span>
+                    <span class="badge warn" title=move || format!("{} — {}: {}", tr(data, "Seeding infinito"), tr(data, "Stato"), state.get())>{ctx_tr("seed ∞")}</span>
                 </Show>
             </td>
             <td>
@@ -2930,7 +2947,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
             <td class="numeric">{move || format!("{}/s", size(&item.get(), "download_rate"))}</td>
             <td class="numeric">{move || format!("{}/s", size(&item.get(), "upload_rate"))}</td>
             <td class="numeric" title=ctx_tr("Tempo stimato al completamento")>{move || eta_label(&item.get())}</td>
-            <td class="numeric" title=ctx_tr("Peer connessi / Seed")>{move || format!("Peer: {} · Seed: {}", number(&item.get(), "num_peers"), number(&item.get(), "num_seeds"))}</td>
+            <td class="numeric" title=ctx_tr("Peer connessi / Seed")>{move || format!("{}: {} · {}: {}", tr(data, "Peer"), number(&item.get(), "num_peers"), tr(data, "Seed"), number(&item.get(), "num_seeds"))}</td>
             <td class="numeric" title=ctx_tr("Rapporto upload/download")>{move || ratio_label(&item.get())}</td>
             <td>
                 <div class="row-actions">
@@ -2981,9 +2998,9 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             }
                                         }) />
                                         <StatLine label="Posizione coda" value=Signal::derive(move || number(&detail.get(), "queue_position")) />
-                                        <StatLine label="Metadata" value=Signal::derive(move || if detail.get().get("has_metadata").and_then(Value::as_bool).unwrap_or(false) { "presenti".into() } else { "in attesa".into() }) />
-                                        <StatLine label="Versione torrent" value=Signal::derive(move || torrent_version_label(&text(&detail.get(), "torrent_version", ""))) />
-                                        <StatLine label="Auto-managed" value=Signal::derive(move || if detail.get().get("auto_managed").and_then(Value::as_bool).unwrap_or(false) { "sì".into() } else { "no".into() }) />
+                                         <StatLine label="Metadata" value=Signal::derive(move || if detail.get().get("has_metadata").and_then(Value::as_bool).unwrap_or(false) { tr(data, "presenti") } else { tr(data, "in attesa") }) />
+                                         <StatLine label="Versione torrent" value=Signal::derive(move || torrent_version_label(data, &text(&detail.get(), "torrent_version", ""))) />
+                                         <StatLine label="Auto-managed" value=Signal::derive(move || if detail.get().get("auto_managed").and_then(Value::as_bool).unwrap_or(false) { tr(data, "sì") } else { tr(data, "no") }) />
                                         <StatLine label="Percorso" value=Signal::derive(move || text(&detail.get(), "save_path", "-")) />
                                     </div>
                                     <div class="sparkline-wrap">
@@ -3004,7 +3021,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             no_rename.set(next);
                                             let path = format!("/api/torrents/{}/no_rename", hash_norename.get_value());
                                             run_post(data, &path, Some(json!({"value": next})), if next { "Rinomina disattivata per il torrent" } else { "Rinomina riattivata per il torrent" });
-                                        }>{move || if no_rename.get() { "Non rinominare ✓" } else { "Non rinominare" }}</button>
+                                        }>{move || format!("{}{}", tr(data, "Non rinominare"), if no_rename.get() { " ✓" } else { "" })}</button>
                                         <button class="btn sm" title=ctx_tr("Forza l'annuncio a tutti i tracker") on:click=move |_| { let path = announce_path.get_value(); run_post(data, &path, None, "Reannounce richiesto"); }>{ctx_tr("Annuncia")}</button>
                                         <a class="btn sm" download=move || format!("{}.torrent", hash_export.get_value()) href=move || format!("/api/torrents/{}/export.torrent", hash_export.get_value()) title=ctx_tr("Scarica il file .torrent di questo torrent")>{ctx_tr("Esporta .torrent")}</a>
                                         <button class="btn sm" class:primary=move || super_seeding.get() title=ctx_tr("Attiva o disattiva il super seeding (initial seeding)") on:click=move |_| {
@@ -3012,7 +3029,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             super_seeding.set(next);
                                             let path = format!("/api/torrents/{}/super-seeding", hash_super.get_value());
                                             run_post(data, &path, Some(json!({"enabled": next})), if next { "Super seeding attivo" } else { "Super seeding disattivato" });
-                                        }>{move || if super_seeding.get() { "Super seeding ✓" } else { "Super seeding" }}</button>
+                                        }>{move || format!("{}{}", tr(data, "Super seeding"), if super_seeding.get() { " ✓" } else { "" })}</button>
                                         <button class="btn sm" title=ctx_tr("Pausa, riprende e richiede nuovi peer senza rimuovere dati o stato") on:click=move |_| { let path = restart_path.get_value(); run_post(data, &path, None, "Torrent riavviato"); }>{ctx_tr("Riavvia torrent")}</button>
                                         <button class="btn sm" title=ctx_tr("Fissa il torrent in cima alla coda") on:click=move |_| { let body = json!({"hash": hash_pin.get_value()}); run_post(data, "/api/torrents/pin", Some(body), "Torrent fissato in cima"); }>{ctx_tr("Pin")}</button>
                                         <button class="btn sm" title=ctx_tr("Assegna un tag al torrent") on:click=move |_| {
@@ -3129,7 +3146,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             <thead><tr><th>{ctx_tr("Indirizzo")}</th><th>{ctx_tr("Client")}</th><th>{ctx_tr("↓")}</th><th>{ctx_tr("↑")}</th><th>{ctx_tr("Seed")}</th></tr></thead>
                                             <tbody>
                                                 {move || peers.get().iter().cloned().map(|peer| view! {
-                                                    <tr><td class="mono">{text(&peer, "address", "-")}</td><td class="muted">{text(&peer, "client", "?")}</td><td class="numeric">{size(&peer, "download_rate")}"/s"</td><td class="numeric">{size(&peer, "upload_rate")}"/s"</td><td>{if peer.get("seed").and_then(Value::as_bool).unwrap_or(false) { "sì" } else { "no" }}</td></tr>
+                                                    <tr><td class="mono">{text(&peer, "address", "-")}</td><td class="muted">{text(&peer, "client", "?")}</td><td class="numeric">{size(&peer, "download_rate")}"/s"</td><td class="numeric">{size(&peer, "upload_rate")}"/s"</td><td>{if peer.get("seed").and_then(Value::as_bool).unwrap_or(false) { tr(data, "sì") } else { tr(data, "no") }}</td></tr>
                                                 }).collect_view()}
                                             </tbody>
                                         </table>
@@ -3282,13 +3299,13 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                     <input
                         prop:value=name
                         on:input=move |event| name.set(event_target_value(&event))
-                        placeholder=move || if mode == "series" { "Nome serie da cercare" } else { "Nome film da cercare" }
+                        placeholder=move || if mode == "series" { tr(data, "Nome serie da cercare") } else { tr(data, "Nome film da cercare") }
                         title=ctx_tr("Titolo da cercare su TMDB")
                     />
                     <button class="btn primary" title=ctx_tr("Cerca il titolo su TMDB") on:click=move |_| {
                         let query = name.get();
                         if query.trim().is_empty() {
-                            tmdb_error.set("Inserisci un titolo da cercare".into());
+                            tmdb_error.set(tr(data, "Inserisci un titolo da cercare"));
                             return;
                         }
                         let kind = if mode == "series" { "series" } else { "movie" };
@@ -3311,7 +3328,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                             loading.set(false);
                             searched.set(true);
                         });
-                    }>{move || if tmdb_loading.get() { "Cerco…" } else { "Cerca su TMDB" }}</button>
+                    }>{move || if tmdb_loading.get() { tr(data, "Cerco…") } else { tr(data, "Cerca su TMDB") }}</button>
                     <button class="btn" title=ctx_tr("Aggiungi manualmente senza usare TMDB") on:click=move |_| {
                         tmdb_add_results.set(Vec::new());
                         tmdb_error.set(String::new());
@@ -3354,11 +3371,11 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                 <div class="list-item">
                                     <div class="list-row">
                                         <div class=move || if poster.is_empty() { "list-poster placeholder" } else { "list-poster" }>
-                                            {if poster.is_empty() { view! { "n/d" }.into_any() } else { view! { <img src=poster.clone() alt="" /> }.into_any() }}
+                                            {if poster.is_empty() { view! { ctx_tr("N/D") }.into_any() } else { view! { <img src=poster.clone() alt="" /> }.into_any() }}
                                         </div>
                                         <div>
                                             <strong>{title}</strong>
-                                            <small>{format!("{} {} · {}", source_label, item_id, if item_year.is_empty() { "anno n/d".to_string() } else { item_year.clone() })}</small>
+                                            <small>{format!("{} {} · {}", source_label, item_id, if item_year.is_empty() { tr(data, "anno n/d") } else { item_year.clone() })}</small>
                                             <small class="muted truncate">{overview}</small>
                                         </div>
                                     </div>
@@ -3380,7 +3397,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                 <div class="modal-backdrop" on:click=move |_| confirm_open.set(false)>
                     <div class="modal" style="width:min(560px,100%)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
                         <div class="modal-head">
-                            <strong>{move || if mode == "series" { "Conferma serie" } else { "Conferma film" }}</strong>
+                            <strong>{move || if mode == "series" { tr(data, "Conferma serie") } else { tr(data, "Conferma film") }}</strong>
                             <button class="btn sm" on:click=move |_| confirm_open.set(false)>{ctx_tr("Chiudi")}</button>
                         </div>
                         <div class="modal-body">
@@ -3393,12 +3410,12 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                 <Show when=move || mode == "movies">
                                     <label class="field" title=ctx_tr("Anno")><span>{ctx_tr("Anno")}</span><input prop:value=year on:input=move |event| year.set(event_target_value(&event)) placeholder=ctx_tr("2024") /></label>
                                 </Show>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                        <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                                  <Show when=move || mode == "series">
                                      <label class="field" title=ctx_tr("Preset lingua o codici custom separati da virgola")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                                  </Show>
                                  <Show when=move || mode != "series">
-                                     <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                     <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                                  </Show>
                                 <label class="field span-full" title=ctx_tr("Parole che non devono comparire nel titolo della release (separate da virgola)")><span>{ctx_tr("Esclusioni (exclude)")}</span><input prop:value=exclude on:input=move |event| exclude.set(event_target_value(&event)) placeholder=ctx_tr("cam, ts, screener") /></label>
                                 <Show when=move || mode == "series">
@@ -3428,7 +3445,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                     <div class="toolbar" style="margin-bottom:10px">
                         <span class="muted">{move || format!("{} selezionate", selected_series.get().len())}</span>
                         <select prop:value=bulk_language title=ctx_tr("Lingua da applicare alle serie selezionate") on:change=move |event| bulk_language.set(event_target_value(&event))>
-                            {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
+                            {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}
                         </select>
                         <button type="button" class="btn" title=ctx_tr("Imposta la lingua scelta su tutte le serie selezionate") on:click=move |_| {
                             let chosen = selected_series.get();
@@ -3446,7 +3463,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                         <button type="button" class="btn danger" title=ctx_tr("Elimina dalla libreria tutte le serie selezionate") on:click=move |_| {
                             let chosen = selected_series.get();
                             if chosen.is_empty() { return; }
-                            if !confirm_dialog(&format!("Eliminare {} serie selezionate? I file già archiviati non vengono toccati.", chosen.len())) { return; }
+                            if !confirm_dialog(&tr_format(data, "Eliminare {count} serie selezionate? I file già archiviati non vengono toccati.", &[("{count}", chosen.len().to_string())])) { return; }
                             let mut library = data.get().library;
                             if let Some(items) = library.get_mut("series").and_then(Value::as_array_mut) {
                                 items.retain(|item| !chosen.contains(&text(item, "name", "")));
@@ -3507,7 +3524,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                                 } else if complete {
                                                     view! { <span class="badge" title=ctx_tr("Al passo: tutti gli episodi pubblicati finora sono archiviati, ma la serie non è terminata")>{ctx_tr("✓ in pari")}</span> }.into_any()
                                                 } else {
-                                                    view! { <span class="badge" class:ok=enabled>{if enabled { "attiva" } else { "in pausa" }}</span> }.into_any()
+                                                     view! { <span class="badge" class:ok=enabled>{if enabled { tr(data, "attiva") } else { tr(data, "in pausa") }}</span> }.into_any()
                                                 }}
                                                 <Show when=move || (ended || complete) && !enabled>
                                                     <span class="badge" title=ctx_tr("Serie in pausa")>{ctx_tr("in pausa")}</span>
@@ -3516,7 +3533,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                             <td>
                                                 <div class="row-actions">
                                                     <button class="btn sm primary" on:click=move |_| selected.set(Some(detail_name.clone()))>{ctx_tr("Dettagli")}</button>
-                                                    <button class="btn sm" on:click=move |_| toggle_enabled(data, "series", editor_name.clone())>{if enabled { "Pausa" } else { "Attiva" }}</button>
+                                                     <button class="btn sm" on:click=move |_| toggle_enabled(data, "series", editor_name.clone())>{if enabled { ctx_tr("Pausa") } else { ctx_tr("Attiva") }}</button>
                                                     <button class="btn sm danger" on:click=move |_| {
                                                         if confirm_dialog(&format!("Eliminare la serie \"{delete_name}\"? I file già archiviati non vengono toccati.")) {
                                                             remove_library(data, "series", delete_name.clone());
@@ -3726,7 +3743,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                     let network = text(&info, "network", "");
                                     let country = text(&info, "country", "");
                                     let vote = info.get("vote").and_then(Value::as_f64).map(|value| format!("★ {value:.1}")).unwrap_or_default();
-                                    let seasons = info.get("seasons").and_then(Value::as_i64).map(|value| format!("{value} stagioni")).unwrap_or_default();
+                                     let seasons = info.get("seasons").and_then(Value::as_i64).map(|value| format!("{value} {}", tr(data, "stagioni"))).unwrap_or_default();
                                     let last = text(&info, "last_air_date", "");
                                     let last_hint = tr(data, "Ultima messa in onda");
                                     view! {
@@ -3754,7 +3771,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                         return None;
                                     }
                                     let list = seasons.iter().map(|season| season.to_string()).collect::<Vec<_>>().join(", ");
-                                    let label = format!("Stagioni disattivate: {list}");
+                                     let label = format!("{}: {list}", tr(data, "Stagioni disattivate"));
                                     Some(view! {
                                         <span class="badge err" title=ctx_tr("Stagioni escluse dal monitoraggio (modificabili in Modifica serie)")>{label}</span>
                                     })
@@ -3783,8 +3800,8 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 {move || {
                                     let status = text(&series_info.get(), "status", "");
                                     if status.is_empty() { return None; }
-                                    let label = if status.contains("Ended") || status.contains("Canceled") { "Terminata" } else { "In corso" };
-                                    Some(view! { <span class="badge">{tr(data, label)}</span> })
+                                     let label = if status.contains("Ended") || status.contains("Canceled") { tr(data, "Terminata") } else { tr(data, "In corso") };
+                                    Some(view! { <span class="badge">{tr(data, &label)}</span> })
                                 }}
                             </div>
                             <p class="series-plot">{move || {
@@ -3819,7 +3836,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 let message = missing_message;
                                 let results = missing_results;
                                 busy.set(true);
-                                message.set("Ricerca episodi mancanti in corso…".into());
+                                 message.set(tr(data, "Ricerca episodi mancanti in corso…"));
                                 results.set(Vec::new());
                                 missing_filter.set(String::new());
                                 spawn_local(async move {
@@ -3833,15 +3850,15 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                             let count = found.len();
                                             results.set(found);
                                             missing_searched.set(array(&value, "episodes"));
-                                            message.set(if searched == 0 {
-                                                "Nessun episodio mancante da cercare.".into()
-                                            } else if count == 0 {
-                                                format!("Cercati {searched} episodi mancanti: nessuna release compatibile trovata.")
-                                            } else {
-                                                format!("Cercati {searched} episodi mancanti: trovate {count} release compatibili.")
-                                            });
+                                             message.set(if searched == 0 {
+                                                 tr(data, "Nessun episodio mancante da cercare.")
+                                             } else if count == 0 {
+                                                 tr_format(data, "Cercati {searched} episodi mancanti: nessuna release compatibile trovata.", &[("{searched}", searched.to_string())])
+                                             } else {
+                                                 tr_format(data, "Cercati {searched} episodi mancanti: trovate {count} release compatibili.", &[("{searched}", searched.to_string()), ("{count}", count.to_string())])
+                                             });
                                         }
-                                        Err(error) => message.set(format!("Ricerca mancanti non riuscita: {error}")),
+                                         Err(error) => message.set(tr_format(data, "Ricerca mancanti non riuscita: {error}", &[("{error}", error)])),
                                     }
                                     busy.set(false);
                                 });
@@ -3854,22 +3871,22 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 let message = scan_message;
                                 let tick = detail_tick;
                                 busy.set(true);
-                                message.set("Scansione archivio in corso…".into());
+                                 message.set(tr(data, "Scansione archivio in corso…"));
                                 spawn_local(async move {
                                     match send("POST", &path, None).await {
                                         Ok(value) => {
                                             let updated = value.get("updated").and_then(Value::as_i64).unwrap_or(0);
                                             let found = value.get("found").and_then(Value::as_i64).unwrap_or(updated);
-                                            message.set(format!("Archivio scansionato: {found} file trovati, {updated} episodi aggiornati"));
+                                             message.set(tr_format(data, "Archivio scansionato: {found} file trovati, {updated} episodi aggiornati", &[("{found}", found.to_string()), ("{updated}", updated.to_string())]));
                                             tick.update(|value| *value += 1);
                                             trigger_refresh();
                                         }
-                                        Err(error) => message.set(format!("Errore scansione: {error}")),
+                                         Err(error) => message.set(tr_format(data, "Errore scansione: {error}", &[("{error}", error)])),
                                     }
                                     busy.set(false);
                                 });
                             }
-                        }>{move || if scan_busy.get() { "Scansione…" } else { "Scansiona archivio" }}</button>
+                        }>{move || if scan_busy.get() { tr(data, "Scansione…") } else { tr(data, "Scansiona archivio") }}</button>
                         <button class="btn sm" on:click=move |_| {
                             if let Some(name) = selected.get() {
                                 let path = format!("/api/series/{}/metadata", urlencoding::encode(&name));
@@ -3885,7 +3902,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                 let already = rename_already_ok;
                                 rename_open.set(true);
                                 busy.set(true);
-                                msg.set("Anteprima rinomina in corso…".into());
+                                 msg.set(tr(data, "Anteprima rinomina in corso…"));
                                 spawn_local(async move {
                                     match send("POST", &path, None).await {
                                         Ok(value) => {
@@ -3894,20 +3911,20 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                             let errors = list.iter().filter(|item| item.get("error").is_some()).count();
                                             already.set(already_ok);
                                             if list.is_empty() && already_ok > 0 {
-                                                msg.set(format!("Tutti i file sono già corretti ({already_ok})."));
+                                                 msg.set(tr_format(data, "Tutti i file sono già corretti ({already_ok}).", &[("{already_ok}", already_ok.to_string())]));
                                             } else if errors > 0 {
-                                                msg.set(format!("{} da rinominare, {already_ok} già corretti, {errors} errori", list.len()));
+                                                 msg.set(tr_format(data, "{pending} da rinominare, {already_ok} già corretti, {errors} errori", &[("{pending}", list.len().to_string()), ("{already_ok}", already_ok.to_string()), ("{errors}", errors.to_string())]));
                                             } else {
-                                                msg.set(format!("{} da rinominare, {already_ok} già corretti", list.len()));
+                                                 msg.set(tr_format(data, "{pending} da rinominare, {already_ok} già corretti", &[("{pending}", list.len().to_string()), ("{already_ok}", already_ok.to_string())]));
                                             }
                                             items.set(list);
                                         }
-                                        Err(error) => msg.set(format!("Anteprima non riuscita: {error}")),
+                                         Err(error) => msg.set(tr_format(data, "Anteprima non riuscita: {error}", &[("{error}", error)])),
                                     }
                                     busy.set(false);
                                 });
                             }
-                        }>{move || if rename_busy.get() { "Attendi…" } else { "Anteprima rinomina" }}</button>
+                        }>{move || if rename_busy.get() { tr(data, "Attendi…") } else { tr(data, "Anteprima rinomina") }}</button>
                         <button class="btn sm" class:primary=move || edit_open.get() title=ctx_tr("Mostra o nascondi i campi di modifica della serie") on:click=move |_| edit_open.update(|value| *value = !*value)>{ctx_tr("Modifica serie")}</button>
                         {move || {
                             let url = text(&series_info.get(), "tvdb_url", "");
@@ -3965,11 +3982,11 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                     <input prop:value=archive_path on:input=move |event| archive_path.set(event_target_value(&event)) placeholder=ctx_tr("/home/user/SerieTVArchivio/Nome") />
                                     <BrowseButton value=archive_path />
                                 </div>
-                                <small class="hint">{move || if archive_path.get().is_empty() { "Nessun percorso archivio impostato".to_string() } else { archive_path.get() }}</small>
+                                <small class="hint">{move || if archive_path.get().is_empty() { tr(data, "Nessun percorso archivio impostato") } else { archive_path.get() }}</small>
                             </div>
                             <label class="field" title=ctx_tr("Stagioni monitorate, es. 1-3,5+ (1+ = tutte)")><span>{ctx_tr("Stagioni")}</span><input prop:value=seasons on:input=move |event| seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
                             <label class="field" title=ctx_tr("Archivia gli episodi in una cartella Stagione 01, Stagione 02, … dentro la cartella archivio della serie")><span>{ctx_tr("Sottocartelle per stagione")}</span><input type="checkbox" prop:checked=move || season_subfolders.get() on:change=move |_| season_subfolders.update(|value| *value = !*value) /></label>
-                            <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                             <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                             <label class="field" title=ctx_tr("Se disattivo, una release migliore non sostituirà mai il file già archiviato per questa serie")><span>{ctx_tr("Consenti aggiornamenti")}</span><input type="checkbox" prop:checked=move || !disable_upgrades.get() on:change=move |_| disable_upgrades.update(|value| *value = !*value) /></label>
                             <label class="field" title=ctx_tr("Scegli un preset oppure inserisci codici custom separati da virgole; tutte le lingue indicate sono richieste")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                             <label class="field span-2" title=ctx_tr("Nomi alternativi con cui riconoscere la serie (separati da virgola)")><span>{ctx_tr("Alias / nomi alternativi (separati da virgola)")}</span><input prop:value=aliases on:input=move |event| aliases.set(event_target_value(&event)) /></label>
@@ -4055,7 +4072,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                                      let error = text(&item, "error", "-");
                                                      let discarded = item.get("discarded").and_then(Value::as_bool).unwrap_or(false);
                                                      let to_full = if to.is_empty() { error.clone() } else { to.clone() };
-                                                     let to_label = if discarded { "Duplicato → cestino".to_string() } else if to.is_empty() { error } else { file_name(&to) };
+                                                     let to_label = if discarded { tr(data, "Duplicato → cestino") } else if to.is_empty() { error } else { file_name(&to) };
                                                     view! {
                                                         <tr>
                                                             <td class="mono">{format!("S{:02}E{:02}", item.get("season").and_then(Value::as_i64).unwrap_or(0), item.get("episode").and_then(Value::as_i64).unwrap_or(0))}</td>
@@ -4084,15 +4101,15 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                             let pending = rename_items.get().len();
                                             // Chiede se rinominare solo i file da
                                             // sistemare o anche quelli già corretti.
-                                            let force = if already > 0 {
-                                                web_sys::window()
-                                                    .and_then(|window| window.confirm_with_message(&format!("{pending} file da rinominare, {already} già corretti. Rinominare anche quelli già corretti? OK = tutti, Annulla = solo i {pending}.")).ok())
+                                             let force = if already > 0 {
+                                                 web_sys::window()
+                                                     .and_then(|window| window.confirm_with_message(&tr_format(data, "{pending} file da rinominare, {already} già corretti. Rinominare anche quelli già corretti? OK = tutti, Annulla = solo i {pending}.", &[("{pending}", pending.to_string()), ("{already}", already.to_string())])).ok())
                                                     .unwrap_or(false)
                                             } else {
                                                 false
                                             };
                                             busy.set(true);
-                                            msg.set("Rinomina in corso…".into());
+                                                     msg.set(tr(data, "Rinomina in corso…"));
                                             spawn_local(async move {
                                                 match send("POST", &path, Some(json!({"force": force}))).await {
                                                     Ok(value) => {
@@ -4101,15 +4118,15 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                                          let discarded = value.get("discarded_count").and_then(Value::as_u64).unwrap_or(0) as usize;
                                                          let errors = list.iter().filter(|item| item.get("error").is_some()).count();
                                                          if errors > 0 {
-                                                             msg.set(format!("Rinomina eseguita: {} rinominati, {discarded} duplicati nel cestino, {errors} errori", list.len().saturating_sub(discarded + errors)));
+                                                              msg.set(tr_format(data, "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino, {errors} errori", &[("{renamed}", list.len().saturating_sub(discarded + errors).to_string()), ("{discarded}", discarded.to_string()), ("{errors}", errors.to_string())]));
                                                          } else {
-                                                             msg.set(format!("Rinomina eseguita: {} rinominati, {discarded} duplicati nel cestino ({} già corretti)", list.len().saturating_sub(discarded), already_ok));
+                                                              msg.set(tr_format(data, "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino ({already_ok} già corretti)", &[("{renamed}", list.len().saturating_sub(discarded).to_string()), ("{discarded}", discarded.to_string()), ("{already_ok}", already_ok.to_string())]));
                                                         }
                                                         items.set(list);
                                                         already_signal.set(already_ok);
                                                         trigger_refresh();
                                                     }
-                                                    Err(error) => msg.set(format!("Rinomina non riuscita: {error}")),
+                                                     Err(error) => msg.set(tr_format(data, "Rinomina non riuscita: {error}", &[("{error}", error)])),
                                                 }
                                                 busy.set(false);
                                             });
@@ -4194,10 +4211,10 @@ fn EpisodeTable(
                                             {if is_expanded { "▾" } else { "▸" }} {format!("{} {}", tr(data, "Stagione"), season_group)}
                                             <span class="muted">{format!("· {owned}/{total}")}</span>
                                             {if season_ended {
-                                                let (label, title) = if season_complete {
-                                                    ("🏁 ✓✓", "Stagione terminata e tutti gli episodi sono presenti")
-                                                } else {
-                                                    ("🏁", "Stagione terminata: mancano ancora episodi")
+                                                 let (label, title) = if season_complete {
+                                                     ("🏁 ✓✓", tr(data, "Stagione terminata e tutti gli episodi sono presenti"))
+                                                 } else {
+                                                     ("🏁", tr(data, "Stagione terminata: mancano ancora episodi"))
                                                 };
                                                 view! { <span class="badge" class:ok=season_complete title=title>{label}</span> }.into_any()
                                             } else { view! {}.into_any() }}
@@ -4227,10 +4244,10 @@ fn EpisodeTable(
                                 })
                                 .cloned()
                                 .collect::<Vec<_>>();
-                            let missing_empty_label = if missing_filter_text.trim().is_empty() {
-                                "Nessuna release compatibile trovata."
-                            } else {
-                                "Nessun risultato corrisponde al filtro."
+                             let missing_empty_label = if missing_filter_text.trim().is_empty() {
+                                 tr(data, "Nessuna release compatibile trovata.")
+                             } else {
+                                 tr(data, "Nessun risultato corrisponde al filtro.")
                             };
                             let missing_searched_for_episode = missing_targets.iter().any(|target| {
                                 target.get("season").and_then(Value::as_i64) == Some(season)
@@ -4242,14 +4259,23 @@ fn EpisodeTable(
                             } else {
                                 Vec::new()
                             };
-                            let ignore_label = if ignored { "Riattiva" } else { "Ignora" };
+                             let ignore_label = if ignored { tr(data, "Riattiva") } else { tr(data, "Ignora") };
                             let on_nas = !text(&item, "archive_path", "").is_empty();
                             // "downloaded" + "NAS" era ridondante: basta "NAS".
                             let downloaded_on_nas = status == "downloaded" && on_nas;
-                            let status_label = if downloaded_on_nas { "NAS".to_string() } else { status.clone() };
+                             let status_label = if downloaded_on_nas {
+                                 tr(data, "NAS")
+                             } else {
+                                 match status.as_str() {
+                                     "downloaded" => tr(data, "Scaricato"),
+                                     "missing" => tr(data, "Mancante"),
+                                     "ignored" => tr(data, "Ignorato"),
+                                     value => value.to_string(),
+                                 }
+                             };
                             let status_for_nas = status.clone();
                             let magnet = text(&item, "magnet_link", "");
-                            let client_state = if status == "missing" || status == "downloaded" { "No" } else { "Sì" };
+                             let client_state = if status == "missing" || status == "downloaded" { tr(data, "No") } else { tr(data, "Sì") };
                             // Nel dettaglio mostra il nome rinominato in libreria; il
                             // titolo originale del file scaricato resta nel tooltip.
                             let original_title = text(&item, "title", "-");
@@ -4267,7 +4293,7 @@ fn EpisodeTable(
                                     <td class="truncate" title=title_tooltip>
                                         <div>{title_display}</div>
                                         <Show when=move || !air_date.is_empty()>
-                                            <small class="muted">{format!("In onda / prevista: {air_date_display}")}</small>
+                                             <small class="muted">{format!("{}: {air_date_display}", tr(data, "In onda / prevista"))}</small>
                                         </Show>
                                     </td>
                                     <td>
@@ -4277,7 +4303,7 @@ fn EpisodeTable(
                                         </Show>
                                         <Show when=move || ignored><span class="badge warn">{ctx_tr("ignorato")}</span></Show>
                                     </td>
-                                    <td><span class="badge" class:ok=client_state=="Sì">{client_state}</span></td>
+                                     <td><span class="badge" class:ok=status!="missing" && status!="downloaded">{client_state}</span></td>
                                     <td class="numeric">{number(&item, "quality_score")}</td>
                                     <td>
                                         <div class="toolbar">
@@ -4293,7 +4319,7 @@ fn EpisodeTable(
                                                             let count = array(&value, "results").len();
                                                             let feeds = number(&value, "feed_matches");
                                                             results.set(array(&value, "results"));
-                                                            label.set(format!("S{season:02}E{episode:02}: {count} risultati ({feeds} dai feed)"));
+                                                             label.set(format!("S{season:02}E{episode:02}: {count} {} ({} {})", tr(data, "risultati"), feeds, tr(data, "dai feed")));
                                                         }
                                                         Err(error) => data.update(|current| current.error = error),
                                                     }
@@ -4324,7 +4350,7 @@ fn EpisodeTable(
                                 rows.push(view! {
                                     <tr class="episode-search-row">
                                         <td colspan="6">
-                                            <strong>{format!("Cerca mancanti · S{season:02}E{episode:02}")}</strong>
+                                             <strong>{format!("{} · S{season:02}E{episode:02}", tr(data, "Cerca mancanti"))}</strong>
                                             {if missing_for_episode.is_empty() {
                                                 view! { <p class="muted">{missing_empty_label}</p> }.into_any()
                                             } else {
@@ -4355,7 +4381,7 @@ fn EpisodeTable(
                                         <td colspan="6">
                                             <strong>{manual_label.clone()}</strong>
                                             {if manual_for_episode.is_empty() {
-                                                view! { <p class="muted">"Nessuna release compatibile trovata."</p> }.into_any()
+                                                 view! { <p class="muted">{ctx_tr("Nessuna release compatibile trovata.")}</p> }.into_any()
                                             } else {
                                                 view! {
                                                     <div class="episode-search-list">
@@ -4475,7 +4501,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                         <div class="toolbar" style="margin-bottom:10px">
                             <span class="muted">{move || format!("{} selezionati", selected_movies.get().len())}</span>
                             <select prop:value=bulk_movie_language title=ctx_tr("Lingua da applicare ai film selezionati") on:change=move |event| bulk_movie_language.set(event_target_value(&event))>
-                                {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
+                                {LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}
                             </select>
                             <button type="button" class="btn" title=ctx_tr("Imposta la lingua scelta su tutti i film selezionati") on:click=move |_| {
                                 let chosen = selected_movies.get();
@@ -4493,7 +4519,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                             <button type="button" class="btn danger" title=ctx_tr("Elimina dalla libreria tutti i film selezionati") on:click=move |_| {
                                 let chosen = selected_movies.get();
                                 if chosen.is_empty() { return; }
-                                if !confirm_dialog(&format!("Eliminare {} film selezionati? I file già archiviati non vengono toccati.", chosen.len())) { return; }
+                                if !confirm_dialog(&tr_format(data, "Eliminare {count} film selezionati? I file già archiviati non vengono toccati.", &[("{count}", chosen.len().to_string())])) { return; }
                                 let mut library = data.get().library;
                                 if let Some(items) = library.get_mut("movies").and_then(Value::as_array_mut) {
                                     items.retain(|item| !chosen.contains(&text(item, "name", "")));
@@ -4542,10 +4568,10 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                                 <td class="muted">{text(&item, "year", "-")}</td>
                                                 <td class="muted">{text(&item, "quality", "-")}</td>
                                                 <td class="muted">{text(&item, "language", "-")}</td>
-                                                <td><span class="badge" class:ok=enabled>{if enabled { "attivo" } else { "pausa" }}</span></td>
+                                                 <td><span class="badge" class:ok=enabled>{if enabled { tr(data, "attivo") } else { tr(data, "pausa") }}</span></td>
                                                 <td>
                                                     <div class="toolbar">
-                                                        <button class="btn sm" on:click=move |_| toggle_enabled(data, "movies", toggle_name.clone())>{if enabled { "Pausa" } else { "Attiva" }}</button>
+                                                         <button class="btn sm" on:click=move |_| toggle_enabled(data, "movies", toggle_name.clone())>{if enabled { ctx_tr("Pausa") } else { ctx_tr("Attiva") }}</button>
                                                         <button class="btn sm danger" on:click=move |_| {
                                                             if confirm_dialog(&format!("Eliminare il film \"{delete_name}\"? I file già archiviati non vengono toccati.")) {
                                                                 remove_library(data, "movies", delete_name.clone());
@@ -4632,9 +4658,9 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                              metadata_open.set(true);
                                          }>{ctx_tr("Aggiorna da TMDB/TVDB")}</button>
                                      </div>
-                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                                 <label class="field" title=ctx_tr("Se disattivo, una release migliore non sostituirà mai il file già archiviato per questo film")><span>{ctx_tr("Consenti aggiornamenti")}</span><input type="checkbox" prop:checked=move || !disable_upgrades.get() on:change=move |_| disable_upgrades.update(|value| *value = !*value) /></label>
-                                <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                                 <div class="grid-2" style="grid-column: 1 / -1">
                                     <label class="field" title=ctx_tr("ID numerico TMDB del film. Se impostato viene usato per i metadati (titolo, trama, locandina, cast) al posto della ricerca per nome.")><span>{ctx_tr("TMDB ID")}</span><input prop:value=movie_tmdb_id on:input=move |event| movie_tmdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 27205") /></label>
                                     <label class="field" title=ctx_tr("ID TheTVDB del film (usato dalla ricerca metadati TVDB). Per il dettaglio film i metadati vengono da TMDB.")><span>{ctx_tr("TVDB ID")}</span><input prop:value=movie_tvdb_id on:input=move |event| movie_tvdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 1234") /></label>
@@ -4658,9 +4684,9 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                                 (lang_c.get(), lang_c_req.get()),
                                             ];
                                             let active: Vec<String> = entries.iter().filter(|(language, _)| !language.is_empty())
-                                                .map(|(language, required)| if *required { format!("{language} (obbligatoria)") } else { format!("{language} (opzionale)") })
+                                                 .map(|(language, required)| if *required { format!("{} ({})", language, tr(data, "obbligatoria")) } else { format!("{} ({})", language, tr(data, "opzionale")) })
                                                 .collect();
-                                            if active.is_empty() { "Nessuna lingua aggiuntiva richiesta.".to_string() } else { format!("Anteprima: {}", active.join(", ")) }
+                                             if active.is_empty() { tr(data, "Nessuna lingua aggiuntiva richiesta.") } else { format!("{}: {}", tr(data, "Anteprima"), active.join(", ")) }
                                         }}</small>
                                     </div>
                                 </div>
@@ -4721,7 +4747,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                                     <option value="tvdb">"TVDB"</option>
                                                 </select>
                                                 <input prop:value=metadata_query on:input=move |event| metadata_query.set(event_target_value(&event)) placeholder=ctx_tr("Cerca titolo film…") />
-                                                <button type="submit" class="btn primary" disabled=move || metadata_loading.get()>{move || if metadata_loading.get() { "Ricerca…" } else { "Cerca" }}</button>
+                                                 <button type="submit" class="btn primary" disabled=move || metadata_loading.get()>{move || if metadata_loading.get() { tr(data, "Ricerca…") } else { tr(data, "Cerca") }}</button>
                                             </form>
                                             <Show when=move || !metadata_error.get().is_empty()>
                                                 <div class="notice err" style="margin-top:10px">{move || metadata_error.get()}</div>
@@ -4860,11 +4886,11 @@ fn TmdbResults(
                                 <span class="badge ok">{ctx_tr("Già in lista")}</span>
                             </Show>
                             <Show when=move || in_list>
-                                <button class="btn sm" on:click=move |_| page.set(library_page.to_string())>{if is_movie { "Apri in Film" } else { "Apri in Serie TV" }}</button>
+                                 <button class="btn sm" on:click=move |_| page.set(library_page.to_string())>{if is_movie { ctx_tr("Apri in Film") } else { ctx_tr("Apri in Serie TV") }}</button>
                             </Show>
                             <button class="btn sm primary" disabled=move || in_list on:click=move |_| {
                                 pending.set(Some(json!({"kind": kind_value, "name": add_name.clone(), "year": year.clone(), "tmdb_id": tmdb_id.clone()})));
-                            }>{move || if in_list { "In lista" } else { "Aggiungi alla libreria" }}</button>
+                             }>{move || if in_list { tr(data, "In lista") } else { tr(data, "Aggiungi alla libreria") }}</button>
                         </div>
                     </article>
                 }
@@ -5048,7 +5074,7 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                                     });
                                     match send("POST", "/api/tmdb/add", Some(body)).await {
                                         Ok(_) => {
-                                            message.set(format!("Aggiunto: {name_label}"));
+                                             message.set(tr_format(data, "Aggiunto: {name}", &[("{name}", name_label)]));
                                             pending.set(None);
                                             trigger_refresh();
                                         }
@@ -5057,8 +5083,8 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                                 });
                             }>
                                 <label class="field span-full" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=move || pending.get().map(|item| text(&item, "name", "")).unwrap_or_default() readonly /></label>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=add_quality on:change=move |event| add_quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
-                                <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=add_language on:change=move |event| add_language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                 <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=add_quality on:change=move |event| add_quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
+                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=add_language on:change=move |event| add_language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}</select></label>
                                 <Show when=move || pending.get().map(|item| text(&item, "kind", "series") == "series").unwrap_or(true)>
                                     <label class="field" title=ctx_tr("Quali stagioni monitorare, es. 1-3,5+")><span>{ctx_tr("Stagioni")}</span><input prop:value=add_seasons on:input=move |event| add_seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
                                     <div class="span-full"><PathPicker label="Percorso di salvataggio (NAS)" value=add_archive_path placeholder="/mnt/nas/Serie TV" /></div>
@@ -5144,7 +5170,7 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                     <button class="btn">{ctx_tr("Aggiungi magnet")}</button>
                 </form>
                 <div class="toolbar" style="margin-top:8px">
-                    <span class="muted">{move || format!("{} elementi", data.get().archive_total)}</span>
+                    <span class="muted">{move || tr_format(data, "{count} elementi", &[("{count}", data.get().archive_total.to_string())])}</span>
                     <button class="btn sm" disabled=move || { data.get().archive_page <= 1 } on:click=move |_| archive_page(data, query.get(), data.get().archive_page.saturating_sub(1))>{ctx_tr("Precedente")}</button>
                     <span>{move || format!("Pagina {} / {}", data.get().archive_page, data.get().archive_pages)}</span>
                     <button class="btn sm" disabled=move || { data.get().archive_page >= data.get().archive_pages } on:click=move |_| archive_page(data, query.get(), data.get().archive_page.saturating_add(1))>{ctx_tr("Successiva")}</button>
@@ -5619,7 +5645,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                          <td class="truncate muted" title=source_url.clone()>
                                              <a href=source_url.clone() target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">{friendly_slug(&source_url)}</a>
                                          </td>
-                                        <td><span class="badge" class:ok=enabled>{if enabled { "attivo" } else { "pausa" }}</span></td>
+                                         <td><span class="badge" class:ok=enabled>{if enabled { tr(data, "attivo") } else { tr(data, "pausa") }}</span></td>
                                         <td class="muted">{text(&item, "last_checked", "-")}</td>
                                         <td>
                                             <div class="toolbar">
@@ -5628,7 +5654,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                                     edit_save_path.set(text(&edit_item, "save_path", ""));
                                                     edit_comic.set(edit_item.clone());
                                                 } >{ctx_tr("Modifica")}</button>
-                                                <button class="btn sm" on:click=move |_| run_post(data, &format!("/api/comics/{id}/enabled"), Some(json!({"enabled": !enabled})), "Stato aggiornato")>{if enabled { "Pausa" } else { "Attiva" }}</button>
+                                                <button class="btn sm" on:click=move |_| run_post(data, &format!("/api/comics/{id}/enabled"), Some(json!({"enabled": !enabled})), "Stato aggiornato")>{if enabled { ctx_tr("Pausa") } else { ctx_tr("Attiva") }}</button>
                                                  <button class="btn sm danger" on:click=move |_| remove_monitored_comic(data, id)>{ctx_tr("Elimina")}</button>
                                             </div>
                                         </td>
@@ -5682,8 +5708,8 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                 </Panel>
                 <Panel title="Weekly pack — monitoraggio">
                     <div class="mode-banner" class:active=move || data.get().comics_weekly_enabled>
-                        <strong>{move || if data.get().comics_weekly_enabled { "Weekly pack monitorato" } else { "Weekly pack NON monitorato" }}</strong>
-                        <span>{move || if data.get().comics_weekly_enabled { "Rextto scarica automaticamente il weekly pack appena esce." } else { "Clicca «Monitora weekly pack» per farlo scaricare automaticamente ogni settimana." }}</span>
+                        <strong>{move || if data.get().comics_weekly_enabled { tr(data, "Weekly pack monitorato") } else { tr(data, "Weekly pack NON monitorato") }}</strong>
+                        <span>{move || if data.get().comics_weekly_enabled { tr(data, "Rextto scarica automaticamente il weekly pack appena esce.") } else { tr(data, "Clicca «Monitora weekly pack» per farlo scaricare automaticamente ogni settimana.") }}</span>
                     </div>
                     <label class="field" style="margin-top:10px" title=ctx_tr("Non scaricare weekly pack con data precedente a quella indicata")>
                         <span>{ctx_tr("Scarica weekly pack a partire dal")}</span>
@@ -5696,7 +5722,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                         <button class="btn primary" title=ctx_tr("Attiva o disattiva il download automatico del weekly pack") on:click=move |_| {
                             let enabled = !data.get().comics_weekly_enabled;
                             run_post(data, "/api/comics/weekly/settings", Some(json!({"enabled": enabled, "from_date": weekly_from_date.get()})), if enabled { "Weekly pack ora monitorato" } else { "Weekly pack non monitorato" });
-                        }>{move || if data.get().comics_weekly_enabled { "Disattiva monitoraggio" } else { "Monitora weekly pack" }}</button>
+                        }>{move || if data.get().comics_weekly_enabled { tr(data, "Disattiva monitoraggio") } else { tr(data, "Monitora weekly pack") }}</button>
                     </div>
                     <p class="hint">{ctx_tr("Il monitoraggio è globale: quando attivo, il weekly pack viene cercato e scaricato automaticamente. Per scaricare un solo pack specifico usa la ricerca qui sotto.")}</p>
                     <form class="form" on:submit=move |event| {
@@ -5784,9 +5810,10 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                 let (url, method) = if !magnet.is_empty() { (magnet, "magnet") } else { (torrent_url, "torrent") };
                                 let enabled = !url.is_empty();
                                 let title = format!("Weekly {date}");
-                                let status = if text(&item, "sent_at", "").is_empty() { "trovato" } else { "inviato" };
+                                 let sent = !text(&item, "sent_at", "").is_empty();
+                                 let status = if sent { tr(data, "inviato") } else { tr(data, "trovato") };
                                 view! { <tr>
-                                    <td class="truncate">{title.clone()}</td><td><span class="badge" class:ok=status=="inviato">{status}</span></td>
+                                     <td class="truncate">{title.clone()}</td><td><span class="badge" class:ok=sent>{status}</span></td>
                                     <td><button class="btn sm" disabled=!enabled title=ctx_tr("Scarica di nuovo questo weekly pack") on:click=move |_| run_post(data, "/api/comics/download", Some(json!({"url":url.clone(),"method":method,"title":title.clone(),"post_url":"","save_path":""})), "Weekly pack forzato")>{ctx_tr("Forza")}</button></td>
                                 </tr> }
                             }).collect_view()}
@@ -5929,7 +5956,7 @@ fn RenameEditor(data: RwSignal<Data>) -> impl IntoView {
             )
             .await
             {
-                Ok(_) => message.set("Rinomina salvata".into()),
+                 Ok(_) => message.set(tr(data, "Rinomina salvata")),
                 Err(error) => message.set(error),
             }
         });
@@ -5938,7 +5965,7 @@ fn RenameEditor(data: RwSignal<Data>) -> impl IntoView {
         <div class="settings-row" title=ctx_tr("Schema usato per comporre il nome dei file: base, standard, completo o personalizzato.")>
             <label>{ctx_tr("Formato")}</label>
             <select prop:value=format title=ctx_tr("Scegli lo schema di rinomina") on:change=move |event| format.set(event_target_value(&event))>
-                {RENAME_FORMAT_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
+                {RENAME_FORMAT_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{ctx_tr(label)}</option> }).collect_view()}
             </select>
             <small class="muted"></small>
         </div>
@@ -5952,9 +5979,9 @@ fn RenameEditor(data: RwSignal<Data>) -> impl IntoView {
             <div class="toolbar">
                 {RENAME_TOKENS.iter().map(|(token, label)| {
                     let token = *token;
-                    let token_title = format!("Aggiungi il segnaposto {token} al template");
+                     let token_title = tr_format(data, "Aggiungi il segnaposto {token} al template", &[("{token}", token.to_string())]);
                     view! {
-                        <button class="btn sm" title=token_title on:click=move |_| template.update(|value| value.push_str(token))>{*label}</button>
+                         <button class="btn sm" title=token_title on:click=move |_| template.update(|value| value.push_str(token))>{ctx_tr(label)}</button>
                     }
                 }).collect_view()}
             </div>
@@ -5968,6 +5995,7 @@ fn RenameEditor(data: RwSignal<Data>) -> impl IntoView {
 
 #[component]
 fn NasPathsEditor() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let rules = RwSignal::new(Vec::<Value>::new());
     let message = RwSignal::new(String::new());
     Effect::new(move |_| {
@@ -6001,7 +6029,7 @@ fn NasPathsEditor() -> impl IntoView {
             </div>
             <div class="toolbar">
                 <button class="btn sm" title=ctx_tr("Aggiungi una nuova regola tag → cartelle") on:click=move |_| rules.update(|items| items.push(json!({"tag": "", "temp_dir": "", "final_dir": ""})))>{ctx_tr("Aggiungi regola")}</button>
-                <button class="btn sm primary" title=ctx_tr("Salva tutte le regole di percorso") on:click=move |_| { let payload = Value::Array(rules.get()); let message = message; spawn_local(async move { match send("POST", "/api/tag-dir-rules", Some(payload)).await { Ok(_) => message.set("Percorsi salvati".into()), Err(error) => message.set(error) } }); }>{ctx_tr("Salva percorsi")}</button>
+                 <button class="btn sm primary" title=ctx_tr("Salva tutte le regole di percorso") on:click=move |_| { let payload = Value::Array(rules.get()); let message = message; spawn_local(async move { match send("POST", "/api/tag-dir-rules", Some(payload)).await { Ok(_) => message.set(tr(data, "Percorsi salvati")), Err(error) => message.set(tr(data, &error)) } }); }>{ctx_tr("Salva percorsi")}</button>
                 <small class="muted">{message}</small>
             </div>
         </div>
@@ -6036,6 +6064,7 @@ fn set_csv_list(item: &mut Value, key: &str, text: &str) {
 
 #[component]
 fn WatchedFoldersPanel() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let folders = RwSignal::new(Vec::<Value>::new());
     let message = RwSignal::new(String::new());
     Effect::new(move |_| {
@@ -6077,8 +6106,8 @@ fn WatchedFoldersPanel() -> impl IntoView {
                     let payload = Value::Array(folders.get());
                     spawn_local(async move {
                         match send("POST", "/api/watched-folders", Some(payload)).await {
-                            Ok(_) => message.set("Cartelle salvate".into()),
-                            Err(error) => message.set(error),
+                             Ok(_) => message.set(tr(data, "Cartelle salvate")),
+                             Err(error) => message.set(tr(data, &error)),
                         }
                     });
                 }>{ctx_tr("Salva cartelle")}</button>
@@ -6090,6 +6119,7 @@ fn WatchedFoldersPanel() -> impl IntoView {
 
 #[component]
 fn ProvidersStatusPanel() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let items = RwSignal::new(Vec::<Value>::new());
     let message = RwSignal::new(String::new());
     Effect::new(move |_| {
@@ -6121,8 +6151,8 @@ fn ProvidersStatusPanel() -> impl IntoView {
                                         let provider = text(&items.get()[index], "provider", "");
                                         spawn_local(async move {
                                             match send("POST", "/api/providers/status", Some(json!({"provider": provider}))).await {
-                                                Ok(_) => message.set("Timer azzerato".into()),
-                                                Err(error) => message.set(error),
+                                                 Ok(_) => message.set(tr(data, "Timer azzerato")),
+                                                 Err(error) => message.set(tr(data, &error)),
                                             }
                                             if let Ok(value) = get("/api/providers/status").await {
                                                 items.set(array(&value, "items"));
@@ -6142,6 +6172,7 @@ fn ProvidersStatusPanel() -> impl IntoView {
 
 #[component]
 fn EventHooksPanel() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let hooks = RwSignal::new(Vec::<Value>::new());
     let message = RwSignal::new(String::new());
     Effect::new(move |_| {
@@ -6191,8 +6222,8 @@ fn EventHooksPanel() -> impl IntoView {
                     let payload = Value::Array(hooks.get());
                     spawn_local(async move {
                         match send("POST", "/api/event-hooks", Some(payload)).await {
-                            Ok(_) => message.set("Hook salvati".into()),
-                            Err(error) => message.set(error),
+                             Ok(_) => message.set(tr(data, "Hook salvati")),
+                             Err(error) => message.set(tr(data, &error)),
                         }
                     });
                 }>{ctx_tr("Salva hook")}</button>
@@ -6205,12 +6236,13 @@ fn EventHooksPanel() -> impl IntoView {
 #[component]
 fn SettingsSaveBar() -> impl IntoView {
     let dirty = use_context::<DirtySettings>().expect("dirty settings context");
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let busy = RwSignal::new(false);
     let message = RwSignal::new(String::new());
     view! {
         <Show when=move || !dirty.items.get().is_empty()>
             <div class="settings-savebar">
-                <strong>{move || format!("{} modifiche non salvate", dirty.items.get().len())}</strong>
+                <strong>{move || tr_format(data, "{count} modifiche non salvate", &[("{count}", dirty.items.get().len().to_string())])}</strong>
                 <button class="btn primary" disabled=move || busy.get() on:click=move |_| {
                     let entries: Vec<(String, String)> = dirty.items.get().into_iter().collect();
                     busy.set(true);
@@ -6225,13 +6257,13 @@ fn SettingsSaveBar() -> impl IntoView {
                         }
                         if errors == 0 {
                             items.set(std::collections::BTreeMap::new());
-                            message.set("Impostazioni salvate".into());
+                            message.set(tr(data, "Impostazioni salvate"));
                         } else {
-                            message.set(format!("{errors} errori durante il salvataggio"));
+                            message.set(tr_format(data, "{errors} errori durante il salvataggio", &[("{errors}", errors.to_string())]));
                         }
                         busy.set(false);
                     });
-                }>{move || if busy.get() { "Salvataggio…" } else { "Salva tutte" }}</button>
+                 }>{move || if busy.get() { tr(data, "Salvataggio…") } else { tr(data, "Salva tutte") }}</button>
                 <button class="btn" on:click=move |_| dirty.items.set(std::collections::BTreeMap::new())>{ctx_tr("Ignora")}</button>
                 <small class="muted">{message}</small>
             </div>
@@ -6388,7 +6420,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                             <TextSetting label="Connessioni max per torrent" setting_key="libtorrent_max_connections_per_torrent" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "max_connections_per_torrent", "-1")) placeholder="-1 = illimitato" />
                             <TextSetting label="Upload max per torrent" setting_key="libtorrent_max_uploads_per_torrent" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "max_uploads_per_torrent", "-1")) placeholder="-1 = illimitato" />
                             <TextSetting label="Thread AIO disco" setting_key="libtorrent_aio_threads" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "aio_threads", "-1")) placeholder="-1 = auto" />
-                            <TextSetting label="Cache disco (blocchi, -1 auto)" setting_key="libtorrent_cache_size" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "cache_size", "-1")) placeholder="-1 = auto" />
+                             <TextSetting label="Cache disco (blocchi, -1 auto)" setting_key="libtorrent_cache_size" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "cache_size", "-1")) placeholder="-1 = auto" managed=Signal::derive(move || flag(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "auto_optimize", false)) />
                             <TextSetting label="Scadenza cache (s)" setting_key="libtorrent_cache_expiry" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "cache_expiry", "300")) placeholder="300" />
                             <TextSetting label="Coda alert" setting_key="libtorrent_alert_queue_size" value=Signal::derive(move || raw(&data.get().config.get("libtorrent").cloned().unwrap_or_default(), "alert_queue_size", "1000")) placeholder="1000" />
                         </SettingGroup>
@@ -6473,8 +6505,8 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
             <Show when=move || tab.get() == "notify">
                 <Panel title="Notifiche">
                     <div class="mode-banner" class:active=move || data.get().config.get("telegram_configured").and_then(Value::as_bool).unwrap_or(false)>
-                        <strong>{move || if data.get().config.get("telegram_configured").and_then(Value::as_bool).unwrap_or(false) { "Telegram configurato" } else { "Telegram non configurato" }}</strong>
-                        <span>{move || format!("Chat ID: {} · token: {}", raw(&data.get().config, "telegram_chat_id", "-"), if data.get().config.get("telegram_configured").and_then(Value::as_bool).unwrap_or(false) { "salvato" } else { "mancante" })}</span>
+                         <strong>{move || if data.get().config.get("telegram_configured").and_then(Value::as_bool).unwrap_or(false) { tr(data, "Telegram configurato") } else { tr(data, "Telegram non configurato") }}</strong>
+                         <span>{move || format!("Chat ID: {} · token: {}", raw(&data.get().config, "telegram_chat_id", "-"), if data.get().config.get("telegram_configured").and_then(Value::as_bool).unwrap_or(false) { tr(data, "salvato") } else { tr(data, "mancante") })}</span>
                     </div>
                     <BooleanSetting label="Telegram attivo" setting_key="notify_telegram" value=Signal::derive(move || raw(&data.get().config, "notify_telegram", "false")) />
                     <SecretSetting label="Telegram bot token" setting_key="telegram_bot_token" />
@@ -6586,7 +6618,7 @@ fn RamDiskControl() -> impl IntoView {
                                 let recommended = value.get("recommended").cloned().unwrap_or_default();
                                 let threshold = text(&recommended, "threshold_gb", "3.5");
                                 let margin = text(&recommended, "margin_gb", "0.5");
-                                message.set(format!("{}: {path} · {} {} GB · {} {} GB", tr(data, "RAM disk configurato"), tr(data, "massimo torrent"), threshold, tr(data, "margine"), margin));
+                                 message.set(tr_format(data, "{label}: {path} · {max_label} {threshold} GB · {margin_label} {margin} GB", &[("{label}", tr(data, "RAM disk configurato")), ("{path}", path), ("{max_label}", tr(data, "massimo torrent")), ("{threshold}", threshold), ("{margin_label}", tr(data, "margine")), ("{margin}", margin)]));
                                 trigger_refresh();
                             }
                             Err(error) => message.set(error),
@@ -6632,6 +6664,7 @@ fn TextSetting(
     let message = RwSignal::new(String::new());
     let is_managed = move || managed.map(|signal| signal.get()).unwrap_or(false);
     let dirty = use_context::<DirtySettings>();
+    let data = use_context::<RwSignal<Data>>();
     let saved = RwSignal::new(None::<String>);
     Effect::new(move |_| {
         let current = value.get();
@@ -6658,7 +6691,7 @@ fn TextSetting(
                 match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": draft_value.clone()}))).await {
                     Ok(value) => {
                         saved.set(Some(draft_value));
-                        message.set(save_message(&value));
+                        message.set(tr_opt(data, &save_message(&value)));
                         if let Some(dirty) = dirty {
                             dirty.items.update(|items| { items.remove(setting_key); });
                         }
@@ -6701,6 +6734,7 @@ fn PathSetting(
     let draft = RwSignal::new(value.get());
     let message = RwSignal::new(String::new());
     let dirty = use_context::<DirtySettings>();
+    let data = use_context::<RwSignal<Data>>();
     Effect::new(move |_| {
         let is_dirty = dirty
             .map(|current| current.items.get().contains_key(setting_key))
@@ -6716,7 +6750,7 @@ fn PathSetting(
             spawn_local(async move {
                 match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": draft_value}))).await {
                     Ok(value) => {
-                        message.set(save_message(&value));
+                        message.set(tr_opt(data, &save_message(&value)));
                         if let Some(dirty) = dirty {
                             dirty.items.update(|items| { items.remove(setting_key); });
                         }
@@ -6753,6 +6787,7 @@ fn AreaSetting(
     let draft = RwSignal::new(value.get());
     let message = RwSignal::new(String::new());
     let dirty = use_context::<DirtySettings>();
+    let data = use_context::<RwSignal<Data>>();
     Effect::new(move |_| {
         let is_dirty = dirty
             .map(|current| current.items.get().contains_key(setting_key))
@@ -6768,7 +6803,7 @@ fn AreaSetting(
             spawn_local(async move {
                 match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": draft_value}))).await {
                     Ok(value) => {
-                        message.set(save_message(&value));
+                        message.set(tr_opt(data, &save_message(&value)));
                         if let Some(dirty) = dirty {
                             dirty.items.update(|items| { items.remove(setting_key); });
                         }
@@ -6795,19 +6830,20 @@ fn SecretSetting(label: &'static str, setting_key: &'static str) -> impl IntoVie
     let draft = RwSignal::new(String::new());
     let message = RwSignal::new(String::new());
     let dirty = use_context::<DirtySettings>();
+    let data = use_context::<RwSignal<Data>>();
     view! {
         <form class="settings-row" title=ctx_tr(setting_tooltip(setting_key)) on:submit=move |event| {
             event.prevent_default();
             let value = draft.get();
             if value.trim().is_empty() {
-                message.set("Inserire un valore".into());
+                message.set(tr_opt(data, "Inserire un valore"));
                 return;
             }
             spawn_local(async move {
                 match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": value}))).await {
                     Ok(_) => {
                         draft.set(String::new());
-                        message.set("Salvato".into());
+                        message.set(tr_opt(data, "Salvato"));
                         if let Some(dirty) = dirty {
                             dirty.items.update(|items| { items.remove(setting_key); });
                         }
@@ -6853,23 +6889,23 @@ fn TmdbKeySetting(data: RwSignal<Data>) -> impl IntoView {
             <div class="stack">
                 <div class="path-picker">
                     <input type=move || if reveal.get() { "text" } else { "password" } prop:value=draft on:input=move |event| draft.set(event_target_value(&event)) placeholder=ctx_tr("incolla la chiave API TMDB") />
-                    <button type="button" class="btn sm" on:click=move |_| reveal.update(|value| *value = !*value)>{move || if reveal.get() { "Nascondi" } else { "Mostra" }}</button>
+                     <button type="button" class="btn sm" on:click=move |_| reveal.update(|value| *value = !*value)>{move || if reveal.get() { tr(data, "Nascondi") } else { tr(data, "Mostra") }}</button>
                 </div>
                 <small class="hint">{ctx_tr("Serve per titoli episodi, poster e metadati. Ottienila su themoviedb.org → Impostazioni → API.")}</small>
             </div>
              <div class="form-actions settings-actions-top">
                  <button class="btn sm primary" on:click=move |_| {
                     let value = draft.get();
-                    if value.trim().is_empty() { message.set("Inserire un valore".into()); return; }
+                     if value.trim().is_empty() { message.set(tr(data, "Inserire un valore")); return; }
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/config/settings", Some(json!({"key": "tmdb_api_key", "value": value}))).await {
-                            Ok(_) => { trigger_refresh(); message.set("Salvato".into()); }
+                             Ok(_) => { trigger_refresh(); message.set(tr(data, "Salvato")); }
                             Err(error) => message.set(error),
                         }
                     });
                 }>{ctx_tr("Salva")}</button>
-                <span class="badge" class:ok=move || configured.get()>{move || if configured.get() { "configurato" } else { "non configurato" }}</span>
+                 <span class="badge" class:ok=move || configured.get()>{move || if configured.get() { tr(data, "configurato") } else { tr(data, "non configurato") }}</span>
                 <small class="muted">{message}</small>
             </div>
         </div>
@@ -6900,22 +6936,22 @@ fn TvdbKeySetting(data: RwSignal<Data>) -> impl IntoView {
             <div class="stack">
                 <div class="path-picker">
                     <input type=move || if reveal.get() { "text" } else { "password" } prop:value=draft on:input=move |event| draft.set(event_target_value(&event)) placeholder=ctx_tr("incolla la chiave API TVDB") />
-                    <button type="button" class="btn sm" on:click=move |_| reveal.update(|value| *value = !*value)>{move || if reveal.get() { "Nascondi" } else { "Mostra" }}</button>
+                     <button type="button" class="btn sm" on:click=move |_| reveal.update(|value| *value = !*value)>{move || if reveal.get() { tr(data, "Nascondi") } else { tr(data, "Mostra") }}</button>
                 </div>
             </div>
             <div class="form-actions settings-actions-top">
                 <button class="btn sm primary" on:click=move |_| {
                     let value = draft.get();
-                    if value.trim().is_empty() { message.set("Inserire un valore".into()); return; }
+                    if value.trim().is_empty() { message.set(tr(data, "Inserire un valore")); return; }
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/config/settings", Some(json!({"key": "tvdb_api_key", "value": value}))).await {
-                            Ok(_) => { trigger_refresh(); message.set("Salvato".into()); }
+                            Ok(_) => { trigger_refresh(); message.set(tr(data, "Salvato")); }
                             Err(error) => message.set(error),
                         }
                     });
                 }>{ctx_tr("Salva")}</button>
-                <span class="badge" class:ok=move || configured.get()>{move || if configured.get() { "configurato" } else { "non configurato" }}</span>
+                 <span class="badge" class:ok=move || configured.get()>{move || if configured.get() { tr(data, "configurato") } else { tr(data, "non configurato") }}</span>
                 <small class="muted">{message}</small>
             </div>
         </div>
@@ -6931,6 +6967,7 @@ fn SelectSetting(
 ) -> impl IntoView {
     let draft = RwSignal::new(value.get());
     let message = RwSignal::new(String::new());
+    let data = use_context::<RwSignal<Data>>();
     Effect::new(move |_| draft.set(value.get()));
     view! {
         <div class="settings-row" title=ctx_tr(setting_tooltip(setting_key))>
@@ -6940,12 +6977,12 @@ fn SelectSetting(
                 draft.set(selected.clone());
                 spawn_local(async move {
                     match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": selected}))).await {
-                        Ok(value) => message.set(save_message(&value)),
+                        Ok(value) => message.set(tr_opt(data, &save_message(&value))),
                         Err(error) => message.set(error),
                     }
                 });
             }>
-                {options.iter().map(|(value, text)| view! { <option value=*value>{*text}</option> }).collect_view()}
+                {options.iter().map(|(value, text)| view! { <option value=*value>{ctx_tr(text)}</option> }).collect_view()}
             </select>
             <small class="muted">{message}</small>
         </div>
@@ -7026,7 +7063,7 @@ fn PortCheckControl(data: RwSignal<Data>) -> impl IntoView {
                             Ok(value) => {
                                 let items = value.get("ports").and_then(Value::as_array).cloned().unwrap_or_default();
                                 let available = items.iter().filter(|item| item.get("available").and_then(Value::as_bool).unwrap_or(false)).count();
-                                message.set(format!("{}: {available}/{} {}", tr(data, "Test completato"), items.len(), tr(data, "libere localmente")));
+                                 message.set(tr_format(data, "{label}: {available}/{total} {free}", &[("{label}", tr(data, "Test completato")), ("{available}", available.to_string()), ("{total}", items.len().to_string()), ("{free}", tr(data, "libere localmente"))]));
                                 ports.set(items);
                             }
                             Err(error) => message.set(error),
@@ -7068,7 +7105,7 @@ fn EngineSetting(data: RwSignal<Data>) -> impl IntoView {
                                 if engines.iter().any(|value| value == id) { engines.retain(|value| value != id); } else { engines.push(id.to_string()); }
                                 run_post(data, "/api/config/settings", Some(json!({"key": "websearch_engines", "value": serde_json::to_string(&engines).unwrap_or_else(|_| "[]".into())})), "Motori aggiornati");
                             } />
-                            <span>{*name}</span>
+                            <span>{tr(data, name)}</span>
                         </label>
                     }
                 }).collect_view()}
@@ -7125,7 +7162,7 @@ fn FeedEditor(data: RwSignal<Data>) -> impl IntoView {
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/config/settings", Some(json!({"key": "url", "value": payload}))).await {
-                            Ok(_) => message.set("Feed salvati".into()),
+                             Ok(_) => message.set(tr(data, "Feed salvati")),
                             Err(error) => message.set(error),
                         }
                     });
@@ -7166,7 +7203,7 @@ fn IndexerEditor(data: RwSignal<Data>) -> impl IntoView {
                             <label class="field span-2" title=ctx_tr("API key dell'indexer (mascherata)")><span>{ctx_tr("API key")}</span>
                                 <div class="path-picker">
                                     <input type=move || if reveal_key.get() { "text" } else { "password" } prop:value=api_key on:input=move |event| { let next = event_target_value(&event); indexers.update(|items| { if let Some(item) = items.get_mut(index) { item["api_key"] = Value::String(next); } }); } placeholder=ctx_tr("chiave API") />
-                                    <button type="button" class="btn sm" title=ctx_tr("Mostra o nascondi la chiave") on:click=move |_| reveal_key.update(|value| *value = !*value)>{move || if reveal_key.get() { "Nascondi" } else { "Mostra" }}</button>
+                                    <button type="button" class="btn sm" title=ctx_tr("Mostra o nascondi la chiave") on:click=move |_| reveal_key.update(|value| *value = !*value)>{move || if reveal_key.get() { tr(data, "Nascondi") } else { tr(data, "Mostra") }}</button>
                                 </div>
                             </label>
                         </div>
@@ -7188,7 +7225,7 @@ fn IndexerEditor(data: RwSignal<Data>) -> impl IntoView {
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/config/settings", Some(json!({"key": "indexers", "value": payload}))).await {
-                            Ok(_) => message.set("Indexer salvati".into()),
+                             Ok(_) => message.set(tr(data, "Indexer salvati")),
                             Err(error) => message.set(error),
                         }
                     });
@@ -7198,7 +7235,7 @@ fn IndexerEditor(data: RwSignal<Data>) -> impl IntoView {
                     let busy = verify_busy;
                     let msg = message;
                     busy.set(true);
-                    msg.set("Verifica indexer in corso…".into());
+                     msg.set(tr(data, "Verifica indexer in corso…"));
                     spawn_local(async move {
                         match get("/api/sources/health").await {
                             Ok(value) => {
@@ -7206,17 +7243,17 @@ fn IndexerEditor(data: RwSignal<Data>) -> impl IntoView {
                                 let found: Vec<Value> = items.into_iter().filter(|item| text(item, "kind", "") == "indexer").collect();
                                 let ok_count = found.iter().filter(|item| item.get("ok").and_then(Value::as_bool).unwrap_or(false)).count();
                                 if found.is_empty() {
-                                    msg.set("Nessun indexer configurato o attivo da verificare".into());
+                                     msg.set(tr(data, "Nessun indexer configurato o attivo da verificare"));
                                 } else {
-                                    msg.set(format!("Verifica completata: {ok_count}/{} indexer ok", found.len()));
+                                     msg.set(tr_format(data, "Verifica completata: {ok_count}/{total} indexer ok", &[("{ok_count}", ok_count.to_string()), ("{total}", found.len().to_string())]));
                                 }
                                 results.set(found);
                             }
-                            Err(error) => msg.set(format!("Verifica fallita: {error}")),
+                             Err(error) => msg.set(tr_format(data, "Verifica fallita: {error}", &[("{error}", error)])),
                         }
                         busy.set(false);
                     });
-                }>{move || if verify_busy.get() { "Verifica…" } else { "Verifica indexer" }}</button>
+                    }>{move || if verify_busy.get() { tr(data, "Verifica…") } else { tr(data, "Verifica indexer") }}</button>
                 <small class="muted">{message}</small>
             </div>
             <Show when=move || !test_results.get().is_empty()>
@@ -7225,8 +7262,8 @@ fn IndexerEditor(data: RwSignal<Data>) -> impl IntoView {
                         let ok = item.get("ok").and_then(Value::as_bool).unwrap_or(false);
                         view! {
                             <div class="list-item">
-                                <div><strong>{text(&item, "name", "-")}</strong><small>{text(&item, "error", &format!("{} risultati", number(&item, "results")))}</small></div>
-                                <span class="badge" class:ok=ok class:err=move || !ok>{if ok { "ok" } else { "errore" }}</span>
+                                 <div><strong>{text(&item, "name", "-")}</strong><small>{text(&item, "error", &tr_format(data, "{count} risultati", &[("{count}", number(&item, "results"))]))}</small></div>
+                                 <span class="badge" class:ok=ok class:err=move || !ok>{if ok { tr(data, "ok") } else { tr(data, "errore") }}</span>
                             </div>
                         }
                     }).collect_view()}
@@ -7252,7 +7289,7 @@ fn FlareSolverrEditor(data: RwSignal<Data>) -> impl IntoView {
             let message = message;
             spawn_local(async move {
                 match send("POST", "/api/config/settings", Some(json!({"key": "flaresolverr_url", "value": url}))).await {
-                    Ok(_) => { trigger_refresh(); message.set("Salvato".into()); }
+                     Ok(_) => { trigger_refresh(); message.set(tr(data, "Salvato")); }
                     Err(error) => message.set(error),
                 }
             });
@@ -7266,23 +7303,23 @@ fn FlareSolverrEditor(data: RwSignal<Data>) -> impl IntoView {
                 let busy = busy;
                 let message = message;
                 busy.set(true);
-                message.set("Test FlareSolverr in corso…".into());
+                 message.set(tr(data, "Test FlareSolverr in corso…"));
                 spawn_local(async move {
                     match send("POST", "/api/flaresolverr/test", None).await {
                         Ok(value) => {
                             let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
                             let sessions = value.get("sessions").and_then(Value::as_array).map(|items| items.len()).unwrap_or(0);
                             if ok {
-                                message.set(format!("FlareSolverr raggiungibile ({sessions} sessioni)"));
+                                 message.set(tr_format(data, "FlareSolverr raggiungibile ({sessions} sessioni)", &[("{sessions}", sessions.to_string())]));
                             } else {
-                                message.set(format!("FlareSolverr risponde ma con stato: {}", text(&value, "status", "sconosciuto")));
+                                 message.set(tr_format(data, "FlareSolverr risponde ma con stato: {status}", &[("{status}", text(&value, "status", "sconosciuto"))]));
                             }
                         }
-                        Err(error) => message.set(format!("FlareSolverr non raggiungibile: {error}")),
+                         Err(error) => message.set(tr_format(data, "FlareSolverr non raggiungibile: {error}", &[("{error}", error)])),
                     }
                     busy.set(false);
                 });
-            }>{move || if busy.get() { "Test…" } else { "Testa FlareSolverr" }}</button>
+             }>{move || if busy.get() { tr(data, "Test…") } else { tr(data, "Testa FlareSolverr") }}</button>
             <small class="muted">{message}</small>
         </div>
     }
@@ -7349,7 +7386,7 @@ fn ContentFilterEditor(data: RwSignal<Data>) -> impl IntoView {
                                 if filters.iter().any(|value| value == id) { filters.retain(|value| value != id); } else { filters.push(id.to_string()); }
                                 run_post(data, "/api/config/settings", Some(json!({"key": "content_filters", "value": serde_json::to_string(&filters).unwrap_or_else(|_| "[]".into())})), "Filtri aggiornati");
                             } />
-                            <span>{*label}</span>
+                             <span>{ctx_tr(label)}</span>
                         </label>
                     }
                 }).collect_view()}
@@ -7373,7 +7410,6 @@ fn ContentFilterEditor(data: RwSignal<Data>) -> impl IntoView {
 fn IpFilterControl(data: RwSignal<Data>) -> impl IntoView {
     let status = RwSignal::new(Value::Null);
     let message = RwSignal::new(String::new());
-    let _ = data;
     Effect::new(move |_| {
         let status = status;
         spawn_local(async move {
@@ -7399,9 +7435,9 @@ fn IpFilterControl(data: RwSignal<Data>) -> impl IntoView {
                     if value.get("active").and_then(Value::as_bool).unwrap_or(false) {
                         format!("{} regole attive", number(&value, "rules"))
                     } else if value.get("configured").and_then(Value::as_bool).unwrap_or(false) {
-                        "configurato, non caricato".to_string()
+                         tr(data, "configurato, non caricato")
                     } else {
-                        "non configurato".to_string()
+                         tr(data, "non configurato")
                     }
                 }}</strong>
             </div>
@@ -7410,7 +7446,7 @@ fn IpFilterControl(data: RwSignal<Data>) -> impl IntoView {
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/torrents/ipfilter_update", None).await {
-                            Ok(value) => message.set(format!("Caricate {} regole", number(&value, "rules"))),
+                             Ok(value) => message.set(tr_format(data, "Caricate {count} regole", &[("{count}", number(&value, "rules"))])),
                             Err(error) => message.set(error),
                         }
                         refresh();
@@ -7446,14 +7482,14 @@ fn DbPruneTool(data: RwSignal<Data>) -> impl IntoView {
                 <button class="btn sm" disabled=move || preview_busy.get() on:click=move |_| {
                     let values = terms();
                     preview_busy.set(true);
-                    message.set("Ricerca in corso…".into());
+                     message.set(tr(data, "Ricerca in corso…"));
                     spawn_local(async move {
                         match send("POST", "/api/db/prune-keyword", Some(json!({"keywords": values, "preview": true}))).await {
                             Ok(response) => {
                                 let items = array(&response, "items");
                                 let count = number(&response, "count");
                                 preview_items.set(items.clone());
-                                message.set(format!("Anteprima: {count} elementi, {} mostrati", items.len()));
+                                 message.set(tr_format(data, "Anteprima: {count} elementi, {shown} mostrati", &[("{count}", count), ("{shown}", items.len().to_string())]));
                             }
                             Err(error) => message.set(error),
                         }
@@ -7466,7 +7502,7 @@ fn DbPruneTool(data: RwSignal<Data>) -> impl IntoView {
                     spawn_local(async move {
                         match send("POST", "/api/db/prune-keyword", Some(json!({"keywords": values, "preview": false}))).await {
                             Ok(response) => {
-                                message.set(format!("Rimossi {} elementi", number(&response, "removed")));
+                                 message.set(tr_format(data, "Rimossi {count} elementi", &[("{count}", number(&response, "removed"))]));
                                 preview_items.set(Vec::new());
                             }
                             Err(error) => message.set(error),
@@ -7541,7 +7577,7 @@ fn DbOptimizeTool(data: RwSignal<Data>) -> impl IntoView {
                     if let Ok(info) = get("/api/db/info").await {
                         db_files.set(array(&info, "files"));
                     }
-                    push_toast(data, "ok", "Fatto".into());
+                     push_toast(data, "ok", tr(data, "Fatto"));
                 }
                 Err(error) => push_toast(data, "err", error),
             }
@@ -7557,8 +7593,8 @@ fn DbOptimizeTool(data: RwSignal<Data>) -> impl IntoView {
                 }).collect_view()}
             </div>
             <div class="toolbar" style="margin-top:10px">
-                <button class="btn" disabled=move || !busy.get().is_empty() title=ctx_tr("Compatta il database (VACUUM) e libera spazio") on:click=move |_| run("vacuum")>{move || if busy.get() == "vacuum" { "VACUUM…" } else { "VACUUM" }}</button>
-                <button class="btn" disabled=move || !busy.get().is_empty() title=ctx_tr("Aggiorna le statistiche del query planner (ANALYZE)") on:click=move |_| run("analyze")>{move || if busy.get() == "analyze" { "ANALYZE…" } else { "ANALYZE" }}</button>
+                 <button class="btn" disabled=move || !busy.get().is_empty() title=ctx_tr("Compatta il database (VACUUM) e libera spazio") on:click=move |_| run("vacuum")>{move || if busy.get() == "vacuum" { tr(data, "VACUUM…") } else { tr(data, "VACUUM") }}</button>
+                 <button class="btn" disabled=move || !busy.get().is_empty() title=ctx_tr("Aggiorna le statistiche del query planner (ANALYZE)") on:click=move |_| run("analyze")>{move || if busy.get() == "analyze" { tr(data, "ANALYZE…") } else { tr(data, "ANALYZE") }}</button>
                 <button class="btn sm" disabled=move || !busy.get().is_empty() on:click=move |_| refresh_files()>{ctx_tr("Aggiorna dimensioni")}</button>
                 <Show when=move || !busy.get().is_empty()><small class="muted">{ctx_tr("Operazione in corso…")}</small></Show>
             </div>
@@ -7593,7 +7629,6 @@ fn BackupSettings(data: RwSignal<Data>) -> impl IntoView {
     let cloud_dir = RwSignal::new(String::new());
     let message = RwSignal::new(String::new());
     let ftp_result = RwSignal::new(String::new());
-    let _ = data;
     Effect::new(move |_| {
         spawn_local(async move {
             if let Ok(value) = get("/api/backup/settings").await {
@@ -7640,7 +7675,7 @@ fn BackupSettings(data: RwSignal<Data>) -> impl IntoView {
                             let message = message;
                             let ftp_result = ftp_result;
                             spawn_local(async move {
-                                let yesno = |value: &Value| if value.as_bool().unwrap_or(false) { "sì" } else { "no" };
+                                 let yesno = |value: &Value| if value.as_bool().unwrap_or(false) { tr(data, "sì") } else { tr(data, "no") };
                                 match send("POST", "/api/backup/test-ftp", Some(body)).await {
                                     Ok(value) => {
                                         let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -7659,9 +7694,9 @@ fn BackupSettings(data: RwSignal<Data>) -> impl IntoView {
                                             if ok { "OK".to_string() } else { error.clone() },
                                         );
                                         ftp_result.set(summary);
-                                        message.set(if ok { "FTP: test riuscito".into() } else { format!("FTP: {error}") });
+                                         message.set(if ok { tr(data, "FTP: test riuscito") } else { tr_format(data, "FTP: {error}", &[("{error}", error.clone())]) });
                                         if ok {
-                                            push_toast(data, "ok", "FTP: test riuscito (file di prova caricato e rimosso)".into());
+                                             push_toast(data, "ok", tr(data, "FTP: test riuscito (file di prova caricato e rimosso)"));
                                         } else {
                                             push_toast(data, "err", format!("FTP: {error}"));
                                         }
@@ -7705,7 +7740,7 @@ fn BackupSettings(data: RwSignal<Data>) -> impl IntoView {
                     let message = message;
                     spawn_local(async move {
                         match send("POST", "/api/backup/settings", Some(body)).await {
-                            Ok(_) => message.set("Impostazioni backup salvate".into()),
+                             Ok(_) => message.set(tr(data, "Impostazioni backup salvate")),
                             Err(error) => message.set(error),
                         }
                     });
@@ -7714,7 +7749,7 @@ fn BackupSettings(data: RwSignal<Data>) -> impl IntoView {
                      spawn_local(async move {
                          match send("POST", "/api/backup", None).await {
                              Ok(_) => {
-                                 push_toast(data, "ok", "Backup creato".into());
+                                  push_toast(data, "ok", tr(data, "Backup creato"));
                                  trigger_refresh();
                              }
                              Err(error) => push_toast(data, "err", error),
@@ -7793,7 +7828,7 @@ fn ScoreGroupsEditor(data: RwSignal<Data>) -> impl IntoView {
         spawn_local(async move {
             match send("POST", "/api/config/settings", Some(json!({"key": key, "value": amount}))).await {
                 Ok(_) => {
-                    message.set(format!("Gruppo '{label}' salvato"));
+                     message.set(tr_format(data, "Gruppo '{label}' salvato", &[("{label}", label)]));
                     trigger_refresh();
                 }
                 Err(error) => message.set(error),
@@ -7806,7 +7841,7 @@ fn ScoreGroupsEditor(data: RwSignal<Data>) -> impl IntoView {
         spawn_local(async move {
             match send("DELETE", &format!("/api/config/settings/{}", urlencoding::encode(&key)), None).await {
                 Ok(_) => {
-                    message.set(format!("Gruppo '{name}' rimosso"));
+                     message.set(tr_format(data, "Gruppo '{name}' rimosso", &[("{name}", name)]));
                     trigger_refresh();
                 }
                 Err(error) => message.set(error),
@@ -7855,7 +7890,6 @@ fn ScoreGroupsEditor(data: RwSignal<Data>) -> impl IntoView {
 
 #[component]
 fn ScoreSimulator(data: RwSignal<Data>) -> impl IntoView {
-    let _ = data;
     let title = RwSignal::new(String::new());
     let result = RwSignal::new(Value::Null);
     let busy = RwSignal::new(false);
@@ -7883,7 +7917,7 @@ fn ScoreSimulator(data: RwSignal<Data>) -> impl IntoView {
             <p class="muted">{ctx_tr("Incolla il titolo di una release per vedere come viene analizzato e quanto vale con i pesi attuali.")}</p>
             <form class="search-row" on:submit=move |event| { event.prevent_default(); run(); }>
                 <input prop:value=title on:input=move |event| title.set(event_target_value(&event)) placeholder=ctx_tr("es. Example.Show.S01E01.1080p.WEB-DL.H264.ITA") title=ctx_tr("Titolo della release da analizzare") />
-                <button class="btn primary" disabled=move || busy.get()>{move || if busy.get() { "Calcolo…" } else { "Calcola" }}</button>
+                 <button class="btn primary" disabled=move || busy.get()>{move || if busy.get() { tr(data, "Calcolo…") } else { tr(data, "Calcola") }}</button>
             </form>
             <Show when=move || !error.get().is_empty()>
                 <div class="alert" style="margin-top:10px">{move || error.get()}</div>
@@ -7894,7 +7928,7 @@ fn ScoreSimulator(data: RwSignal<Data>) -> impl IntoView {
                         <Metric label="Punteggio (impostazioni)" value=Signal::derive(move || number(&result.get(), "score")) tone="mint" />
                         <Metric label="Punteggio base" value=Signal::derive(move || number(&result.get(), "base_score")) tone="blue" />
                         <Metric label="Tipo" value=Signal::derive(move || text(&result.get(), "kind", "-")) tone="amber" />
-                        <Metric label="Accettata" value=Signal::derive(move || if result.get().get("allowed").and_then(Value::as_bool).unwrap_or(false) { "sì".into() } else { "no".into() }) tone="violet" />
+                         <Metric label="Accettata" value=Signal::derive(move || if result.get().get("allowed").and_then(Value::as_bool).unwrap_or(false) { tr(data, "sì") } else { tr(data, "no") }) tone="violet" />
                     </div>
                     <div class="grid-2">
                         <div class="table-wrap">
@@ -7947,7 +7981,7 @@ fn ScoreEditor(data: RwSignal<Data>) -> impl IntoView {
         <div class="stack">
             {SCORE_GROUPS.iter().map(|(group, fields)| view! {
                 <div>
-                    <div class="field span-full" style="margin:10px 0 6px"><span>{*group}</span></div>
+                     <div class="field span-full" style="margin:10px 0 6px"><span>{ctx_tr(group)}</span></div>
                     <div class="form-grid">
                         {fields.iter().map(|(label, key, default)| {
                             let value = Signal::derive(move || text(&data.get().config.get("score_settings").cloned().unwrap_or_default(), key, default));
@@ -7969,6 +8003,7 @@ fn ScoreField(
 ) -> impl IntoView {
     let draft = RwSignal::new(value.get());
     let message = RwSignal::new(String::new());
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let dirty = use_context::<DirtySettings>();
     Effect::new(move |_| draft.set(value.get()));
     view! {
@@ -7988,7 +8023,7 @@ fn ScoreField(
                     spawn_local(async move {
                         match send("POST", "/api/config/settings", Some(json!({"key": setting_key, "value": draft_value}))).await {
                             Ok(_) => {
-                                message.set("Salvato".into());
+                                 message.set(tr(data, "Salvato"));
                                 if let Some(dirty) = dirty {
                                     dirty.items.update(|items| { items.remove(setting_key); });
                                 }
@@ -8082,8 +8117,8 @@ fn IntegrationsView(data: RwSignal<Data>) -> impl IntoView {
                 <Panel title="Trakt">
                     <div class="stack">
                         <div class="mode-banner" class:active=move || data.get().trakt.get("authenticated").and_then(Value::as_bool).unwrap_or(false)>
-                            <strong>{move || if data.get().trakt.get("authenticated").and_then(Value::as_bool).unwrap_or(false) { "Trakt: autenticato" } else if trakt_configured.get() { "Trakt: configurato, da autenticare" } else { "Trakt: non configurato" }}</strong>
-                            <span>{move || format!("client_id: {} · secret: {}", if trakt_id.get().is_empty() { "mancante" } else { "salvato" }, if trakt_configured.get() { "salvato" } else { "mancante" })}</span>
+                             <strong>{move || if data.get().trakt.get("authenticated").and_then(Value::as_bool).unwrap_or(false) { tr(data, "Trakt: autenticato") } else if trakt_configured.get() { tr(data, "Trakt: configurato, da autenticare") } else { tr(data, "Trakt: non configurato") }}</strong>
+                             <span>{move || format!("client_id: {} · secret: {}", if trakt_id.get().is_empty() { tr(data, "mancante") } else { tr(data, "salvato") }, if trakt_configured.get() { tr(data, "salvato") } else { tr(data, "mancante") })}</span>
                         </div>
                         <p class="hint">{ctx_tr("Crea un'app su trakt.tv (Settings → Your API Apps), imposta come Redirect URI una qualsiasi (es. urn:ietf:wg:oauth:2.0:oob) e incolla qui client_id e client_secret. Poi premi Avvia accesso.")}</p>
                         <form class="form" on:submit=move |event| { event.prevent_default(); let body = json!({"trakt_client_id": trakt_id.get(), "trakt_client_secret": trakt_secret.get()}); trakt_secret.set(String::new()); run_post(data, "/api/trakt/settings", Some(body), "Credenziali Trakt salvate"); }>
@@ -8121,7 +8156,7 @@ fn IntegrationsView(data: RwSignal<Data>) -> impl IntoView {
                 </Panel>
                 <Panel title="Simkl">
                     <div class="stack">
-                        <StatLine label="Stato" value=Signal::derive(move || if data.get().simkl.get("authenticated").and_then(Value::as_bool).unwrap_or(false) { "autenticato".to_string() } else if data.get().simkl.get("configured").and_then(Value::as_bool).unwrap_or(false) { "configurato".to_string() } else { "non configurato".to_string() }) />
+                             <StatLine label="Stato" value=Signal::derive(move || if data.get().simkl.get("authenticated").and_then(Value::as_bool).unwrap_or(false) { tr(data, "autenticato") } else if data.get().simkl.get("configured").and_then(Value::as_bool).unwrap_or(false) { tr(data, "configurato") } else { tr(data, "non configurato") }) />
                         <p class="hint">{ctx_tr("Autenticazione PIN: crea un'app PIN/device su simkl.com/settings/developer/new, incolla il client_id e premi Salva; poi Avvia PIN, apri simkl.com/pin, inserisci il codice mostrato e premi Conferma. Usa un'app PIN/device (legacy V1): un client OAuth V2 può restituire unauthorized_client.")}</p>
                         <form class="toolbar" on:submit=move |event| { event.prevent_default(); let body = json!({"simkl_client_id": simkl_id.get()}); run_post(data, "/api/simkl/settings", Some(body), "Client ID salvato"); }>
                             <input prop:value=simkl_id on:input=move |event| simkl_id.set(event_target_value(&event)) placeholder=ctx_tr("Simkl client_id") />
@@ -8161,20 +8196,20 @@ fn IntegrationsView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Jellyfin / Plex">
                 <div class="grid-2">
                     <div class="stack">
-                        <div class="toolbar"><strong>{ctx_tr("Jellyfin")}</strong><span class="badge" class:ok=move || data.get().config.get("jellyfin_configured").and_then(Value::as_bool).unwrap_or(false)>{move || if data.get().config.get("jellyfin_configured").and_then(Value::as_bool).unwrap_or(false) { "configurato" } else { "non configurato" }}</span></div>
+                         <div class="toolbar"><strong>{ctx_tr("Jellyfin")}</strong><span class="badge" class:ok=move || data.get().config.get("jellyfin_configured").and_then(Value::as_bool).unwrap_or(false)>{move || if data.get().config.get("jellyfin_configured").and_then(Value::as_bool).unwrap_or(false) { tr(data, "configurato") } else { tr(data, "non configurato") }}</span></div>
                         <label class="field" title=ctx_tr("URL del server Jellyfin")><span>{ctx_tr("URL Jellyfin")}</span><input prop:value=jellyfin_url on:input=move |event| jellyfin_url.set(event_target_value(&event)) placeholder=ctx_tr("http://127.0.0.1:8096") /></label>
                         <label class="field" title=ctx_tr("API key di Jellyfin (non visualizzata dopo il salvataggio)")><span>{ctx_tr("API key Jellyfin")}</span><input type="password" prop:value=jellyfin_key on:input=move |event| jellyfin_key.set(event_target_value(&event)) placeholder=ctx_tr("non visualizzata") /></label>
                         <div class="toolbar">
-                            <button class="btn sm primary" on:click=move |_| { let url = jellyfin_url.get(); let key = jellyfin_key.get(); let message = sync_message; spawn_local(async move { if !url.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"jellyfin_url","value":url}))).await; } if !key.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"jellyfin_api_key","value":key}))).await; } message.set("Jellyfin salvato".into()); trigger_refresh(); }); }>{ctx_tr("Salva")}</button>
+                             <button class="btn sm primary" on:click=move |_| { let url = jellyfin_url.get(); let key = jellyfin_key.get(); let message = sync_message; spawn_local(async move { if !url.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"jellyfin_url","value":url}))).await; } if !key.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"jellyfin_api_key","value":key}))).await; } message.set(tr(data, "Jellyfin salvato")); trigger_refresh(); }); }>{ctx_tr("Salva")}</button>
                             <button class="btn sm" title=ctx_tr("Forza l'aggiornamento della libreria Jellyfin") on:click=move |_| run_post(data, "/api/jellyfin/refresh", None, "Jellyfin aggiornato")>{ctx_tr("Aggiorna libreria")}</button>
                         </div>
                     </div>
                     <div class="stack">
-                        <div class="toolbar"><strong>{ctx_tr("Plex")}</strong><span class="badge" class:ok=move || data.get().config.get("plex_configured").and_then(Value::as_bool).unwrap_or(false)>{move || if data.get().config.get("plex_configured").and_then(Value::as_bool).unwrap_or(false) { "configurato" } else { "non configurato" }}</span></div>
+                         <div class="toolbar"><strong>{ctx_tr("Plex")}</strong><span class="badge" class:ok=move || data.get().config.get("plex_configured").and_then(Value::as_bool).unwrap_or(false)>{move || if data.get().config.get("plex_configured").and_then(Value::as_bool).unwrap_or(false) { tr(data, "configurato") } else { tr(data, "non configurato") }}</span></div>
                         <label class="field" title=ctx_tr("URL del server Plex")><span>{ctx_tr("URL Plex")}</span><input prop:value=plex_url on:input=move |event| plex_url.set(event_target_value(&event)) placeholder=ctx_tr("http://127.0.0.1:32400") /></label>
                         <label class="field" title=ctx_tr("Token Plex (non visualizzato dopo il salvataggio)")><span>{ctx_tr("Token Plex")}</span><input type="password" prop:value=plex_token on:input=move |event| plex_token.set(event_target_value(&event)) placeholder=ctx_tr("non visualizzato") /></label>
                         <div class="toolbar">
-                            <button class="btn sm primary" on:click=move |_| { let url = plex_url.get(); let token = plex_token.get(); let message = sync_message; spawn_local(async move { if !url.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"plex_url","value":url}))).await; } if !token.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"plex_token","value":token}))).await; } message.set("Plex salvato".into()); trigger_refresh(); }); }>{ctx_tr("Salva")}</button>
+                             <button class="btn sm primary" on:click=move |_| { let url = plex_url.get(); let token = plex_token.get(); let message = sync_message; spawn_local(async move { if !url.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"plex_url","value":url}))).await; } if !token.trim().is_empty() { let _ = send("POST", "/api/config/settings", Some(json!({"key":"plex_token","value":token}))).await; } message.set(tr(data, "Plex salvato")); trigger_refresh(); }); }>{ctx_tr("Salva")}</button>
                             <button class="btn sm" title=ctx_tr("Forza l'aggiornamento della libreria Plex") on:click=move |_| run_post(data, "/api/plex/refresh", None, "Plex aggiornato")>{ctx_tr("Aggiorna libreria")}</button>
                         </div>
                     </div>
@@ -8233,8 +8268,8 @@ fn IntegrationsView(data: RwSignal<Data>) -> impl IntoView {
                             let origin = window.location().origin().unwrap_or_default();
                             let handler = format!("{origin}/magnet?url=%s");
                             match window.navigator().register_protocol_handler("magnet", &handler, "Rextto") {
-                                Ok(_) => push_toast(data, "info", "Registrazione gestore magnet inviata al browser".into()),
-                                Err(_) => push_toast(data, "err", "Il browser non ha accettato la registrazione (serve HTTPS o localhost): usa gli handler xdg qui sopra".into()),
+                                 Ok(_) => push_toast(data, "info", tr(data, "Registrazione gestore magnet inviata al browser")),
+                                 Err(_) => push_toast(data, "err", tr(data, "Il browser non ha accettato la registrazione (serve HTTPS o localhost): usa gli handler xdg qui sopra")),
                             }
                         }
                     }>{ctx_tr("Registra gestore magnet nel browser")}</button>
@@ -8327,7 +8362,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     <button class="btn" title=ctx_tr("Riavvia il servizio rextto per applicare gli aggiornamenti (richiede l'helper installato una volta da root)") on:click=move |_| {
                         spawn_local(async move {
                             match send("POST", "/api/service/restart", None).await {
-                                Ok(_) => push_toast(data, "ok", "Riavvio del servizio richiesto…".into()),
+                         Ok(_) => push_toast(data, "ok", tr(data, "Riavvio del servizio richiesto…")),
                                 Err(error) => push_toast(data, "err", error),
                             }
                         });
@@ -8357,15 +8392,15 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                                     let count = value.get("count").and_then(Value::as_i64).unwrap_or(items.len() as i64);
                                     duplicates.set(items);
                                     duplicates_count.set(count);
-                                    duplicates_message.set(if count == 0 {
-                                        "Nessun duplicato trovato".to_string()
-                                    } else {
-                                        format!("{count} candidati trovati (in tabella sotto)")
-                                    });
-                                }
-                                Err(error) => {
-                                    duplicates_message.set(format!("Errore: {error}"));
-                                    push_toast(data, "err", error);
+                                     duplicates_message.set(if count == 0 {
+                                         tr(data, "Nessun duplicato trovato")
+                                     } else {
+                                         tr_format(data, "{count} candidati trovati (in tabella sotto)", &[("{count}", count.to_string())])
+                                     });
+                                 }
+                                 Err(error) => {
+                                     duplicates_message.set(tr_format(data, "Errore: {error}", &[("{error}", error.clone())]));
+                                     push_toast(data, "err", tr(data, &error));
                                 }
                             }
                             duplicates_busy.set(false);
@@ -8381,18 +8416,18 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                                     let removed = number(&value, "removed");
                                     duplicates.set(Vec::new());
                                     duplicates_count.set(0);
-                                    duplicates_message.set(format!("Pulizia completata: {removed} nel trash"));
-                                    push_toast(data, "ok", format!("{removed} duplicati spostati nel trash"));
+                                     duplicates_message.set(tr_format(data, "Pulizia completata: {removed} nel trash", &[("{removed}", removed.clone())]));
+                                     push_toast(data, "ok", tr_format(data, "{removed} duplicati spostati nel trash", &[("{removed}", removed.to_string())]));
                                 }
                                 Err(error) => {
-                                    duplicates_message.set(format!("Errore: {error}"));
-                                    push_toast(data, "err", error);
+                                     duplicates_message.set(tr_format(data, "Errore: {error}", &[("{error}", error.clone())]));
+                                     push_toast(data, "err", tr(data, &error));
                                 }
                             }
                             duplicates_busy.set(false);
                         });
                     }>{move || if duplicates_busy.get() { ctx_tr("Attendere…").get() } else { ctx_tr("Pulisci duplicati").get() }}</button>
-                    <span class="muted">{move || if duplicates_message.get().is_empty() { format!("{} candidati", duplicates_count.get()) } else { duplicates_message.get() }}</span>
+                     <span class="muted">{move || if duplicates_message.get().is_empty() { tr_format(data, "{count} candidati", &[("{count}", duplicates_count.get().to_string())]) } else { duplicates_message.get() }}</span>
                 </div>
                 <Show when=move || duplicates_busy.get()>
                     <p class="muted">{ctx_tr("Scansione delle cartelle in corso…")}</p>
@@ -8435,7 +8470,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                             }
                         });
                     }>{ctx_tr("Testa sorgenti")}</button>
-                    <span class="muted">{move || format!("{} sorgenti", sources.get().len())}</span>
+                    <span class="muted">{move || tr_format(data, "{count} sorgenti", &[("{count}", sources.get().len().to_string())])}</span>
                     <button class="btn sm" on:click=move |_| { let ports = ports; spawn_local(async move { if let Ok(value) = get("/api/config/check-ports").await { ports.set(value); } }); }>{ctx_tr("Verifica porte")}</button>
                     <button class="btn sm" on:click=move |_| run_post(data, "/api/test-notification", Some(json!({"message": "Rextto test"})), "Notifica inviata")>{ctx_tr("Test notifica")}</button>
                 </div>
@@ -8445,8 +8480,8 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                         let results = item.get("results").and_then(Value::as_i64);
                         view! {
                             <div class="list-item">
-                                <div><strong>{text(&item, "name", "-")}</strong><small class="mono">{text(&item, "kind", "-")}{results.map(|value| format!(" · {value} risultati")).unwrap_or_default()}</small></div>
-                                <span class="badge" class:ok=ok class:err=move || !ok>{if ok { "ok" } else { "errore" }}</span>
+                                 <div><strong>{text(&item, "name", "-")}</strong><small class="mono">{text(&item, "kind", "-")}{results.map(|value| format!(" · {}", tr_format(data, "{count} risultati", &[("{count}", value.to_string())]))).unwrap_or_default()}</small></div>
+                                 <span class="badge" class:ok=ok class:err=move || !ok>{if ok { tr(data, "ok") } else { tr(data, "errore") }}</span>
                             </div>
                         }
                     }).collect_view()}
@@ -8455,7 +8490,7 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
                     <div class="list" style="margin-top:8px">
                         {move || ports.get().get("ports").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|item| {
                             let available = item.get("available").and_then(Value::as_bool).unwrap_or(false);
-                            view! { <div class="list-item"><span class="mono">{format!("porta {}", number(&item, "port"))}</span><span class="badge" class:ok=available class:err=move || !available>{if available { "libera" } else { "occupata" }}</span></div> }
+                             view! { <div class="list-item"><span class="mono">{tr_format(data, "porta {port}", &[("{port}", number(&item, "port"))])}</span><span class="badge" class:ok=available class:err=move || !available>{if available { tr(data, "libera") } else { tr(data, "occupata") }}</span></div> }
                         }).collect_view()}
                     </div>
                 </Show>
@@ -8481,10 +8516,10 @@ fn MaintenanceView(data: RwSignal<Data>) -> impl IntoView {
              <Panel title="Trash">
                  <div class="stack">
                      <div class="row"><span class="muted">{ctx_tr("Percorso trash")}</span><strong class="mono">{move || text(&trash.get(), "path", "-")}</strong></div>
-                     <div class="row"><span class="muted">{ctx_tr("Stato cartella")}</span><strong>{move || if trash.get().get("exists").and_then(Value::as_bool).unwrap_or(false) { "presente" } else { "non presente" }}</strong></div>
-                     <div class="row"><span class="muted">{ctx_tr("Elementi")}</span><strong>{move || number(&trash.get(), "count")}</strong></div>
-                     <div class="row"><span class="muted">{ctx_tr("Dimensione")}</span><strong>{move || size(&trash.get(), "total_bytes")}</strong></div>
-                     <div class="row"><span class="muted">{ctx_tr("Conservazione")}</span><strong>{move || format!("{} giorni", number(&trash.get(), "retention_days"))}</strong></div>
+                      <div class="row"><span class="muted">{ctx_tr("Stato cartella")}</span><strong>{move || if trash.get().get("exists").and_then(Value::as_bool).unwrap_or(false) { tr(data, "presente") } else { tr(data, "non presente") }}</strong></div>
+                      <div class="row"><span class="muted">{ctx_tr("Elementi")}</span><strong>{move || number(&trash.get(), "count")}</strong></div>
+                      <div class="row"><span class="muted">{ctx_tr("Dimensione")}</span><strong>{move || size(&trash.get(), "total_bytes")}</strong></div>
+                      <div class="row"><span class="muted">{ctx_tr("Conservazione")}</span><strong>{move || format!("{} {}", number(&trash.get(), "retention_days"), tr(data, "giorni"))}</strong></div>
                      <div class="toolbar">
                          <button class="btn" on:click=move |_| {
                              let refresh_trash = refresh_trash;
@@ -8694,9 +8729,9 @@ fn LogsView(data: RwSignal<Data>) -> impl IntoView {
                     <input style="flex:1" prop:value=filter on:input=move |event| filter.set(event_target_value(&event)) placeholder=ctx_tr("Filtra…") />
                     <label class="check" title=ctx_tr("Numero di righe di log da caricare (50–5000)")><span>{ctx_tr("Righe")}</span><input style="width:80px" prop:value=limit on:change=reload_limit /></label>
                     <button class="btn sm" class:primary=move || follow.get() on:click=move |_| follow.update(|value| *value = !*value)>
-                        {move || if follow.get() { "⏸ Ferma scorrimento" } else { "▶ Riprendi" }}
+                        {move || if follow.get() { tr(data, "⏸ Ferma scorrimento") } else { tr(data, "▶ Riprendi") }}
                     </button>
-                    <small class="muted">{move || if loading.get() { "Caricamento…".to_string() } else { format!("{} righe", filtered.get().len()) }}</small>
+                    <small class="muted">{move || if loading.get() { tr(data, "Caricamento…") } else { format!("{} {}", filtered.get().len(), tr(data, "righe")) }}</small>
                 </div>
                 <pre class="log-view" node_ref=log_ref inner_html=move || filtered.get().join("\n")></pre>
             </Panel>
@@ -8727,7 +8762,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
         <Panel title="Servizio Rextto">
             <div class="toolbar" style="margin-bottom:10px">
                 <button class="btn sm" disabled=move || busy.get() on:click=move |_| reload()>
-                    {move || if busy.get() { "Aggiorna…" } else { "Aggiorna" }}
+                    {move || if busy.get() { tr(data, "Aggiorna…") } else { tr(data, "Aggiorna") }}
                 </button>
                 <span class="muted">{ctx_tr("Stato di rextto.service e riavvio senza password.")}</span>
             </div>
@@ -8750,7 +8785,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                                             <button class="btn sm" title=ctx_tr("Avvia rextto.service") on:click=move |_| {
                                                 spawn_local(async move {
                                                     match send("POST", "/api/service/restart", Some(json!({"action": "start"}))).await {
-                                                        Ok(_) => push_toast(data, "ok", "Avvio del servizio richiesto…".into()),
+                                                         Ok(_) => push_toast(data, "ok", tr(data, "Avvio del servizio richiesto…")),
                                                         Err(error) => push_toast(data, "err", error),
                                                     }
                                                 });
@@ -8758,7 +8793,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                                             <button class="btn sm" title=ctx_tr("Riavvia rextto.service senza password") on:click=move |_| {
                                                 spawn_local(async move {
                                                     match send("POST", "/api/service/restart", Some(json!({"action": "restart"}))).await {
-                                                        Ok(_) => push_toast(data, "ok", "Riavvio del servizio richiesto…".into()),
+                                                         Ok(_) => push_toast(data, "ok", tr(data, "Riavvio del servizio richiesto…")),
                                                         Err(error) => push_toast(data, "err", error),
                                                     }
                                                 });
@@ -8766,7 +8801,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                                             <button class="btn sm danger" title=ctx_tr("Ferma rextto.service (la UI si interrompe finché non lo riavvii da terminale)") on:click=move |_| {
                                                 spawn_local(async move {
                                                     match send("POST", "/api/service/restart", Some(json!({"action": "stop"}))).await {
-                                                        Ok(_) => push_toast(data, "info", "Arresto del servizio richiesto…".into()),
+                                                         Ok(_) => push_toast(data, "info", tr(data, "Arresto del servizio richiesto…")),
                                                         Err(error) => push_toast(data, "err", error),
                                                     }
                                                 });
@@ -8798,8 +8833,8 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                                     <tr title=if is_flaresolverr { Some(ctx_tr("Servizio FlareSolverr configurato come supporto anti-Cloudflare").get()) } else { None }>
                                         <td>{text(&entry, "name", "-")}</td>
                                         <td class="mono truncate muted">{text(&entry, "url", "-")}</td>
-                                        <td><span class="badge ok">{if is_flaresolverr { "configurato" } else { "sì" }}</span></td>
-                                        <td><span class="badge" class:ok=reachable class:err=!reachable>{if reachable { format!("ok ({status})") } else { "non raggiungibile".into() }}</span></td>
+                                         <td><span class="badge ok">{if is_flaresolverr { tr(data, "configurato") } else { tr(data, "sì") }}</span></td>
+                                         <td><span class="badge" class:ok=reachable class:err=!reachable>{if reachable { format!("{} ({status})", tr(data, "ok")) } else { tr(data, "non raggiungibile") }}</span></td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
@@ -8835,7 +8870,7 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
             <Panel title="Runtime">
                 <div class="grid-3">
                     <StatLine label="Processo" value=Signal::derive(move || number(&data.get().health, "process_id")) />
-                    <StatLine label="Data directory scrivibile" value=Signal::derive(move || if data.get().health.get("data_dir_writable").and_then(Value::as_bool).unwrap_or(false) { "sì".into() } else { "no".into() }) />
+                     <StatLine label="Data directory scrivibile" value=Signal::derive(move || if data.get().health.get("data_dir_writable").and_then(Value::as_bool).unwrap_or(false) { tr(data, "sì") } else { tr(data, "no") }) />
                     <StatLine label="Load average" value=Signal::derive(move || data.get().health.get("load_average").and_then(Value::as_f64).map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".into())) />
                     <StatLine label="CPU / RAM sistema" value=Signal::derive(move || format!("{} / {}", data.get().health.get("cpu_percent").and_then(Value::as_f64).map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".into()), size(&data.get().health, "memory_available_bytes"))) />
                     <StatLine label="File in trash" value=Signal::derive(move || number(&data.get().health, "trash_file_count")) />
@@ -8863,8 +8898,8 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                                             <tr>
                                                 <td>{text(&entry, "label", "-")}</td>
                                                 <td class="mono truncate muted">{text(&entry, "path", "-")}</td>
-                                                <td><span class="badge" class:ok=exists class:err=!exists>{if exists { "sì" } else { "no" }}</span></td>
-                                                <td><span class="badge" class:ok=writable class:err=!writable>{if writable { "sì" } else { "no" }}</span></td>
+                                                 <td><span class="badge" class:ok=exists class:err=!exists>{if exists { tr(data, "sì") } else { tr(data, "no") }}</span></td>
+                                                 <td><span class="badge" class:ok=writable class:err=!writable>{if writable { tr(data, "sì") } else { tr(data, "no") }}</span></td>
                                             </tr>
                                         }
                                     }).collect_view()}
@@ -8887,7 +8922,7 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                                 view! {
                                     <div class="disk-row" title=format!("{} · {}", text(&disk, "filesystem", "-"), mount_hint)>
                                         <span class="mono truncate">{mount}</span>
-                                        <span class="muted">{format!("{} liberi / {} · {:.0}% usato", size_str(free), size_str(total), used)}</span>
+                                         <span class="muted">{tr_format(data, "{free} liberi / {total} · {used}% usato", &[("{free}", size_str(free)), ("{total}", size_str(total)), ("{used}", format!("{used:.0}"))])}</span>
                                     </div>
                                 }
                             }).collect_view()}
@@ -8909,11 +8944,11 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                             loaded.set(true);
                             sources_busy.set(false);
                         });
-                    }>{move || if sources_busy.get() { "Verifica…" } else { "Verifica sorgenti" }}</button>
+                     }>{move || if sources_busy.get() { tr(data, "Verifica…") } else { tr(data, "Verifica sorgenti") }}</button>
                     <span class="muted">{move || {
                         let items = sources.get();
                         let ok = items.iter().filter(|item| item.get("ok").and_then(Value::as_bool).unwrap_or(false)).count();
-                        if items.is_empty() { if sources_loaded.get() { "nessuna sorgente".to_string() } else { "non verificato".to_string() } } else { format!("{ok}/{} sane", items.len()) }
+                         if items.is_empty() { if sources_loaded.get() { tr(data, "nessuna sorgente") } else { tr(data, "non verificato") } } else { format!("{ok}/{} {}", items.len(), tr(data, "sane")) }
                     }}</span>
                 </div>
                 <div class="table-wrap">
@@ -8924,14 +8959,14 @@ fn HealthView(data: RwSignal<Data>) -> impl IntoView {
                                 let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
                                 let detail = {
                                     let error = text(&entry, "error", "");
-                                    if !error.is_empty() { error } else { let results = entry.get("results").and_then(Value::as_i64).unwrap_or(0); if results > 0 { format!("{results} risultati") } else { String::new() } }
+                                     if !error.is_empty() { error } else { let results = entry.get("results").and_then(Value::as_i64).unwrap_or(0); if results > 0 { tr_format(data, "{count} risultati", &[("{count}", results.to_string())]) } else { String::new() } }
                                 };
                                 let detail_hint = detail.clone();
                                 view! {
                                     <tr>
                                         <td class="muted">{text(&entry, "kind", "-")}</td>
                                         <td class="truncate">{text(&entry, "name", "-")}</td>
-                                        <td><span class="badge" class:ok=ok class:err=!ok>{if ok { "ok" } else { "errore" }}</span></td>
+                                        <td><span class="badge" class:ok=ok class:err=!ok>{if ok { tr(data, "ok") } else { tr(data, "errore") }}</span></td>
                                         <td class="truncate muted" title=detail_hint>{detail}</td>
                                     </tr>
                                 }
@@ -8970,7 +9005,7 @@ fn MissingView(data: RwSignal<Data>) -> impl IntoView {
                                 <details class="panel" style="padding:0">
                                     <summary class="list-item" style="cursor:pointer">
                                         <strong>{series_name.clone()}</strong>
-                                        <span class="badge warn">{format!("{count} episodi mancanti")}</span>
+                                         <span class="badge warn">{tr_format(data, "{count} episodi mancanti", &[("{count}", count.to_string())])}</span>
                                     </summary>
                                     <div class="table-wrap" style="padding:0 12px 12px">
                                         <table class="data-table">

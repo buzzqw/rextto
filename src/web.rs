@@ -10009,19 +10009,22 @@ fn libtorrent_optimization(cfg: &Config) -> LibtorrentOptimization {
     // legacy non deriva la coda dal tetto di banda: mantiene una base stabile e
     // lascia che la coda dinamica si adatti a runtime. I suggerimenti di memoria
     // sono separati e mirano ai burst di scrittura su NFS/NAS.
-    let (cache_size, queue_mb, send_buffer_kb, peer_list): (i64, i64, i64, i64) =
+    let (queue_mb, send_buffer_kb, peer_list): (i64, i64, i64) =
         if memory_mb > 0 && memory_mb < 2048 {
-            (0, 8, 256, 100)
+            (8, 256, 100)
         } else if memory_mb < 4096 {
-            (1024, 32, 512, 200)
+            (32, 512, 200)
         } else if memory_mb < 8192 {
-            (8192, 64, 1024, 300)
+            (64, 1024, 300)
         } else if memory_mb < 16384 {
-            (16384, 64, 1024, 500)
+            (64, 1024, 500)
         } else {
-            (32768, 128, 2048, 500)
+            (128, 2048, 500)
         };
-    let cache_mb = cache_size * 16 / 1024;
+    // Let libtorrent choose its cache from the physical RAM instead of
+    // replacing its own policy with a coarse Rextto RAM tier.
+    let cache_size = -1;
+    let cache_mb = -1;
     let active_downloads = 3;
     let active_seeds = 3;
     let active_limit = 5;
@@ -10118,7 +10121,7 @@ async fn optimize_libtorrent_settings(State(s): State<AppState>) -> impl IntoRes
             "applied": true,
             "hardware": {"memory_mb": optimization.memory_mb},
             "settings": {"active_downloads": 3, "active_seeds": 3, "active_limit": 5, "dynamic_queue": true, "dynamic_queue_min": 1, "dynamic_queue_max": 10, "dont_count_slow_torrents": true, "cache_blocks": optimization.cache_size, "cache_mb": optimization.cache_mb, "queue_mb": optimization.queue_mb, "send_buffer_kb": optimization.send_buffer_kb, "peer_list": optimization.peer_list},
-            "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. I torrent senza trasferimento non contano negli slot attivi. RAM rilevata: {} MB; cache: {} blocchi ({} MB), coda disco: {} MB, send-buffer: {} KiB, peer-list: {}. Connessioni e limiti globali di banda lasciati invariati.", optimization.memory_mb, optimization.cache_size, optimization.cache_mb, optimization.queue_mb, optimization.send_buffer_kb, optimization.peer_list),
+        "explanation": format!("Base: 3 download, 3 seed, limite 5. Coda dinamica: active_downloads tra 1 e 10, a passi di uno, dopo campioni coerenti e con raffreddamento di 10 minuti. I torrent senza trasferimento non contano negli slot attivi. RAM rilevata: {} MB; cache: automatica libtorrent (-1), coda disco: {} MB, send-buffer: {} KiB, peer-list: {}. Connessioni e limiti globali di banda lasciati invariati.", optimization.memory_mb, optimization.queue_mb, optimization.send_buffer_kb, optimization.peer_list),
             "bandwidth_limits_preserved": true,
             "connections_limit_preserved": true
         })),
@@ -11729,8 +11732,10 @@ async fn monitor_stalled(
                 stall_after_minutes,
                 "⏸️ DOWNLOAD STALLED — excluded from active slots; retaining for periodic retry"
             );
-            // Retry immediately on the first transition to stalled.
-            entry.next_retry_at = now;
+            // Keep it parked for the configured retry interval. Restarting in
+            // the same worker tick would immediately undo the slot exclusion
+            // we just applied and produce a stalled/resumed log pair.
+            entry.next_retry_at = now + retry_timeout;
         }
         if giveup_timeout.is_some_and(|timeout| now.duration_since(stalled_since) >= timeout) {
             let mut failed_title = String::new();
