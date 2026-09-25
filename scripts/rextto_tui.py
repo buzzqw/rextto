@@ -965,7 +965,7 @@ def draw_health(app: App, win, top, bottom, width, colors) -> None:
     disk_free = health.get("disk_free_bytes") or 0
     writable = "yes" if health.get("data_dir_writable") else "no"
     summary = [
-        f"Process: PID {text(health, 'process_id', '-')} · uptime {human_duration(health.get('uptime_seconds'))} · CPU {optional_number(health.get('process_cpu_percent'), '%', 1)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
+        f"Rextto: PID {text(health, 'process_id', '-')} · uptime {human_duration(health.get('process_uptime_seconds'))} · CPU {optional_number(health.get('process_cpu_percent'), '%', 1)} · RAM {human_bytes(health.get('resident_bytes') or 0)}",
         f"System: CPU {optional_number(health.get('cpu_percent'), '%')} · load {optional_number(health.get('load_average'), '', 2)} · RAM free {human_bytes(available_memory)} / {human_bytes(total_memory)}",
         f"Disk: {human_bytes(disk_free)} free / {human_bytes(disk_total)} · data directory writable: {writable}",
         f"Trash: {text(health, 'trash_file_count', '0')} files · {human_bytes(health.get('trash_bytes') or 0)}",

@@ -9442,8 +9442,8 @@ async fn remove_completed_torrents(
             global_time
         };
         let ratio_reached = ratio_limit.is_some_and(|limit| {
-            torrent.all_time_download > 0
-                && torrent.all_time_upload as f64 / torrent.all_time_download as f64 >= limit
+            let download = effective_download_for_ratio(&torrent);
+            download > 0.0 && torrent.all_time_upload as f64 / download >= limit
         });
         let time_reached = time_limit.is_some_and(|limit| torrent.seeding_seconds >= limit);
         if !ratio_reached && !time_reached {
@@ -12023,6 +12023,17 @@ fn completed_source_disposable(
     processed.exists() && outside && status.as_deref() == Some("completed")
 }
 
+/// libtorrent reports zero downloaded bytes for torrents whose data was
+/// already present when they were added. For completed torrents, use the real
+/// payload size so their upload/download ratio remains meaningful.
+fn effective_download_for_ratio(torrent: &crate::models::TorrentView) -> f64 {
+    if torrent.all_time_download > 0 {
+        torrent.all_time_download as f64
+    } else {
+        torrent.total_size.max(0) as f64
+    }
+}
+
 /// Limiti di seed effettivi (per-torrent se impostati, altrimenti globali) e se
 /// ratio/tempo sono stati raggiunti. Stessa semantica di `enforce_seed_policy`.
 fn seed_limits_reached(cfg: &Config, torrent: &crate::models::TorrentView) -> (bool, bool) {
@@ -12052,8 +12063,8 @@ fn seed_limits_reached(cfg: &Config, torrent: &crate::models::TorrentView) -> (b
         None
     };
     let ratio_reached = ratio_limit.is_some_and(|limit| {
-        torrent.all_time_download > 0
-            && (torrent.all_time_upload as f64 / torrent.all_time_download as f64) >= limit
+        let download = effective_download_for_ratio(torrent);
+        download > 0.0 && (torrent.all_time_upload as f64 / download) >= limit
     });
     let time_reached = time_limit.is_some_and(|limit| torrent.seeding_seconds >= limit);
     (ratio_reached, time_reached)
@@ -12158,8 +12169,8 @@ fn enforce_seed_policy(
             None
         };
         let ratio_reached = torrent_ratio_limit.is_some_and(|limit| {
-            torrent.all_time_download > 0
-                && (torrent.all_time_upload as f64 / torrent.all_time_download as f64) >= limit
+            let download = effective_download_for_ratio(&torrent);
+            download > 0.0 && (torrent.all_time_upload as f64 / download) >= limit
         });
         let time_reached = torrent_time_limit.is_some_and(|limit| torrent.seeding_seconds >= limit);
         if ratio_reached || time_reached {

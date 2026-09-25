@@ -17,6 +17,7 @@ pub struct Health {
     pub disk_total_bytes: u64,
     pub disk_free_bytes: u64,
     pub uptime_seconds: u64,
+    pub process_uptime_seconds: u64,
     pub load_average: Option<f64>,
     pub cpu_percent: Option<f64>,
     pub process_cpu_percent: Option<f64>,
@@ -170,6 +171,37 @@ fn process_cpu_percent() -> Option<f64> {
     percent
 }
 
+/// Seconds since the current Rextto process started, using procfs start ticks.
+fn process_uptime_seconds() -> u64 {
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(stat) => stat,
+        Err(_) => return 0,
+    };
+    let command_end = match stat.rfind(')') {
+        Some(index) => index,
+        None => return 0,
+    };
+    let fields: Vec<&str> = match stat.get(command_end + 2..) {
+        Some(rest) => rest.split_whitespace().collect(),
+        None => return 0,
+    };
+    // After pid and comm, fields[0] is state; starttime is procfs field 22,
+    // therefore index 19 in this zero-based slice.
+    let start_ticks = match fields.get(19).and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => return 0,
+    };
+    let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clock_ticks <= 0 {
+        return 0;
+    }
+    let system_uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    (system_uptime - start_ticks as f64 / clock_ticks as f64).max(0.0) as u64
+}
+
 /// Contesto dei percorsi controllati dalla salute (permessi, spazio, ram disk).
 pub struct HealthPaths<'a> {
     pub data_dir: &'a Path,
@@ -240,6 +272,7 @@ pub fn check_with_paths(paths: &HealthPaths) -> Health {
         disk_total_bytes,
         disk_free_bytes,
         uptime_seconds,
+        process_uptime_seconds: process_uptime_seconds(),
         load_average,
         cpu_percent: system_cpu_percent(),
         process_cpu_percent: process_cpu_percent(),

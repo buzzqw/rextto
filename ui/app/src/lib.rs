@@ -1994,10 +1994,17 @@ fn save_message(value: &Value) -> String {    if value
     }
 }
 
-/// Rapporto upload/download totale di un torrent (— se non ha ancora scaricato).
+/// Rapporto upload/download totale di un torrent. For an already-present
+/// completed torrent, libtorrent can report zero downloaded bytes; use its
+/// payload size as the denominator in that case.
 fn ratio_label(item: &Value) -> String {
     let up = item.get("all_time_upload").and_then(Value::as_i64).unwrap_or(0) as f64;
-    let down = item.get("all_time_download").and_then(Value::as_i64).unwrap_or(0) as f64;
+    let reported_down = item.get("all_time_download").and_then(Value::as_i64).unwrap_or(0) as f64;
+    let down = if reported_down > 0.0 {
+        reported_down
+    } else {
+        item.get("total_size").and_then(Value::as_i64).unwrap_or(0) as f64
+    };
     if down <= 0.0 {
         "—".into()
     } else {
@@ -2045,7 +2052,12 @@ fn value_f64(value: &Value, key: &str) -> f64 {
 
 fn torrent_ratio_value(value: &Value) -> f64 {
     let up = value_f64(value, "all_time_upload");
-    let down = value_f64(value, "all_time_download");
+    let reported_down = value_f64(value, "all_time_download");
+    let down = if reported_down > 0.0 {
+        reported_down
+    } else {
+        value_f64(value, "total_size")
+    };
     if down <= 0.0 { 0.0 } else { up / down }
 }
 
