@@ -1341,6 +1341,7 @@ fn start_http_download(
     title: String,
 ) -> String {
     let id = register_http_download(&title, "http");
+    tracing::info!(title=%title, download_id=%id, "comic HTTP download started");
     let download_id = id.clone();
     tokio::spawn(async move {
         if let Err(error) = download_http_registered(

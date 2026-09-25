@@ -2628,8 +2628,37 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     </div>
                 </form>
             </Panel>
-            <Panel title="Sessione torrent">
-                <p class="muted">{ctx_tr("Torrent ancora nel client (download e seed). Il badge NAS indica che i file sono già archiviati: restano qui a seedare e passano allo Storico download solo quando escono dalla sessione (Pulisci completati, rimozione manuale, o automaticamente al limite di seed).")}</p>
+            <Panel title="Download session">
+                <Show when=move || !data.get().comic_downloads.is_empty()>
+                    <div class="table-wrap" style="margin-bottom:10px">
+                        <table class="data-table">
+                            <thead><tr><th>{ctx_tr("Titolo")}</th><th>{ctx_tr("Metodo")}</th><th>{ctx_tr("Stato")}</th><th>{ctx_tr("Progresso")}</th><th>{ctx_tr("Velocità")}</th></tr></thead>
+                            <tbody>
+                                {move || data.get().comic_downloads.iter().cloned().map(|item| {
+                                    let status = text(&item, "status", "-");
+                                    let status_label = match status.as_str() {
+                                        "downloading" => tr(data, "In scarico"),
+                                        "completed" => tr(data, "Completato"),
+                                        "error" => tr(data, "errore"),
+                                        _ => status.clone(),
+                                    };
+                                    let progress = item.get("progress").and_then(Value::as_f64).unwrap_or(0.0);
+                                    let speed = item.get("speed_bytes").and_then(Value::as_f64).unwrap_or(0.0);
+                                    view! {
+                                        <tr>
+                                            <td class="truncate">{text(&item, "title", "-")}</td>
+                                            <td class="muted">{text(&item, "method", "-")}</td>
+                                            <td><span class="badge" class:ok=status == "completed">{status_label}</span></td>
+                                            <td class="numeric">{format!("{progress:.0}%")}</td>
+                                            <td class="numeric">{format!("{}/s", size_str(speed))}</td>
+                                        </tr>
+                                    }
+                                }).collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+                <p class="muted">{ctx_tr("Torrent ancora nel client (download e seed). I download HTTP, come quelli dei fumetti, restano visibili qui fino al completamento o all'errore; il seed si applica solo ai torrent.")}</p>
                 <div class="toolbar" style="margin-bottom:10px">
                     <button class="btn sm" title=ctx_tr("Toglie dalla coda libtorrent i torrent completati che hanno già raggiunto i limiti di seed (ratio/tempo). Esclude il seed infinito e non cancella l'archivio NAS: i torrent escono dalla Sessione e passano allo Storico download.") on:click=move |_| run_cleanup_completed(data)>{ctx_tr("Pulisci completati")}</button>
                     <label class="check" title=ctx_tr("Elimina dalla sessione i torrent completati appena raggiungono i limiti di seed (ratio/tempo). Non cancella l'archivio NAS: la copia in libreria resta.")>
@@ -5687,7 +5716,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
     view! {
         <div class="view">
             <Panel title="Aggiungi fumetto">
-                <form class="toolbar" on:submit=move |event| {
+                <form class="toolbar comics-search-form" on:submit=move |event| {
                     event.prevent_default();
                     let query = explore_query.get();
                     selected_comic.set(Value::Null);
