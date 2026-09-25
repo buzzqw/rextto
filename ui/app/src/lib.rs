@@ -1859,6 +1859,17 @@ fn setting_tooltip(key: &str) -> &'static str {
         "gap_fill_max_per_series" => "Numero massimo di gap da cercare per serie in un ciclo (0 = illimitato).",
         "gap_deep_interval_hours" => "Ogni quante ore fare una ricerca live mirata sugli indexer per i gap.",
         "gap_deep_max_per_cycle" => "Numero massimo di ricerche live (deep) per ciclo.",
+        "delay_torrent_minutes" => "Ritarda l'avvio dei download delle serie per questo numero di minuti dopo che una release è stata trovata. 0 avvia senza attesa; serve a lasciare arrivare versioni migliori.",
+        "delay_movies_minutes" => "Ritarda l'avvio dei download dei film per questo numero di minuti dopo che una release è stata trovata. 0 avvia senza attesa.",
+        "delay_bypass_score" => "Se una release raggiunge almeno questo punteggio, ignora il delay configurato. 0 disattiva il bypass e lascia attivo sempre il delay.",
+        "housekeeping_enabled" => "Attiva il housekeeping periodico: pulisce dati temporanei e mantiene sotto controllo lo storico senza cancellare i file della libreria.",
+        "housekeeping_interval_hours" => "Intervallo tra due housekeeping automatici, in ore. Un valore più basso pulisce più spesso; il comando manuale resta sempre disponibile.",
+        "housekeeping_retain_cycles" => "Numero massimo di cicli recenti da conservare nel database. I cicli più vecchi vengono rimossi durante il housekeeping.",
+        "housekeeping_seen_days" => "Conserva per questo numero di giorni le release già viste nei feed. 0 non applica la pulizia basata sull'età.",
+        "housekeeping_history_days" => "Conserva per questo numero di giorni lo storico dei download. 0 conserva lo storico senza limite automatico.",
+        "media_info_backfill_enabled" => "Analizza periodicamente con ffprobe i file già presenti che non hanno ancora MediaInfo. Non modifica né sposta i file.",
+        "media_info_backfill_interval_minutes" => "Minuti tra due passaggi del backfill MediaInfo. Intervalli più bassi completano prima l'analisi ma usano più disco/CPU.",
+        "media_info_backfill_batch" => "Numero massimo di file analizzati in ogni passaggio MediaInfo. Valori più alti accelerano il recupero ma aumentano il carico temporaneo.",
         "notify_telegram" => "Invia le notifiche su Telegram.",
         "telegram_bot_token" => "Token del bot Telegram (da @BotFather).",
         "telegram_chat_id" => "ID della chat/canale dove inviare le notifiche.",
@@ -5999,14 +6010,14 @@ fn WatchedFoldersPanel() -> impl IntoView {
                         <section class="setting-group">
                             <h4>{raw(folder, "path", "Cartella")}</h4>
                             <div class="setting-group-body">
-                                <div class="field"><span>{ctx_tr("Percorso")}</span>
+                                <div class="field" title=ctx_tr("Cartella locale che Rextto controlla periodicamente per nuovi file .torrent e .magnet.")><span>{ctx_tr("Percorso")}</span>
                                     <input prop:value=raw(folder, "path", "") on:input=move |event| { let value = event_target_value(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["path"] = Value::String(value); } }); } />
                                 </div>
-                                <label class="check-inline"><input type="checkbox" prop:checked=enabled on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["enabled"] = Value::Bool(value); } }); } />{ctx_tr("Attiva")}</label>
-                                <label class="check-inline"><input type="checkbox" prop:checked=recursive on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["recursive"] = Value::Bool(value); } }); } />{ctx_tr("Ricorsiva")}</label>
-                                <label class="check-inline"><input type="checkbox" prop:checked=delete_after on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["delete_after"] = Value::Bool(value); } }); } />{ctx_tr("Rimuovi dopo l'aggiunta")}</label>
+                                <label class="check-inline" title=ctx_tr("Controlla questa cartella ogni 15 secondi. Se disattivata, il percorso resta salvato ma non viene importato nulla.")><input type="checkbox" prop:checked=enabled on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["enabled"] = Value::Bool(value); } }); } />{ctx_tr("Attiva")}</label>
+                                <label class="check-inline" title=ctx_tr("Cerca anche nelle sottocartelle, non solo nella directory indicata.")><input type="checkbox" prop:checked=recursive on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["recursive"] = Value::Bool(value); } }); } />{ctx_tr("Ricorsiva")}</label>
+                                <label class="check-inline" title=ctx_tr("Dopo l'importazione riuscita elimina il file sorgente. Se disattivata, il file viene rinominato con estensione .imported per evitare nuovi tentativi.")><input type="checkbox" prop:checked=delete_after on:change=move |event| { let value = event_target_checked(&event); folders.update(|items| { if let Some(item) = items.get_mut(index) { item["delete_after"] = Value::Bool(value); } }); } />{ctx_tr("Rimuovi dopo l'aggiunta")}</label>
                                 <div class="toolbar">
-                                    <button class="btn sm danger" on:click=move |_| folders.update(|items| { if index < items.len() { items.remove(index); } })>{ctx_tr("Rimuovi cartella")}</button>
+                                    <button class="btn sm danger" title=ctx_tr("Rimuove questa cartella dall'elenco senza cancellare file dal disco.") on:click=move |_| folders.update(|items| { if index < items.len() { items.remove(index); } })>{ctx_tr("Rimuovi cartella")}</button>
                                 </div>
                             </div>
                         </section>
@@ -6014,8 +6025,8 @@ fn WatchedFoldersPanel() -> impl IntoView {
                 }).collect_view()}
             </div>
             <div class="toolbar">
-                <button class="btn sm" on:click=move |_| folders.update(|items| items.push(json!({"path":"","enabled":true,"recursive":false,"delete_after":true})))>{ctx_tr("Aggiungi cartella")}</button>
-                <button class="btn primary" on:click=move |_| {
+                <button class="btn sm" title=ctx_tr("Aggiunge una nuova cartella osservata; inserisci il percorso prima di salvarla.") on:click=move |_| folders.update(|items| items.push(json!({"path":"","enabled":true,"recursive":false,"delete_after":true})))>{ctx_tr("Aggiungi cartella")}</button>
+                <button class="btn primary" title=ctx_tr("Salva tutti i percorsi e le relative opzioni. Il worker li applica al successivo controllo.") on:click=move |_| {
                     let payload = Value::Array(folders.get());
                     spawn_local(async move {
                         match send("POST", "/api/watched-folders", Some(payload)).await {
@@ -6059,7 +6070,7 @@ fn ProvidersStatusPanel() -> impl IntoView {
                                     <td class="numeric">{number(item, "level")}</td>
                                     <td class="muted">{text(item, "disabled_till", "-")}</td>
                                     <td class="muted truncate">{text(item, "last_error", "-")}</td>
-                                    <td><button class="btn sm" on:click=move |_| {
+                                    <td><button class="btn sm" title=ctx_tr("Azzera il backoff di questa sorgente e consente un nuovo tentativo immediato.") on:click=move |_| {
                                         let provider = text(&items.get()[index], "provider", "");
                                         spawn_local(async move {
                                             match send("POST", "/api/providers/status", Some(json!({"provider": provider}))).await {
@@ -6220,11 +6231,11 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
             </Show>
             <Show when=move || tab.get() == "acquisition">
                 <Panel title="Acquisizione automatica">
-                    <p class="muted">{ctx_tr("Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. Le regole di sanità (sottotitoli hardcoded e dimensione anomala) sono automatiche.")}</p>
+                    <p class="muted" title=ctx_tr("Questa scheda controlla quando parte un download, il riempimento dei gap, la manutenzione dei database e il recupero delle informazioni tecniche dei file.")>{ctx_tr("Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. Le regole di sanità (sottotitoli hardcoded e dimensione anomala) sono automatiche.")}</p>
                     <TextSetting label="Delay serie (minuti, 0 = nessuno)" setting_key="delay_torrent_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_torrent_minutes", "0")) placeholder="0" />
                     <TextSetting label="Delay film (minuti, 0 = nessuno)" setting_key="delay_movies_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_movies_minutes", "0")) placeholder="0" />
                     <TextSetting label="Bypassa il delay sopra questo punteggio (0 = mai)" setting_key="delay_bypass_score" value=Signal::derive(move || raw(&data.get().config, "delay_bypass_score", "0")) placeholder="0" />
-                    <p class="muted">{ctx_tr("Rextto non scarica mai un episodio più vecchio fuori dai buchi riconosciuti quando possiede già episodi successivi: è una regola fissa, non disattivabile. Un vero upgrade di qualità resta permesso, e gap-fill e azioni manuali passano sempre.")}</p>
+                    <p class="muted" title=ctx_tr("La protezione vale solo per episodi non pertinenti a un gap o a un upgrade. Le azioni manuali e il riempimento dei gap non vengono bloccati.")>{ctx_tr("Rextto non scarica mai un episodio più vecchio fuori dai buchi riconosciuti quando possiede già episodi successivi: è una regola fissa, non disattivabile. Un vero upgrade di qualità resta permesso, e gap-fill e azioni manuali passano sempre.")}</p>
                     <BooleanSetting label="Housekeeping periodico attivo" setting_key="housekeeping_enabled" value=Signal::derive(move || raw(&data.get().config, "housekeeping_enabled", "true")) />
                     <TextSetting label="Housekeeping — intervallo (ore)" setting_key="housekeeping_interval_hours" value=Signal::derive(move || raw(&data.get().config, "housekeeping_interval_hours", "24")) placeholder="24" />
                     <TextSetting label="Housekeeping — cicli conservati" setting_key="housekeeping_retain_cycles" value=Signal::derive(move || raw(&data.get().config, "housekeeping_retain_cycles", "200")) placeholder="200" />
@@ -6234,8 +6245,8 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                     <TextSetting label="Backfill MediaInfo — intervallo (minuti)" setting_key="media_info_backfill_interval_minutes" value=Signal::derive(move || raw(&data.get().config, "media_info_backfill_interval_minutes", "60")) placeholder="60" />
                     <TextSetting label="Backfill MediaInfo — file per volta" setting_key="media_info_backfill_batch" value=Signal::derive(move || raw(&data.get().config, "media_info_backfill_batch", "10")) placeholder="10" />
                     <div class="toolbar" style="margin-top:12px">
-                        <button class="btn" title=ctx_tr("Esegue subito pulizia tabelle e compattazione dei database") on:click=move |_| { run_post(data, "/api/maintenance/housekeeping", None, "Housekeeping completato"); }>{ctx_tr("Esegui housekeeping ora")}</button>
-                        <button class="btn" title=ctx_tr("Azzera i periodi di disattivazione di tutte le sorgenti") on:click=move |_| { run_post(data, "/api/providers/status", Some(json!({})), "Backoff sorgenti azzerato"); }>{ctx_tr("Azzera backoff sorgenti")}</button>
+                        <button class="btn" title=ctx_tr("Esegue subito pulizia tabelle e compattazione dei database, senza attendere il prossimo intervallo automatico.") on:click=move |_| { run_post(data, "/api/maintenance/housekeeping", None, "Housekeeping completato"); }>{ctx_tr("Esegui housekeeping ora")}</button>
+                        <button class="btn" title=ctx_tr("Azzera i periodi di disattivazione di tutte le sorgenti e consente nuovi tentativi immediati.") on:click=move |_| { run_post(data, "/api/providers/status", Some(json!({})), "Backoff sorgenti azzerato"); }>{ctx_tr("Azzera backoff sorgenti")}</button>
                     </div>
                 </Panel>
                 <WatchedFoldersPanel />
@@ -6468,6 +6479,7 @@ fn load_ramdisk_info(
 
 #[component]
 fn RamDiskControl() -> impl IntoView {
+    let data = use_context::<RwSignal<Data>>().expect("data context");
     let paths = RwSignal::new(Vec::<Value>::new());
     let configured = RwSignal::new(String::new());
     let selected = RwSignal::new(String::new());
@@ -6497,9 +6509,9 @@ fn RamDiskControl() -> impl IntoView {
                         let filesystem = text(&item, "filesystem", "tmpfs");
                         let writable = item.get("writable").and_then(Value::as_bool).unwrap_or(false);
                         let label = if writable {
-                            format!("{path} · {filesystem} · {} liberi", size(&item, "free_bytes"))
+                            format!("{path} · {filesystem} · {} {}", size(&item, "free_bytes"), tr(data, "liberi"))
                         } else {
-                            format!("{path} · {filesystem} · non scrivibile")
+                            format!("{path} · {filesystem} · {}", tr(data, "non scrivibile"))
                         };
                         view! { <option value=path disabled=!writable>{label}</option> }
                     }
@@ -6511,12 +6523,12 @@ fn RamDiskControl() -> impl IntoView {
                     let message = message;
                     spawn_local(async move {
                         if path.trim().is_empty() {
-                            message.set("Seleziona prima un percorso RAM disk.".into());
+                            message.set(tr(data, "Seleziona prima un percorso RAM disk."));
                             return;
                         }
                         match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_dir","value":path.clone()}))).await {
                             Ok(_) => match send("POST", "/api/config/settings", Some(json!({"key":"libtorrent_ramdisk_enabled","value":"yes"}))).await {
-                                Ok(_) => { message.set(format!("RAM disk configurato: {path}")); trigger_refresh(); }
+                                Ok(_) => { message.set(format!("{}: {path}", tr(data, "RAM disk configurato"))); trigger_refresh(); }
                                 Err(error) => message.set(error),
                             },
                             Err(error) => message.set(error),
@@ -6532,7 +6544,7 @@ fn RamDiskControl() -> impl IntoView {
                                     let path = text(&value, "path", "/dev/shm/rextto");
                                     configured.set(path.clone());
                                     selected.set(path);
-                                    message.set("RAM disk creato. Ricorda: il contenuto di /dev/shm si perde al riavvio.".into());
+                                    message.set(tr(data, "RAM disk creato. Ricorda: il contenuto di /dev/shm si perde al riavvio."));
                                     load_ramdisk_info(paths, configured, create_path, create_available, message);
                                     trigger_refresh();
                                 }
