@@ -43,13 +43,14 @@ o disco locale).
   con log viewer, salute, grafici e manutenzione.
 - **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo,
   consultabile anche per ciò che non è monitorato.
-- **Policy release** — regole ordinate accetta/rifiuta/punteggio con termini
-  wildcard/regex, custom format con punteggio, limiti di dimensione per qualità,
-  hook eventi verso programmi esterni, cartelle osservate e simulatore dal vivo,
-  modificabili dalla nuova pagina *Automazione*.
-- **Regolazione acquisizione** — delay profile con coda di attesa, profili
-  qualità con cutoff, ispezione reale dei file con `ffprobe`, backoff
-  progressivo delle sorgenti e housekeeping/VACUUM programmato.
+- **Regole di sanità automatiche** — sottotitoli hardcoded e dimensioni assurde
+  (soglie per risoluzione derivate da un archivio reale) vengono rifiutati con
+  una riga `INFO` chiara nel log; nessun numero da configurare.
+- **Regolazione acquisizione** — delay prima del download con coda di attesa,
+  interruttore per-titolo "Consenti aggiornamenti", ispezione reale dei file con
+  `ffprobe`, backoff progressivo delle sorgenti e housekeeping/VACUUM programmato.
+- **Automazione senza confusione** — hook eventi sotto *Integrazioni* e cartelle
+  osservate sotto *Configurazione*.
 - **Libreria monotona** — Rextto non scarica mai un episodio più vecchio fuori
   dai buchi riconosciuti quando possiede già episodi successivi (un vero
   upgrade sotto il cutoff del profilo passa comunque); gap-fill e azioni
@@ -215,8 +216,7 @@ i dettagli diagnostici quando è abilitato.
 | **Archivio** | Release passate; *Visti dal feed* per film/serie |
 | **Fumetti** | GetComics e weekly pack |
 | **Configurazione** | Sorgenti, libtorrent, punteggi, rinomina, percorsi, notifiche |
-| **Automazione** | Regole release, custom format, limiti dimensione, hook eventi, cartelle osservate |
-| **Integrazioni** | Trakt, Simkl, Jellyfin, Plex |
+| **Integrazioni** | Trakt, Simkl, Jellyfin, Plex, hook eventi |
 | **Manutenzione** | Backup, duplicati, scoring, riavvio |
 | **Salute / Log / Grafici** | Diagnostica e monitoraggio |
 

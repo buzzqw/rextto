@@ -37,6 +37,7 @@ pub fn merge_quality(primary: Quality, fallback: Quality) -> Quality {
         } else {
             primary.subtitle_languages
         },
+        hardcoded_subs: primary.hardcoded_subs || fallback.hardcoded_subs,
     }
 }
 
@@ -510,6 +511,11 @@ pub fn parse_quality(title: &str) -> Quality {
         .unwrap()
         .is_match(title),
         subtitle_languages,
+        hardcoded_subs: crate::utils::cached_regex(
+            r"(?i)(^|[._ \-\[\]\(\)+])(hc|hardcoded|hardsub|hardsubs)([._ \-\[\]\(\)+]|$)",
+        )
+        .unwrap()
+        .is_match(title),
     }
 }
 

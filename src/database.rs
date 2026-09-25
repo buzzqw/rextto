@@ -602,16 +602,14 @@ impl Database {
                     |row| row.get(0),
                 )?;
                 if later_exists {
+                    // Accept only a genuine quality upgrade over the best later
+                    // archived episode; anything equal or worse stays blocked.
                     let candidate_rank = release.quality.resolution_rank();
                     let later_rank = self
                         .later_archived_max_resolution_rank(series_name, season, episode)?;
-                    let upgrade_below_cutoff = later_rank.is_some_and(|later_rank| {
-                        candidate_rank > later_rank
-                            && context
-                                .cutoff_rank
-                                .is_none_or(|cutoff| candidate_rank < cutoff)
-                    });
-                    if !upgrade_below_cutoff {
+                    let is_upgrade =
+                        later_rank.is_some_and(|later_rank| candidate_rank > later_rank);
+                    if !is_upgrade {
                         return Ok((false, "smart_episode".into()));
                     }
                 }
@@ -661,7 +659,7 @@ impl Database {
             // replaced. Only enforced when the file exists on disk, so a
             // placeholder never blocks the first download.
             if context.forbid_upgrade && context.archive.best_for(season, episode).is_some() {
-                return Ok((false, "cutoff_reached".into()));
+                return Ok((false, "upgrades_disabled".into()));
             }
             // legacy upgrade_reason: resolution jump, HDTV→WEB-DL, HDR, first
             // REPACK, or a score gain of at least `min_score_diff`.
@@ -954,7 +952,7 @@ impl Database {
             // Quality profile cutoff reached on a real imported file: never
             // replace it.
             if forbid_upgrade && downloaded_at.is_some() {
-                return Ok((false, "cutoff_reached".into()));
+                return Ok((false, "upgrades_disabled".into()));
             }
             // The movies row stores the configured clean name (not the original
             // release title). When the original torrent metadata is still
@@ -3760,7 +3758,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: index,
             live: crate::models::LiveDownloads::default(),
-            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
+            forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3803,7 +3801,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
-            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
+            forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3819,7 +3817,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
-            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
+            forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -4984,9 +4982,9 @@ mod tests {
     }
 
     #[test]
-    fn quality_profile_cutoff_blocks_upgrade() {
+    fn disable_upgrades_blocks_replacement() {
         let path = std::env::temp_dir().join(format!(
-            "rextto-profile-cutoff-{}-{}.db",
+            "rextto-disable-upgrades-{}-{}.db",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -5030,11 +5028,11 @@ mod tests {
                 1000,
             ),
         );
-        // Without the cutoff the 2160p release would be an upgrade.
+        // With upgrades enabled the 2160p release is a real upgrade.
         let allowed_context = crate::models::ApprovalContext {
             archive: index.clone(),
             live: Default::default(),
-            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
+            forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
             .check_series_scored(&candidate, score, 200, &allowed_context)
@@ -5051,13 +5049,13 @@ mod tests {
         let cutoff_context = crate::models::ApprovalContext {
             archive: index,
             live: Default::default(),
-            forbid_upgrade: true, gap_episode: false, cutoff_rank: None,
+            forbid_upgrade: true, gap_episode: false,
         };
         let (approved, reason) = db
             .check_series_scored(&candidate, score, 200, &cutoff_context)
             .unwrap();
         assert!(!approved);
-        assert_eq!(reason, "cutoff_reached");
+        assert_eq!(reason, "upgrades_disabled");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -5128,32 +5126,21 @@ mod tests {
         assert!(approved, "expected gap approval, got {reason}");
         clear_episode();
 
-        // A genuine upgrade over the later episode, below the cutoff, is accepted.
+        // A genuine quality upgrade over the later episode is accepted.
         candidate.quality = Quality {
             resolution: "2160p".into(),
             source: "webdl".into(),
             ..Default::default()
         };
-        let below_cutoff = crate::models::ApprovalContext {
-            cutoff_rank: Some(7),
-            ..Default::default()
-        };
         let (approved, reason) = db
-            .check_series_scored(&candidate, candidate.quality.score(), 200, &below_cutoff)
+            .check_series_scored(
+                &candidate,
+                candidate.quality.score(),
+                200,
+                &crate::models::ApprovalContext::default(),
+            )
             .unwrap();
         assert!(approved, "expected upgrade approval, got {reason}");
-        clear_episode();
-
-        // At or above the cutoff it is refused again.
-        let at_cutoff = crate::models::ApprovalContext {
-            cutoff_rank: Some(5),
-            ..Default::default()
-        };
-        let (approved, reason) = db
-            .check_series_scored(&candidate, candidate.quality.score(), 200, &at_cutoff)
-            .unwrap();
-        assert!(!approved);
-        assert_eq!(reason, "smart_episode");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

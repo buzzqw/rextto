@@ -45,13 +45,14 @@ disk).
   English**, with log viewer, health, charts and maintenance tools.
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
-- **Release policy** — ordered accept/reject/score rules with
-  wildcard/regex terms, scored custom formats, per-quality size envelopes,
-  external event hooks, watched folders and a live simulator, all editable
-  from the new *Automation* page.
-- **Acquisition tuning** — delay profiles with pending queue, named quality
-  profiles with cutoff, ground-truth media inspection via `ffprobe`,
-  escalating provider backoff and scheduled housekeeping/VACUUM.
+- **Automatic sanity rules** — hardcoded subtitles and absurd file sizes
+  (per-resolution floors derived from a real archive) are rejected with a clear
+  `INFO` log line; no numbers to configure.
+- **Acquisition tuning** — delay before grabbing with a pending queue,
+  per-title "allow upgrades" switch, ground-truth media inspection via
+  `ffprobe`, escalating provider backoff and scheduled housekeeping/VACUUM.
+- **Automation without clutter** — external event hooks live under
+  *Integrations* and watched folders under *Configuration*.
 - **Monotonic library** — Rextto never pulls an older episode outside a
   recognised gap while it already owns later ones (a genuine upgrade below the
   profile cutoff still passes); gap-fill and manual actions always win.
@@ -214,8 +215,7 @@ enabled.
 | **Archive** | Past releases; *Seen from feed* for movies/series |
 | **Comics** | GetComics and weekly packs |
 | **Configuration** | Sources, libtorrent, scoring, renaming, paths, notifications |
-| **Automation** | Release rules, custom formats, size limits, event hooks, watched folders |
-| **Integrations** | Trakt, Simkl, Jellyfin, Plex |
+| **Integrations** | Trakt, Simkl, Jellyfin, Plex, event hooks |
 | **Maintenance** | Backups, duplicates, scoring, restart |
 | **Health, Logs, Charts** | Diagnostics and monitoring |
 

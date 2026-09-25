@@ -183,7 +183,9 @@ pub async fn run_cycle_domain(
                 continue;
             }
             if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}")) {
-                if cfg.release_allowed(&release) {
+                if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                    crate::rules::log_rejection(&release, &reason);
+                } else {
                     releases.push(release);
                 }
             }
@@ -192,7 +194,8 @@ pub async fn run_cycle_domain(
     let mut ready_pending = std::collections::HashSet::new();
     for (_series, title, magnet, _season, _episode) in db.lock().unwrap().ready_pending()? {
         if let Some(release) = parse_release(&title, &magnet, "timeframe") {
-            if !cfg.release_allowed(&release) {
+            if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                crate::rules::log_rejection(&release, &reason);
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
@@ -212,7 +215,8 @@ pub async fn run_cycle_domain(
     // Movies held back by a delay profile.
     for (_name, title, magnet, _year) in db.lock().unwrap().ready_pending_movies()? {
         if let Some(release) = parse_release(&title, &magnet, "delay") {
-            if !cfg.release_allowed(&release) {
+            if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                crate::rules::log_rejection(&release, &reason);
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
@@ -335,7 +339,9 @@ pub async fn run_cycle_domain(
                 }
                 if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}"))
                 {
-                    if cfg.release_allowed(&release) {
+                    if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                        crate::rules::log_rejection(&release, &reason);
+                    } else {
                         tracing::debug!(series = %series, season, episode, title = %release.title, source = %release.source, "archive release found");
                         releases.push(release);
                         found = true;
@@ -706,35 +712,23 @@ pub async fn run_cycle_domain(
         } else {
             empty_archive_index.clone()
         };
-        // Quality profile: upgrades can be disabled, or stop once the archived
-        // file reaches the profile cutoff resolution.
-        let requirement = if release.kind == "series" {
+        // Per-title "allow upgrades" toggle (default on). The gap flag feeds the
+        // always-on "no orphan older episode" best practice.
+        let forbid_upgrade = if release.kind == "series" {
             release
                 .series
                 .as_deref()
                 .and_then(|name| cfg.find_series_match(name, release.season))
-                .map(|series| series.quality.clone())
-                .unwrap_or_default()
+                .is_some_and(|series| series.disable_upgrades)
         } else {
             cfg.find_movie_match(&release.title, release.year)
-                .map(|movie| movie.quality.clone())
-                .unwrap_or_default()
+                .is_some_and(|movie| movie.disable_upgrades)
         };
-        // Cutoff and upgrade policy come from the title's quality profile; the
-        // gap flag feeds the always-on "no orphan older episode" best practice.
-        let cutoff_rank = cfg.upgrade_cutoff_rank(&requirement);
-        let cutoff_reached = cutoff_rank.is_some_and(|cutoff| {
-            archive_index
-                .best_for(release.season.unwrap_or(0), release.episode.unwrap_or(0))
-                .is_some_and(|(quality, _)| quality.resolution_rank() >= cutoff)
-        });
-        let forbid_upgrade = !cfg.upgrade_allowed(&requirement) || cutoff_reached;
         let approval_context = crate::models::ApprovalContext {
             archive: archive_index,
             live: live_downloads.clone(),
             forbid_upgrade,
             gap_episode: is_gap,
-            cutoff_rank,
         };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();

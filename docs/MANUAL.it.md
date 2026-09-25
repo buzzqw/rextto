@@ -97,9 +97,9 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
 
 ## 7. Configurazione
 
-Tab: **Daemon, Sorgenti, libtorrent, Punteggi, Rinomina, Avanzate, Notifiche,
-Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
-“Salva tutte”.
+Tab: **Daemon, Sorgenti, libtorrent, Punteggi, Rinomina, Avanzate, Acquisizione,
+Notifiche, Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con
+la barra “Salva tutte”.
 
 - **Sorgenti** — lista feed RSS, indexer (Jackett/Prowlarr) con pulsante
   *Verifica*, URL FlareSolverr + test, motori web, filtri contenuto, blacklist.
@@ -116,8 +116,21 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   invece di restare `unknown`.
 - **Avanzate** — spazio libero minimo, retention cestino, retention archivio,
   pagine feed, intervallo verifica rinomina, sposta episodi, flag di debug.
+- **Acquisizione** — delay prima del download (serie/film, con bypass per
+  punteggio alto), intervallo di housekeeping e **Cartelle osservate**: Rextto
+  controlla le cartelle indicate e aggiunge i file `.torrent`/`.magnet` copiati,
+  rimuovendoli (o rinominandoli `.imported`) dopo l'aggiunta.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
   per tag.
+
+I controlli di sanità delle release sono **automatici** e non configurabili:
+sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione
+derivata da un archivio reale) vengono rifiutati, con una riga a `INFO` nel log
+che riporta titolo, risoluzione, dimensione e motivo. Anche la protezione dagli
+episodi vecchi è fissa: Rextto non riscarica un episodio precedente fuori dai
+buchi riconosciuti quando possiede già episodi successivi (gap-fill e azioni
+manuali restano sempre permessi). Per congelare un titolo usa **Consenti
+aggiornamenti** nella scheda di serie/film.
 
 ## 8. Integrazioni
 
@@ -125,6 +138,11 @@ Percorsi, Traduzioni**. Le modifiche non salvate sono evidenziate con la barra
   scrobble/segna come visto.
 - **Jellyfin / Plex** — URL + token del server e pulsante di aggiornamento
   libreria.
+- **Hook eventi** — esegue un programma esterno su eventi Rextto
+  (`download_started`, `torrent_completed`, `season_pack_completed`,
+  `torrent_error`, …). I campi accettano segnaposto come `{title}`, `{hash}`,
+  `{path}`, `{series}`, `{episode}`; gli stessi valori sono esposti come variabili
+  d'ambiente `REXTTO_*`. I programmi sono eseguiti senza shell e con timeout.
 
 ## 9. Manutenzione
 

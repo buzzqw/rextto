@@ -1,7 +1,7 @@
 # Rextto — Ricerca funzionalità da Sonarr, Radarr, qBittorrent, BiglyBT e autobrr
 
-Data: 2026-09-25 · Stato: ricerca + integrazione (policy, dimensione, hook,
-cartelle osservate, smart episode, delay, quality profile, media info,
+Data: 2026-09-25 · Stato: ricerca + integrazione (regole built-in, hook eventi,
+cartelle osservate, smart episode, delay, upgrade per titolo, media info,
 AddOptions, provider backoff, housekeeping)
 
 Questo documento nasce da un'analisi approfondita dei sorgenti di cinque
@@ -44,13 +44,13 @@ Terza convergenza: **ingestione da cartelle osservate** (qBittorrent
 
 | # | Funzionalità | Fonte principale | Valore | Sforzo | Stato |
 |---|---|---|---|---|---|
-| 1 | Motore regole release + custom formats + rejection reasons | Sonarr/Radarr/autobrr/BiglyBT/qBittorrent | alto | M | **integrato** |
-| 2 | Inviluppi di dimensione per qualità (min/max MB) | Sonarr/Radarr | alto | S | **integrato** |
+| 1 | Motore regole release + custom formats + rejection reasons | Sonarr/Radarr/autobrr/BiglyBT/qBittorrent | alto | M | **scartato**: troppo complesso per l'utente; salvato come regole built-in (sottotitoli hardcoded + dimensione) con rejection reasons nel log |
+| 2 | Inviluppi di dimensione per qualità (min/max MB) | Sonarr/Radarr | alto | S | **scartato come config**: sostituito da soglie automatiche per risoluzione derivate dall'archivio |
 | 3 | Hook eventi (programma esterno) con variabili | qBittorrent/Sonarr/BiglyBT/autobrr | alto | S | **integrato** |
 | 4 | Cartelle osservate | qBittorrent/BiglyBT | medio-alto | S | **integrato** |
 | 5 | Smart episode guard (monotonia episodio) | autobrr | alto | S | **integrato** (core, sempre attivo) |
 | 6 | Delay profile + coda "pending" | Sonarr/Radarr | alto | M | **integrato** |
-| 7 | Quality profile ordinati con cutoff/gruppi | Sonarr/Radarr | alto | L | **integrato** (cutoff su archivio) |
+| 7 | Quality profile ordinati con cutoff/gruppi | Sonarr/Radarr | alto | L | **scartato**: ridondante col range qualità; sostituito dal toggle per-titolo "Consenti aggiornamenti" |
 | 8 | MediaInfo/ffprobe sul file reale | Sonarr/Radarr | alto | M | **integrato** |
 | 9 | Import list (Trakt/Simkl/Plex/JSON) con esclusioni e pulizia libreria | Sonarr/Radarr | medio-alto | L | proposto |
 | 10 | Duplicate profile con hash normalizzato | autobrr | alto | S-M | proposto |
@@ -235,8 +235,8 @@ righe announce in release tramite regex, variabili e template.
 
 ## 7. Scelte e roadmap rimanente
 
-Sono stati integrati (vedi §8): policy release, inviluppi dimensione, hook
-eventi, cartelle osservate, smart episode, delay profile, quality profile,
+Sono stati integrati (vedi §8): regole di sanità built-in, hook eventi, cartelle
+osservate, smart episode, delay profile, upgrade per titolo,
 MediaInfo/ffprobe, refactor `AddOptions`, provider backoff e housekeeping.
 
 **Scartati o rimandati per scelta:**
@@ -268,31 +268,26 @@ incorporamento diretto).
 
 ## 8. Integrato in questa iterazione
 
-### 8.1 Motore policy release (`src/policy.rs`)
+### 8.1 Regole di sanità built-in (`src/rules.rs`)
 
-- `ReleaseRule`: regola ordinata con `media` (any/series/movie/comic), scope
-  per sorgente, predicati (`match_terms`, `required_terms`, `except_terms`,
-  risoluzioni, sorgenti, codec, audio, gruppi, lingue, dimensione, seeder,
-  età) e azione `Reject { reason }` o `Score { score }`.
-- `CustomFormat`: condizioni tipizzate (`title, group, resolution, source,
-  codec, audio, language, hdr, size, indexer, release_type`) con `negate` e
-  `required`; semantica OR dentro il tipo, AND tra tipi.
-- `SizeRule`: inviluppo min/max MB per risoluzione (`any` come fallback).
-- `PolicyDecision { allowed, score_delta, rejections, matched_formats,
-  violated_rules }`: ogni rifiuto è motivato.
-- I termini supportano testo, wildcard (`* ?`) e regex `/pattern/flags`
-  (`i m s`). `validate_term` rifiuta pattern non validi in fase di salvataggio.
+L'editor di regole release, i custom format e gli inviluppi di dimensione sono
+stati **rimossi**: duplicavano filtri già presenti (blacklist, filtri
+contenuto/sorgente, exclude per titolo) e chiedevano all'utente di indovinare
+numeri. Al loro posto, controlli automatici sempre attivi:
 
-Integrazione:
-- `Config::release_allowed` ora include la policy;
-  `Config::all_release_denied_reason` unifica blacklist, content filter, source
-  filter e policy (usato dal log di ciclo e dalla ricerca manuale).
-- `Config::release_score` = punteggio additivo + bonus sottotitoli +
-  `score_delta` della policy. Usato in `orchestrator.rs` (selezione, timeframe,
-  approvazione) e in `engine.rs`/`web.rs`.
-- `Release` porta ora `size_bytes`, `seeders`, `peers`, popolati da RSS,
-  Torznab XML (tag `<torznab:attr>`) e Prowlarr JSON; `0`/`-1` = sconosciuto e
-  le regole relative non scattano (mai rifiutare per un dato mancante).
+- **Sottotitoli hardcoded** (`HC`/`hardcoded`): rifiutati, default di Radarr.
+- **Dimensione assurda**: soglia per risoluzione derivata da un archivio reale
+  (4962 file; 5° percentile con margine): 2160p 1200 MiB, 1080p 180, 720p 120,
+  576p 80, 480p 60. Dimensione sconosciuta = nessun rifiuto.
+- **Preferenza dimensione**: piccolo bonus (max 100) per un bitrate più sano
+  nella stessa risoluzione; non può mai colmare un divario di qualità.
+
+`Config::all_release_denied_reason` unifica blacklist, content/source filter e
+queste regole; `Config::release_score` = punteggio + bonus sottotitoli + bonus
+dimensione. Gli scarti per regola built-in sono loggati a **INFO** con titolo,
+risoluzione, dimensione e motivo (`rules::log_rejection`), gli altri restano a
+DEBUG. `Release` porta `size_bytes`/`seeders`/`peers`, popolati da RSS, Torznab
+e Prowlarr (`0`/`-1` = sconosciuto).
 
 ### 8.2 Hook eventi (`src/hooks.rs`)
 
@@ -304,6 +299,8 @@ Integrazione:
   `event_hooks()`/`reload_hooks()` e li dispatcha su **ogni**
   `notify_event` (download_started, torrent_completed, season_pack_completed,
   torrent_error, comic_completed, …) su task distaccato.
+- UI: pannello **Hook eventi** nella pagina **Integrazioni** (non più in una
+  pagina Automazione separata).
 
 ### 8.3 Cartelle osservate (`src/watcher.rs`)
 
@@ -312,6 +309,8 @@ Integrazione:
   `.imported`) come funzioni pure testabili.
 - Worker `watched_folders_worker` in `web.rs` (ogni 15 s, salta il dry-run,
   max 5 tentativi per file) registrato tra i worker di lunga durata.
+- UI: pannello **Cartelle osservate** nella tab **Acquisizione** di
+  **Configurazione**.
 
 ### 8.4 Smart episode (logica core, sempre attiva)
 
@@ -322,9 +321,8 @@ successivi già archiviati, con queste esenzioni:
 
 - **gap-fill**: `ApprovalContext.gap_episode` (calcolato sui gap riconosciuti)
   passa sempre, così il backfill deliberato non è mai bloccato;
-- **upgrade reale sotto cutoff**: se la risoluzione candidata è superiore a
-  quella del migliore episodio successivo archiviato e resta sotto il
-  `cutoff_rank` del profilo, l'episodio passa;
+- **upgrade reale**: se la risoluzione candidata è superiore a quella del
+  migliore episodio successivo archiviato, l'episodio passa;
 - **azioni manuali**: `check_series_manual_scored` bypassa sempre;
 - i **season pack** non sono interessati (logica per-episodio già esistente).
 
@@ -341,15 +339,21 @@ la libreria resta monotona senza mai impedire di riempire un buco.
 - L'orchestratore mette in attesa serie/film e bypassa per gap-fill, ricerca
   manuale e punteggio sopra soglia; il migliore visto durante l'attesa vince.
 
-### 8.6 Quality profile
+### 8.6 Upgrade per titolo (in sostituzione dei quality profile)
 
-- `QualityProfile { name, allowed[], cutoff, upgrade_allowed }`, salvato in
-  `settings.quality_profiles`; un titolo lo usa scrivendo `profile:<nome>` nel
-  campo qualità (nessun cambio di schema per serie/film).
-- `allow` = lista ordinata di risoluzioni consentite; `upgrade_allowed=false`
-  disabilita gli upgrade; `cutoff` blocca l'upgrade quando il file archiviato
-  ha già raggiunto quella risoluzione (`forbid_upgrade` in `ApprovalContext`).
-- API `GET/POST /api/quality-profiles`, editor nella pagina Automazione.
+I quality profile sono stati **valutati e rimossi**: il campo `quality` di
+Rextto esprime già gli stessi casi (`720p` = 720p+, `1080p` = 1080p+,
+`720p-1080p` = intervallo) e lo scoring additivo gestisce la preferenza tra
+risoluzioni. Un secondo modello sarebbe stato ridondante.
+
+Al loro posto, l'unica capacità realmente assente è ora un toggle per titolo:
+
+- `SeriesConfig.disable_upgrades` / `MovieConfig.disable_upgrades` (default
+  `false` = aggiornamenti consentiti), esposto in UI come **"Consenti
+  aggiornamenti"**, persistito per le serie nel JSON `_migrated_series` e per i
+  film in `movies_config.disable_upgrades`.
+- Quando disattivo, `ApprovalContext.forbid_upgrade` impedisce che una release
+  migliore sostituisca un file già archiviato (`upgrades_disabled`).
 
 ### 8.7 MediaInfo/ffprobe
 
@@ -385,38 +389,31 @@ la libreria resta monotona senza mai impedire di riempire un buco.
 
 ### 8.11 API e UI
 
-- `GET/POST /api/policy`, `POST /api/policy/preview`
 - `GET/POST /api/event-hooks`
 - `GET/POST /api/watched-folders`
-- `GET/POST /api/quality-profiles`
 - `GET /api/media-info`, `POST /api/media-info/probe`
 - `GET/POST /api/providers/status`
 - `POST /api/maintenance/housekeeping`
-- Nuova pagina **Automazione** (Leptos) e tab **Acquisizione** in
-  Configurazione.
+- Nessuna pagina Automazione: **Hook eventi** è in *Integrazioni*, **Cartelle
+  osservate** nella tab *Acquisizione* di *Configurazione*.
 
 ### 8.12 Test
 
-- `policy.rs`: 14 test (term matching, reject/required/except, score, scope
-  media, inviluppi dimensione e fallback `any`, semantica gruppi custom format,
-  condizione required, negazione, soglia minima, seeder/dimensione sconosciuti,
-  size condition range, default permissivo).
+- `rules.rs`: 3 test (soglia dimensione e dimensioni sconosciute, sottotitoli
+  hardcoded, bonus dimensione limitato).
 - `hooks.rs`: 6 test (espansione, split argomenti, flatten variabili, filtro
   eventi, validazione, esecuzione reale di `/bin/echo` e `/bin/sh` con env).
 - `watcher.rs`: 4 test (scan piatto/ricorsivo con rumore, cartella mancante,
   lettura magnet, consume).
-- `config.rs`: 1 test di integrazione regole+format+size su
-  `release_allowed`/`release_score`.
 - `backoff.rs`: 3 test (scala, escalation con grace, recovery).
 - `mediainfo.rs`: 4 test (HDR10 10-bit con audio/sottotitoli, Dolby Vision,
   skip motion image, bit depth con suffissi di endianness).
 - `database.rs`: test per housekeeping, provider backoff, delay pending,
-  media info, smart episode, cutoff quality profile.
-- `config.rs`: test per profili qualità (allow-list, cutoff, upgrade disabilitato,
-  parsing).
-- `web.rs`: test endpoint (policy, hook reload, watched folders, quality
-  profiles).
-- Suite completa: **248 test verdi** (erano 200).
+  media info, smart episode, upgrade per titolo.
+- `config.rs`: test per i range qualità legacy (720p, 720p-1080p) e per il
+  default "Consenti aggiornamenti".
+- `web.rs`: test endpoint (hook reload, watched folders, media info).
+- Suite completa: **233 test verdi**.
 
 ---
 

@@ -28,6 +28,10 @@ pub struct SeriesConfig {
     pub ignored_seasons: Vec<i64>,
     #[serde(default)]
     pub season_subfolders: bool,
+    /// When true, a better release never replaces an archived file for this
+    /// series. Default false (= upgrades allowed).
+    #[serde(default)]
+    pub disable_upgrades: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,6 +60,24 @@ pub struct MovieConfig {
     pub language_requirements: String,
     #[serde(default)]
     pub subtitle_requirements: String,
+    /// When true, a better release never replaces an archived file for this
+    /// movie. Default false (= upgrades allowed).
+    #[serde(default)]
+    pub disable_upgrades: bool,
+}
+
+impl SeriesConfig {
+    /// Whether a better release may replace an archived file (default true).
+    pub fn upgrades_allowed(&self) -> bool {
+        !self.disable_upgrades
+    }
+}
+
+impl MovieConfig {
+    /// Whether a better release may replace an archived file (default true).
+    pub fn upgrades_allowed(&self) -> bool {
+        !self.disable_upgrades
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -83,27 +105,6 @@ pub struct SourceFilter {
 
 /// Parses the `source_filters` setting (a JSON array); bad input yields none.
 pub fn parse_source_filters(raw: &str) -> Vec<SourceFilter> {
-    serde_json::from_str(raw).unwrap_or_default()
-}
-
-/// A named, reusable quality profile (Sonarr/Radarr). Titles reference it with
-/// `profile:<name>` in their `quality` field. `allowed` is an ordered list of
-/// resolution buckets (best first); empty means every resolution. `cutoff` is
-/// the resolution at which upgrades stop and `upgrade_allowed` turns upgrades
-/// off entirely.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct QualityProfile {
-    pub name: String,
-    #[serde(default)]
-    pub allowed: Vec<String>,
-    #[serde(default)]
-    pub cutoff: String,
-    #[serde(default = "default_enabled")]
-    pub upgrade_allowed: bool,
-}
-
-/// Parses the `quality_profiles` setting (a JSON array); bad input yields none.
-pub fn parse_quality_profiles(raw: &str) -> Vec<QualityProfile> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
@@ -275,20 +276,6 @@ pub struct Config {
     pub state_dir: PathBuf,
     #[serde(default = "default_api_token")]
     pub api_token: Option<String>,
-    // Release policy (rules, custom formats, size envelopes). Persisted in the
-    // `settings` table under the `release_rules`, `custom_formats`,
-    // `size_rules` and `min_custom_format_score` keys; the JSON config file
-    // remains a valid override for tests and one-off runs.
-    #[serde(default)]
-    pub release_rules: Vec<crate::policy::ReleaseRule>,
-    #[serde(default)]
-    pub custom_formats: Vec<crate::policy::CustomFormat>,
-    #[serde(default)]
-    pub size_rules: Vec<crate::policy::SizeRule>,
-    #[serde(default)]
-    pub min_custom_format_score: Option<i64>,
-    #[serde(default)]
-    pub quality_profiles: Vec<QualityProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -674,11 +661,6 @@ impl Default for Config {
             rename_format: "base".into(),
             rename_template: "{Serie} - {Stagione}{Episodio} - {Titolo} [{Risoluzione}][{Lingue}]".into(),
             api_token: default_api_token(),
-            release_rules: Vec::new(),
-            custom_formats: Vec::new(),
-            size_rules: Vec::new(),
-            min_custom_format_score: None,
-            quality_profiles: Vec::new(),
         }
     }
 }
@@ -1111,68 +1093,6 @@ impl Config {
             && Self::language_subtitle_allowed(quality, language, subtitle)
     }
 
-    /// Resolves a named quality profile from a `profile:<name>` requirement, or
-    /// `None` when the requirement is a plain resolution range.
-    pub fn quality_profile(&self, requirement: &str) -> Option<&QualityProfile> {
-        let name = requirement.trim().strip_prefix("profile:")?.trim();
-        if name.is_empty() {
-            return None;
-        }
-        self.quality_profiles
-            .iter()
-            .find(|profile| profile.name.eq_ignore_ascii_case(name))
-    }
-
-    /// Profile-aware quality gate. A `profile:<name>` requirement enforces the
-    /// profile's ordered allowed resolutions; anything else keeps the legacy
-    /// range/language/subtitle behaviour.
-    fn quality_allowed_with(
-        &self,
-        quality: &crate::models::Quality,
-        requirement: &str,
-        language: &str,
-        subtitle: &str,
-    ) -> bool {
-        if let Some(profile) = self.quality_profile(requirement) {
-            if !profile.allowed.is_empty() {
-                let actual = quality.resolution.trim().trim_end_matches('p');
-                let allowed = profile.allowed.iter().any(|item| {
-                    let item = item.trim().trim_end_matches('p');
-                    item.eq_ignore_ascii_case(actual)
-                });
-                if !allowed {
-                    return false;
-                }
-            }
-            return Self::language_subtitle_allowed(quality, language, subtitle);
-        }
-        Self::quality_allowed(quality, requirement, language, subtitle)
-    }
-
-    /// Whether upgrades are permitted for a title/profile. Defaults to true.
-    pub fn upgrade_allowed(&self, requirement: &str) -> bool {
-        self.quality_profile(requirement)
-            .map(|profile| profile.upgrade_allowed)
-            .unwrap_or(true)
-    }
-
-    /// Resolution rank at which the profile stops upgrading, if configured.
-    pub fn upgrade_cutoff_rank(&self, requirement: &str) -> Option<i32> {
-        let cutoff = self.quality_profile(requirement)?.cutoff.trim().to_ascii_lowercase();
-        if cutoff.is_empty() {
-            return None;
-        }
-        Some(match cutoff.as_str() {
-            "2160p" | "2160" => 6,
-            "1080p" | "1080" => 5,
-            "720p" | "720" => 4,
-            "576p" | "576" => 3,
-            "480p" | "480" => 2,
-            "360p" | "360" => 1,
-            _ => 0,
-        })
-    }
-
     pub fn movie_release_allowed(&self, movie: &MovieConfig, quality: &crate::models::Quality) -> bool {
         let required_languages = parse_language_requirements(&movie.language_requirements);
         let language = if required_languages.is_empty() {
@@ -1181,7 +1101,7 @@ impl Config {
             required_languages
         }
         .join(",");
-        if !self.quality_allowed_with(quality, &movie.quality, &language, "") {
+        if !Self::quality_allowed(quality, &movie.quality, &language, "") {
             return false;
         }
         // "Requisiti sottotitoli" è obbligatorio: una release senza quei
@@ -1248,7 +1168,7 @@ impl Config {
         quality: &crate::models::Quality,
         title: &str,
     ) -> bool {
-        if !self.quality_allowed_with(quality, &series.quality, &series.language, &series.subtitle) {
+        if !Self::quality_allowed(quality, &series.quality, &series.language, &series.subtitle) {
             return false;
         }
         series
@@ -1267,41 +1187,9 @@ impl Config {
         self.all_release_denied_reason(release).is_none()
     }
 
-    /// Current release policy assembled from the configuration.
-    pub fn policy(&self) -> crate::policy::Policy {
-        crate::policy::Policy {
-            release_rules: self.release_rules.clone(),
-            custom_formats: self.custom_formats.clone(),
-            size_rules: self.size_rules.clone(),
-            min_custom_format_score: self
-                .min_custom_format_score
-                .unwrap_or_else(crate::policy::default_min_format_score),
-        }
-    }
-
-    /// Evaluate the configured policy for one release without cloning it.
-    pub fn policy_decision(
-        &self,
-        release: &crate::models::Release,
-    ) -> crate::policy::PolicyDecision {
-        crate::policy::Policy::evaluate_parts(
-            release,
-            &self.release_rules,
-            &self.custom_formats,
-            &self.size_rules,
-            self.min_custom_format_score
-                .unwrap_or_else(crate::policy::default_min_format_score),
-        )
-    }
-
-    /// Reason the configurable release policy refuses a release, if any.
-    pub fn policy_denied_reason(&self, release: &crate::models::Release) -> Option<String> {
-        self.policy_decision(release).reason()
-    }
-
     /// Every global rejection reason combined (static filters, per-source
-    /// filters and the release policy). Used for logging and the manual search
-    /// `allowed` flag so all layers speak with one voice.
+    /// filters and the built-in sanity rules). Used for logging and the manual
+    /// search `allowed` flag so all layers speak with one voice.
     pub fn all_release_denied_reason(&self, release: &crate::models::Release) -> Option<String> {
         if let Some(reason) = self.release_denied_reason(release) {
             return Some(reason.to_string());
@@ -1309,12 +1197,11 @@ impl Config {
         if let Some(reason) = self.source_filter_denied_reason(release) {
             return Some(reason);
         }
-        self.policy_denied_reason(release)
+        crate::rules::denied_reason(release)
     }
 
-    /// Score used for acquisition and upgrade decisions: the legacy additive
-    /// quality score, the movie subtitle bonus and the policy delta (score
-    /// rules + custom formats). Sorting and the upgrade threshold read this.
+    /// Score used for acquisition and upgrade decisions: the additive quality
+    /// score, the movie subtitle bonus and the small built-in size preference.
     pub fn release_score(&self, release: &crate::models::Release) -> i64 {
         let mut score = release.quality.score_with_settings(&self.settings);
         if release.kind == "movie" {
@@ -1322,7 +1209,7 @@ impl Config {
                 score += Self::movie_subtitle_bonus(movie, &release.quality);
             }
         }
-        score + self.policy_decision(release).score_delta
+        score + crate::rules::size_score_bonus(release)
     }
 
     /// Reason a release is refused by a per-source filter, if any. Unlike the
@@ -1421,29 +1308,6 @@ impl Config {
             .or_else(|| self.settings.get("max_age_days"))
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
-        // Release policy. A present settings key is authoritative (it is what
-        // the UI writes); the JSON config remains a fallback for tests and
-        // one-off runs, so an absent key must not clear the JSON value.
-        if let Some(value) = self.settings.get("release_rules") {
-            self.release_rules = serde_json::from_str(value).unwrap_or_default();
-        }
-        if let Some(value) = self.settings.get("custom_formats") {
-            self.custom_formats = serde_json::from_str(value).unwrap_or_default();
-        }
-        if let Some(value) = self.settings.get("size_rules") {
-            self.size_rules = serde_json::from_str(value).unwrap_or_default();
-        }
-        if let Some(value) = self.settings.get("min_custom_format_score") {
-            let value = value.trim();
-            self.min_custom_format_score = if value.is_empty() {
-                None
-            } else {
-                value.parse::<i64>().ok()
-            };
-        }
-        if let Some(value) = self.settings.get("quality_profiles") {
-            self.quality_profiles = parse_quality_profiles(value);
-        }
         if let Some(value) = self.settings.get("_migrated_series") {
             self.series = serde_json::from_str(value).unwrap_or_default();
         }
@@ -1461,6 +1325,7 @@ impl Config {
                         tmdb_id: row.get(7)?, tvdb_id: String::new(), subtitle: row.get(8)?, enabled: row.get::<_, i64>(9)? != 0,
                         ignored_seasons: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(), exclude: row.get(11)?,
                         season_subfolders: false,
+                        disable_upgrades: false,
                     })).ok().into_iter().flatten().filter_map(Result::ok).collect();
                 };
             }
@@ -1469,16 +1334,16 @@ impl Config {
             .prepare("SELECT tmdb_id,tvdb_id,original_title,overview,poster_path FROM movies_config")
             .is_ok()
         {
-            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path,disable_upgrades FROM movies_config"
         } else if conn
             .prepare("SELECT language_requirements,subtitle_requirements FROM movies_config")
             .is_ok()
         {
-            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,'','','','','' FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,'','','','','',0 FROM movies_config"
         } else if conn.prepare("SELECT exclude FROM movies_config").is_ok() {
-            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,'','','','','','','' FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,exclude,'','','','','','','',0 FROM movies_config"
         } else {
-            "SELECT id,name,year,quality,language,enabled,subtitle,'','','','','','','','' FROM movies_config"
+            "SELECT id,name,year,quality,language,enabled,subtitle,'','','','','','','','',0 FROM movies_config"
         };
         if let Ok(mut stmt) = conn.prepare(movie_query) {
             self.movies = stmt
@@ -1503,6 +1368,7 @@ impl Config {
                         original_title: row.get(12).unwrap_or_default(),
                         overview: row.get(13).unwrap_or_default(),
                         poster_path: row.get(14).unwrap_or_default(),
+                        disable_upgrades: row.get::<_, i64>(15).unwrap_or(0) != 0,
                     })
                 })?
                 .filter_map(Result::ok)
@@ -2012,7 +1878,7 @@ impl Config {
         movies: &[MovieConfig],
     ) -> Result<()> {
         let mut conn = open_config_db(&data_dir.join("rextto_config.db"))?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', tvdb_id TEXT DEFAULT '', original_title TEXT DEFAULT '', overview TEXT DEFAULT '', poster_path TEXT DEFAULT '');")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT '', tmdb_id TEXT DEFAULT '', tvdb_id TEXT DEFAULT '', original_title TEXT DEFAULT '', overview TEXT DEFAULT '', poster_path TEXT DEFAULT '', disable_upgrades INTEGER NOT NULL DEFAULT 0);")?;
         let _ = conn.execute(
             "ALTER TABLE movies_config ADD COLUMN exclude TEXT NOT NULL DEFAULT ''",
             [],
@@ -2031,6 +1897,7 @@ impl Config {
             "original_title TEXT NOT NULL DEFAULT ''",
             "overview TEXT NOT NULL DEFAULT ''",
             "poster_path TEXT NOT NULL DEFAULT ''",
+            "disable_upgrades INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE movies_config ADD COLUMN {column}"), []);
         }
@@ -2066,9 +1933,9 @@ impl Config {
                     .unwrap_or(0)
             };
             if id > 0 {
-                tx.execute("INSERT INTO movies_config(id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", rusqlite::params![id, movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path])?;
+                tx.execute("INSERT INTO movies_config(id,name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path,disable_upgrades) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", rusqlite::params![id, movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path, movie.disable_upgrades as i64])?;
             } else {
-                tx.execute("INSERT INTO movies_config(name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", rusqlite::params![movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path])?;
+                tx.execute("INSERT INTO movies_config(name,year,quality,language,enabled,subtitle,exclude,language_requirements,subtitle_requirements,tmdb_id,tvdb_id,original_title,overview,poster_path,disable_upgrades) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", rusqlite::params![movie.name, movie.year, movie.quality, movie.language, movie.enabled as i64, movie.subtitle, movie.exclude, movie.language_requirements, movie.subtitle_requirements, movie.tmdb_id, movie.tvdb_id, movie.original_title, movie.overview, movie.poster_path, movie.disable_upgrades as i64])?;
             }
         }
         tx.commit()?;
@@ -2565,91 +2432,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_rules_formats_and_size_envelopes_drive_decisions() {
-        let mut cfg = Config::default();
-        // Isolate the policy from the built-in blacklist (which already knows
-        // "cam") so the rule reason is the one under test.
-        cfg.blacklist = Vec::new();
-        cfg.release_rules = vec![
-            crate::policy::ReleaseRule {
-                name: "block cam".into(),
-                enabled: true,
-                match_terms: vec!["CAM".into()],
-                action: crate::policy::RuleAction::Reject {
-                    reason: "cam rip".into(),
-                },
-                ..Default::default()
-            },
-            crate::policy::ReleaseRule {
-                name: "prefer x265".into(),
-                enabled: true,
-                match_terms: vec!["x265".into()],
-                action: crate::policy::RuleAction::Score { score: 250 },
-                ..Default::default()
-            },
-        ];
-        cfg.custom_formats = vec![crate::policy::CustomFormat {
-            name: "remux".into(),
-            enabled: true,
-            score: 400,
-            conditions: vec![crate::policy::FormatCondition {
-                kind: crate::policy::ConditionKind::Source,
-                value: "remux".into(),
-                ..Default::default()
-            }],
-        }];
-        cfg.size_rules = vec![crate::policy::SizeRule {
-            resolution: "1080p".into(),
-            min_mb: 500,
-            max_mb: 0,
-        }];
-        let release = |title: &str| crate::models::Release { torrent_url: None,
-            title: title.into(),
-            magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
-            source: "test".into(),
-            quality: crate::parser::parse_quality(title),
-            kind: "movie".into(),
-            series: None,
-            season: None,
-            episode: None,
-            is_pack: false,
-            episode_range: Vec::new(),
-            year: Some(2026),
-            size_bytes: 4000 * 1_048_576,
-            seeders: -1,
-            peers: -1,
-            discovered_at: Utc::now(),
-        };
-
-        // A block rule rejects even though the score would otherwise be high.
-        let cam = release("Movie.2026.CAM.1080p.x265");
-        assert!(!cfg.release_allowed(&cam));
-        assert!(cfg
-            .all_release_denied_reason(&cam)
-            .unwrap()
-            .contains("cam rip"));
-
-        // Score rules and custom formats add to the acquisition score.
-        let plain = release("Movie.2026.1080p.WEB-DL");
-        let boosted = release("Movie.2026.1080p.REMUX.x265");
-        let base = plain.quality.score_with_settings(&cfg.settings);
-        assert_eq!(cfg.release_score(&plain), base);
-        assert_eq!(
-            cfg.release_score(&boosted),
-            boosted.quality.score_with_settings(&cfg.settings) + 250 + 400
-        );
-
-        // A 1080p release under the minimum size is rejected by the envelope.
-        let mut tiny = release("Movie.2026.1080p.WEB-DL");
-        tiny.size_bytes = 100 * 1_048_576;
-        assert!(!cfg.release_allowed(&tiny));
-        assert!(cfg
-            .all_release_denied_reason(&tiny)
-            .unwrap()
-            .contains("below the 1080p minimum"));
-    }
-
-    #[test]
     fn saves_and_reloads_library_configuration() {
         let dir = std::env::temp_dir().join(format!("rextto-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2766,69 +2548,52 @@ mod tests {
     }
 
     #[test]
-    fn quality_profiles_gate_resolutions_and_cutoff() {
-        let mut cfg = Config::default();
-        cfg.quality_profiles = vec![QualityProfile {
-            name: "HD".into(),
-            allowed: vec!["1080p".into(), "720p".into()],
-            cutoff: "1080p".into(),
-            upgrade_allowed: true,
-        }];
-        let series = SeriesConfig {
-            name: "Show".into(),
-            quality: "profile:HD".into(),
-            enabled: true,
+    fn legacy_quality_ranges_still_cover_the_common_profiles() {
+        let cfg = Config::default();
+        let quality = |resolution: &str| crate::models::Quality {
+            resolution: resolution.into(),
             ..Default::default()
         };
-        let hd = crate::models::Quality {
-            resolution: "1080p".into(),
-            ..Default::default()
-        };
-        let uhd = crate::models::Quality {
-            resolution: "2160p".into(),
-            ..Default::default()
-        };
-        assert!(cfg.series_release_allowed(&series, &hd, "Show.S01E01.1080p"));
-        assert!(!cfg.series_release_allowed(&series, &uhd, "Show.S01E01.2160p"));
-        assert!(cfg.upgrade_allowed("profile:HD"));
-        assert_eq!(cfg.upgrade_cutoff_rank("profile:HD"), Some(5));
-        // Unknown profile names fall back to the legacy range behaviour.
-        assert!(Config::quality_allowed(&hd, "1080p", "", ""));
-    }
-
-    #[test]
-    fn quality_profile_can_disable_upgrades() {
-        let mut cfg = Config::default();
-        cfg.quality_profiles = vec![QualityProfile {
-            name: "no-upgrade".into(),
-            allowed: Vec::new(),
-            cutoff: String::new(),
-            upgrade_allowed: false,
-        }];
-        let movie = MovieConfig {
+        // "720p" means 720p and above; "1080p" means 1080p and above.
+        assert!(cfg.movie_release_allowed(
+            &MovieConfig {
+                name: "Film".into(),
+                year: "2020".into(),
+                quality: "720p".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            &quality("2160p")
+        ));
+        // "720p-1080p" caps the range.
+        let ranged = MovieConfig {
             name: "Film".into(),
             year: "2020".into(),
-            quality: "profile:no-upgrade".into(),
+            quality: "720p-1080p".into(),
             enabled: true,
             ..Default::default()
         };
-        assert!(!cfg.upgrade_allowed("profile:no-upgrade"));
-        assert!(cfg.movie_release_allowed(
-            &movie,
-            &crate::models::Quality {
-                resolution: "2160p".into(),
-                ..Default::default()
-            }
-        ));
+        assert!(cfg.movie_release_allowed(&ranged, &quality("1080p")));
+        assert!(cfg.movie_release_allowed(&ranged, &quality("720p")));
+        assert!(!cfg.movie_release_allowed(&ranged, &quality("2160p")));
+        assert!(!cfg.movie_release_allowed(&ranged, &quality("576p")));
     }
 
     #[test]
-    fn quality_profiles_load_from_settings() {
-        let raw = r#"[{"name":"4K","allowed":["2160p"],"cutoff":"2160p","upgrade_allowed":false}]"#;
-        let profiles = parse_quality_profiles(raw);
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "4K");
-        assert!(!profiles[0].upgrade_allowed);
-        assert!(parse_quality_profiles("not json").is_empty());
+    fn titles_default_to_allowing_upgrades() {
+        let series = SeriesConfig::default();
+        let movie = MovieConfig::default();
+        assert!(!series.disable_upgrades);
+        assert!(!movie.disable_upgrades);
+        // The flag round-trips through the JSON config.
+        let mut toggled = SeriesConfig {
+            disable_upgrades: true,
+            ..Default::default()
+        };
+        toggled.name = "Show".into();
+        let parsed: SeriesConfig =
+            serde_json::from_str(&serde_json::to_string(&toggled).unwrap()).unwrap();
+        assert!(parsed.disable_upgrades);
+        assert!(!parsed.upgrades_allowed());
     }
 }

@@ -96,8 +96,9 @@ aliases, exclusions, NAS path, subtitles, timeframe).
 
 ## 7. Configuration
 
-Tabs: **Daemon, Sources, libtorrent, Scores, Rename, Advanced, Notifications,
-Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar.
+Tabs: **Daemon, Sources, libtorrent, Scores, Rename, Advanced, Acquisition,
+Notifications, Paths, Translations**. Unsaved changes are highlighted with a
+“Save all” bar.
 
 - **Sources** — RSS feed list, indexers (Jackett/Prowlarr) with a *Verify*
   button, FlareSolverr URL + test, web engines, content filters, blacklist.
@@ -114,13 +115,30 @@ Paths, Translations**. Unsaved changes are highlighted with a “Save all” bar
   of staying `unknown`.
 - **Advanced** — free-space guard, trash retention, archive retention, feed
   pages, rename-verify interval, move episodes, debug flags.
+- **Acquisition** — download delay for series/movies (with a high-score
+  bypass), housekeeping interval and **Watched folders**: Rextto scans the
+  chosen directories and adds copied `.torrent`/`.magnet` files, removing them
+  (or renaming them `.imported`) after a successful add.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
+
+Release sanity checks are **automatic** and not configurable: hardcoded
+subtitles (`HC`) and absurd sizes (a per-resolution floor derived from a real
+archive) are refused, with an `INFO` log line reporting the title, resolution,
+size and reason. The older-episode protection is fixed too: Rextto never
+re-downloads an earlier episode outside a recognised gap while it already owns
+later ones (gap-fill and manual actions always pass). To freeze a title, use
+**Allow upgrades** in the series/movie editor.
 
 ## 8. Integrations
 
 - **Trakt / Simkl** — credentials, PIN/OAuth flows, watchlist import, calendar,
   scrobble/mark-watched.
 - **Jellyfin / Plex** — server URL + token and a library refresh button.
+- **Event hooks** — run an external program on Rextto events
+  (`download_started`, `torrent_completed`, `season_pack_completed`,
+  `torrent_error`, …). Fields accept placeholders such as `{title}`, `{hash}`,
+  `{path}`, `{series}`, `{episode}`; the same values are exported as `REXTTO_*`
+  environment variables. Programs run without a shell and with a timeout.
 
 ## 9. Maintenance
 

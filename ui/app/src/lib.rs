@@ -28,7 +28,6 @@ const NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Sistema",
         &[
-            ("policy", "Automazione"),
             ("settings", "Configurazione"),
             ("integrations", "Integrazioni"),
             ("maintenance", "Manutenzione"),
@@ -1000,7 +999,6 @@ pub fn App() -> impl IntoView {
                         <Show when=move || page.get() == "comics"><ComicsView data /></Show>
                         <Show when=move || page.get() == "archive"><ArchiveView data /></Show>
                         <Show when=move || page.get() == "settings"><SettingsView data /></Show>
-                        <Show when=move || page.get() == "policy"><ReleasePolicyView data /></Show>
                         <Show when=move || page.get() == "integrations"><IntegrationsView data /></Show>
                         <Show when=move || page.get() == "maintenance"><MaintenanceView data /></Show>
                         <Show when=move || page.get() == "logs"><LogsView data /></Show>
@@ -1063,43 +1061,6 @@ fn Panel(title: &'static str, children: Children) -> impl IntoView {
             <div class="panel-head"><h3>{heading}</h3><span class="hint">{ctx_tr("REXTTO")}</span></div>
             <div class="panel-body">{children()}</div>
         </section>
-    }
-}
-
-/// Quality selector shared by the series/movie forms. Besides the legacy
-/// resolution ranges it lists every configured quality profile as
-/// `profile:<name>`, so profiles are first-class in the edit masks.
-#[component]
-fn QualitySelect(data: RwSignal<Data>, value: RwSignal<String>) -> impl IntoView {
-    let options = Signal::derive(move || {
-        let mut items: Vec<(String, String)> = QUALITY_OPTIONS
-            .iter()
-            .map(|(value, label)| ((*value).to_string(), (*label).to_string()))
-            .collect();
-        if let Some(profiles) = data
-            .get()
-            .config
-            .get("quality_profiles")
-            .and_then(Value::as_array)
-        {
-            for profile in profiles {
-                if let Some(name) = profile.get("name").and_then(Value::as_str) {
-                    if !name.trim().is_empty() {
-                        items.push((format!("profile:{name}"), format!("Profilo: {name}")));
-                    }
-                }
-            }
-        }
-        let current = value.get();
-        if !current.is_empty() && !items.iter().any(|(item, _)| item == &current) {
-            items.push((current, "Personalizzato".into()));
-        }
-        items
-    });
-    view! {
-        <select prop:value=move || value.get() on:change=move |event| value.set(event_target_value(&event))>
-            {move || options.get().into_iter().map(|(option, label)| view! { <option value=option>{label}</option> }).collect_view()}
-        </select>
     }
 }
 
@@ -3298,7 +3259,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                 <Show when=move || mode == "movies">
                                     <label class="field" title=ctx_tr("Anno")><span>{ctx_tr("Anno")}</span><input prop:value=year on:input=move |event| year.set(event_target_value(&event)) placeholder=ctx_tr("2024") /></label>
                                 </Show>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
+                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                  <Show when=move || mode == "series">
                                      <label class="field" title=ctx_tr("Preset lingua o codici custom separati da virgola")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                                  </Show>
@@ -3523,6 +3484,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
     let exclude = RwSignal::new(String::new());
     let enabled = RwSignal::new(true);
     let season_subfolders = RwSignal::new(false);
+    let disable_upgrades = RwSignal::new(false);
     let rename_items = RwSignal::new(Vec::<Value>::new());
     let detail_tick = RwSignal::new(0u32);
     let scan_busy = RwSignal::new(false);
@@ -3539,7 +3501,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
     let baseline = RwSignal::new(String::new());
     let signature = move || {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             name.get(),
             seasons.get(),
             quality.get(),
@@ -3551,7 +3513,8 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
             subtitle.get(),
             exclude.get(),
             enabled.get(),
-            season_subfolders.get()
+            season_subfolders.get(),
+            disable_upgrades.get()
         )
     };
     let dirty = Signal::derive(move || signature() != baseline.get());
@@ -3587,6 +3550,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                     exclude.set(text(&series, "exclude", ""));
                     enabled.set(series.get("enabled").and_then(Value::as_bool).unwrap_or(true));
                     season_subfolders.set(series.get("season_subfolders").and_then(Value::as_bool).unwrap_or(false));
+                    disable_upgrades.set(series.get("disable_upgrades").and_then(Value::as_bool).unwrap_or(false));
                     detail.set(value);
                     baseline.set(signature());
                 }
@@ -3850,6 +3814,7 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                  "exclude": exclude.get(),
                                  "enabled": enabled.get(),
                                  "season_subfolders": season_subfolders.get(),
+                                 "disable_upgrades": disable_upgrades.get(),
                                  // Il form salva l'intera libreria: conserva le
                                  // stagioni disattivate anche se sono state
                                  // cambiate poco prima con i pulsanti sotto.
@@ -3870,7 +3835,8 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                             </div>
                             <label class="field" title=ctx_tr("Stagioni monitorate, es. 1-3,5+ (1+ = tutte)")><span>{ctx_tr("Stagioni")}</span><input prop:value=seasons on:input=move |event| seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
                             <label class="field" title=ctx_tr("Archivia gli episodi in una cartella Stagione 01, Stagione 02, … dentro la cartella archivio della serie")><span>{ctx_tr("Sottocartelle per stagione")}</span><input type="checkbox" prop:checked=move || season_subfolders.get() on:change=move |_| season_subfolders.update(|value| *value = !*value) /></label>
-                            <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
+                            <label class="field" title=ctx_tr("Qualità minima/desiderata delle release")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                            <label class="field" title=ctx_tr("Se disattivo, una release migliore non sostituirà mai il file già archiviato per questa serie")><span>{ctx_tr("Consenti aggiornamenti")}</span><input type="checkbox" prop:checked=move || !disable_upgrades.get() on:change=move |_| disable_upgrades.update(|value| *value = !*value) /></label>
                             <label class="field" title=ctx_tr("Scegli un preset oppure inserisci codici custom separati da virgole; tutte le lingue indicate sono richieste")><span>{ctx_tr("Lingue (preset o custom)")}</span><LanguagePresetField value=language /></label>
                             <label class="field span-2" title=ctx_tr("Nomi alternativi con cui riconoscere la serie (separati da virgola)")><span>{ctx_tr("Alias / nomi alternativi (separati da virgola)")}</span><input prop:value=aliases on:input=move |event| aliases.set(event_target_value(&event)) /></label>
                             <label class="field" title=ctx_tr("ID TMDB della serie (per titoli episodi e poster)")><span>{ctx_tr("TMDB ID")}</span><input prop:value=tmdb_id on:input=move |event| tmdb_id.set(event_target_value(&event)) /></label>
@@ -4300,6 +4266,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
     let language = RwSignal::new(String::new());
     let subtitle = RwSignal::new(String::new());
     let exclude = RwSignal::new(String::new());
+    let disable_upgrades = RwSignal::new(false);
     let list_filter = RwSignal::new(String::new());
     let list_sort = RwSignal::new("name".to_string());
     let selected_movies = RwSignal::new(Vec::<String>::new());
@@ -4332,6 +4299,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                     language.set(text(&movie, "language", ""));
                     subtitle.set(text(&movie, "subtitle", ""));
                     exclude.set(text(&movie, "exclude", ""));
+                    disable_upgrades.set(movie.get("disable_upgrades").and_then(Value::as_bool).unwrap_or(false));
                     movie_tmdb_id.set(text(&movie, "tmdb_id", ""));
                     movie_tvdb_id.set(text(&movie, "tvdb_id", ""));
                     let entries = parse_language_entries(&text(&movie, "language_requirements", ""));
@@ -4513,7 +4481,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                         (lang_b.get(), lang_b_req.get()),
                                         (lang_c.get(), lang_c_req.get()),
                                     ]);
-                                    let body = json!({"name": name.get(), "year": year.get(), "quality": quality.get(), "language": language.get(), "subtitle": subtitle.get(), "exclude": exclude.get(), "language_requirements": requirements, "subtitle_requirements": subtitle_reqs.get(), "tmdb_id": movie_tmdb_id.get(), "tvdb_id": movie_tvdb_id.get()});
+                                    let body = json!({"name": name.get(), "year": year.get(), "quality": quality.get(), "language": language.get(), "subtitle": subtitle.get(), "exclude": exclude.get(), "language_requirements": requirements, "subtitle_requirements": subtitle_reqs.get(), "tmdb_id": movie_tmdb_id.get(), "tvdb_id": movie_tvdb_id.get(), "disable_upgrades": disable_upgrades.get()});
                                     let path = format!("/api/movies/{id}");
                                     run_post(data, &path, Some(body), "Film aggiornato");
                                 }
@@ -4530,7 +4498,8 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                              metadata_open.set(true);
                                          }>{ctx_tr("Aggiorna da TMDB/TVDB")}</button>
                                      </div>
-                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=quality /></label>
+                                     <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=quality on:change=move |event| quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
+                                <label class="field" title=ctx_tr("Se disattivo, una release migliore non sostituirà mai il file già archiviato per questo film")><span>{ctx_tr("Consenti aggiornamenti")}</span><input type="checkbox" prop:checked=move || !disable_upgrades.get() on:change=move |_| disable_upgrades.update(|value| *value = !*value) /></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=language on:change=move |event| language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <div class="grid-2" style="grid-column: 1 / -1">
                                     <label class="field" title=ctx_tr("ID numerico TMDB del film. Se impostato viene usato per i metadati (titolo, trama, locandina, cast) al posto della ricerca per nome.")><span>{ctx_tr("TMDB ID")}</span><input prop:value=movie_tmdb_id on:input=move |event| movie_tmdb_id.set(event_target_value(&event)) placeholder=ctx_tr("es. 27205") /></label>
@@ -4954,7 +4923,7 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                                 });
                             }>
                                 <label class="field span-full" title=ctx_tr("Titolo")><span>{ctx_tr("Titolo")}</span><input prop:value=move || pending.get().map(|item| text(&item, "name", "")).unwrap_or_default() readonly /></label>
-                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><QualitySelect data value=add_quality /></label>
+                                <label class="field" title=ctx_tr("Qualità richiesta")><span>{ctx_tr("Qualità richiesta")}</span><select prop:value=add_quality on:change=move |event| add_quality.set(event_target_value(&event))>{QUALITY_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <label class="field" title=ctx_tr("Lingua")><span>{ctx_tr("Lingua")}</span><select prop:value=add_language on:change=move |event| add_language.set(event_target_value(&event))>{LANGUAGE_OPTIONS.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}</select></label>
                                 <Show when=move || pending.get().map(|item| text(&item, "kind", "series") == "series").unwrap_or(true)>
                                     <label class="field" title=ctx_tr("Quali stagioni monitorare, es. 1-3,5+")><span>{ctx_tr("Stagioni")}</span><input prop:value=add_seasons on:input=move |event| add_seasons.set(event_target_value(&event)) placeholder=ctx_tr("es. 1-3,5+") /></label>
@@ -5907,11 +5876,9 @@ fn NasPathsEditor() -> impl IntoView {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Release policy (rules, custom formats, size envelopes)              */
-/* ------------------------------------------------------------------ */
-
-fn policy_csv(value: &Value, key: &str) -> String {
+/// Comma-separated list helpers for the small automation editors
+/// (watched folders, event hooks).
+fn csv_list(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_array)
@@ -5925,7 +5892,7 @@ fn policy_csv(value: &Value, key: &str) -> String {
         .unwrap_or_default()
 }
 
-fn policy_set_csv(item: &mut Value, key: &str, text: &str) {
+fn set_csv_list(item: &mut Value, key: &str, text: &str) {
     let list = text
         .split(',')
         .map(str::trim)
@@ -5933,392 +5900,6 @@ fn policy_set_csv(item: &mut Value, key: &str, text: &str) {
         .map(|value| Value::String(value.to_string()))
         .collect::<Vec<_>>();
     item[key] = Value::Array(list);
-}
-
-fn policy_opt_i64(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_i64)
-        .map(|value| value.to_string())
-        .unwrap_or_default()
-}
-
-fn policy_set_opt_i64(item: &mut Value, key: &str, text: &str) {
-    let text = text.trim();
-    item[key] = if text.is_empty() {
-        Value::Null
-    } else {
-        text.parse::<i64>()
-            .map(Value::from)
-            .unwrap_or(Value::Null)
-    };
-}
-
-fn policy_mb(item: &Value, key: &str) -> String {
-    item.get(key)
-        .and_then(Value::as_u64)
-        .map(|bytes| (bytes / 1_048_576).to_string())
-        .unwrap_or_default()
-}
-
-fn policy_set_mb(item: &mut Value, key: &str, text: &str) {
-    let text = text.trim();
-    item[key] = if text.is_empty() {
-        Value::from(0)
-    } else {
-        text.parse::<u64>()
-            .map(|mb| Value::from(mb.saturating_mul(1_048_576)))
-            .unwrap_or(Value::from(0))
-    };
-}
-
-#[component]
-fn ReleasePolicyView(data: RwSignal<Data>) -> impl IntoView {
-    // The page is self-contained; the shared data signal is only kept so the
-    // navigation/routing conventions stay uniform.
-    let _ = data;
-    let policy = RwSignal::new(json!({
-        "release_rules": [],
-        "custom_formats": [],
-        "size_rules": [],
-        "min_custom_format_score": Value::Null
-    }));
-    let message = RwSignal::new(String::new());
-    let preview_title = RwSignal::new(String::new());
-    let preview_kind = RwSignal::new("movie".to_string());
-    let preview_size = RwSignal::new(String::new());
-    let preview = RwSignal::new(Value::Null);
-
-    Effect::new(move |_| {
-        spawn_local(async move {
-            if let Ok(value) = get("/api/policy").await {
-                policy.set(value);
-            }
-        });
-    });
-
-    let save = move |_| {
-        let payload = policy.get();
-        spawn_local(async move {
-            match send("POST", "/api/policy", Some(payload)).await {
-                Ok(_) => message.set("Regole salvate".into()),
-                Err(error) => message.set(error),
-            }
-        });
-    };
-
-    view! {
-        <div class="stack">
-            <Panel title="Regole release">
-                <p class="hint">{ctx_tr("Regole ordinate che accettano, rifiutano o premiano una release. I termini supportano testo, wildcard (* ?) e regex /pattern/flags. \"Rifiuta\" scatta quando la regola è selezionata e una condizione di violazione è presente (required mancante, except presente, ecc.).")}</p>
-                <div class="stack">
-                    {move || policy.get()["release_rules"].as_array().cloned().unwrap_or_default().iter().enumerate().map(|(index, rule)| {
-                        let enabled = flag(rule, "enabled", true);
-                        let media = raw(rule, "media", "any");
-                        let action = rule.get("action").cloned().unwrap_or_default();
-                        let action_type = raw(&action, "type", "reject");
-                        let reason = raw(&action, "reason", "");
-                        let score = action.get("score").and_then(Value::as_i64).map(|v| v.to_string()).unwrap_or_default();
-                        view! {
-                            <section class="setting-group">
-                                <h4>{ctx_tr("Regola")} " " {index + 1}</h4>
-                                <div class="setting-group-body">
-                                    <div class="field"><span>{ctx_tr("Nome")}</span>
-                                        <input prop:value=raw(rule, "name", "") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["release_rules"][index]["name"] = Value::String(value)); } />
-                                    </div>
-                                    <label class="check-inline"><input type="checkbox" prop:checked=enabled on:change=move |event| { let value = event_target_checked(&event); policy.update(|p| p["release_rules"][index]["enabled"] = Value::Bool(value)); } />{ctx_tr("Attiva")}</label>
-                                    <div class="field"><span>{ctx_tr("Media")}</span>
-                                        <select prop:value=media on:change=move |event| { let value = event_target_value(&event); policy.update(|p| p["release_rules"][index]["media"] = Value::String(value)); }>
-                                            <option value="any">{ctx_tr("Tutti")}</option>
-                                            <option value="series">{ctx_tr("Serie")}</option>
-                                            <option value="movie">{ctx_tr("Film")}</option>
-                                            <option value="comic">{ctx_tr("Fumetti")}</option>
-                                        </select>
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Azione")}</span>
-                                        <select prop:value=action_type.clone() on:change=move |event| { let value = event_target_value(&event); policy.update(|p| { let rule = &mut p["release_rules"][index]; if value == "score" { rule["action"] = json!({"type":"score","score":0}); } else { rule["action"] = json!({"type":"reject","reason":""}); } }); }>
-                                            <option value="reject">{ctx_tr("Rifiuta")}</option>
-                                            <option value="score">{ctx_tr("Punteggio")}</option>
-                                        </select>
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Motivo / Punteggio")}</span>
-                                        <input prop:value=if action_type == "score" { score } else { reason } on:input=move |event| { let value = event_target_value(&event); policy.update(|p| { let action = &mut p["release_rules"][index]["action"]; if action["type"] == "score" { action["score"] = value.trim().parse::<i64>().map(Value::from).unwrap_or(Value::from(0)); } else { action["reason"] = Value::String(value); } }); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Termini richiesti (tutti)")}</span>
-                                        <input prop:value=policy_csv(rule, "match_terms") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "match_terms", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Almeno uno di")}</span>
-                                        <input prop:value=policy_csv(rule, "required_terms") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "required_terms", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Nessuno di (rifiuta)")}</span>
-                                        <input prop:value=policy_csv(rule, "except_terms") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "except_terms", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Risoluzioni")}</span>
-                                        <input prop:value=policy_csv(rule, "resolutions") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "resolutions", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Sorgenti")}</span>
-                                        <input prop:value=policy_csv(rule, "sources") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "sources", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Codec")}</span>
-                                        <input prop:value=policy_csv(rule, "codecs") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "codecs", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Audio")}</span>
-                                        <input prop:value=policy_csv(rule, "audio") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "audio", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Gruppi")}</span>
-                                        <input prop:value=policy_csv(rule, "groups") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "groups", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Lingue")}</span>
-                                        <input prop:value=policy_csv(rule, "languages") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_csv(&mut p["release_rules"][index], "languages", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Dimensione min (MB)")}</span>
-                                        <input prop:value=policy_mb(rule, "min_size_bytes") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_mb(&mut p["release_rules"][index], "min_size_bytes", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Dimensione max (MB)")}</span>
-                                        <input prop:value=policy_mb(rule, "max_size_bytes") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_mb(&mut p["release_rules"][index], "max_size_bytes", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Seeders min")}</span>
-                                        <input prop:value=policy_opt_i64(rule, "min_seeders") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_opt_i64(&mut p["release_rules"][index], "min_seeders", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Seeders max")}</span>
-                                        <input prop:value=policy_opt_i64(rule, "max_seeders") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_opt_i64(&mut p["release_rules"][index], "max_seeders", &value)); } />
-                                    </div>
-                                    <div class="field"><span>{ctx_tr("Età massima (giorni)")}</span>
-                                        <input prop:value=policy_opt_i64(rule, "max_age_days") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| policy_set_opt_i64(&mut p["release_rules"][index], "max_age_days", &value)); } />
-                                    </div>
-                                    <div class="toolbar">
-                                        <button class="btn sm danger" on:click=move |_| policy.update(|p| { if let Some(items) = p["release_rules"].as_array_mut() { if index < items.len() { items.remove(index); } } })>{ctx_tr("Rimuovi regola")}</button>
-                                    </div>
-                                </div>
-                            </section>
-                        }
-                    }).collect_view()}
-                </div>
-                <div class="toolbar">
-                    <button class="btn sm" on:click=move |_| policy.update(|p| { if let Some(items) = p["release_rules"].as_array_mut() { items.push(json!({"name":"Nuova regola","enabled":true,"media":"any","action":{"type":"reject","reason":""},"match_terms":[],"required_terms":[],"except_terms":[],"resolutions":[],"sources":[],"codecs":[],"audio":[],"groups":[],"languages":[],"min_size_bytes":0,"max_size_bytes":0,"max_age_days":0,"min_seeders":null,"max_seeders":null,"min_peers":null})); } })>{ctx_tr("Aggiungi regola")}</button>
-                </div>
-            </Panel>
-
-            <Panel title="Custom format">
-                <p class="hint">{ctx_tr("Insiemi di condizioni con un punteggio. Le condizioni dello stesso tipo si combinano con OR; tipi diversi con AND. Una condizione 'obbligatoria' rende il suo gruppo vincolante.")}</p>
-                <div class="stack">
-                    {move || policy.get()["custom_formats"].as_array().cloned().unwrap_or_default().iter().enumerate().map(|(index, format)| {
-                        let enabled = flag(format, "enabled", true);
-                        let score = format.get("score").and_then(Value::as_i64).unwrap_or(0);
-                        view! {
-                            <section class="setting-group">
-                                <h4>{raw(format, "name", "Custom format")}</h4>
-                                <div class="setting-group-body">
-                                    <div class="field"><span>{ctx_tr("Nome")}</span>
-                                        <input prop:value=raw(format, "name", "") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["custom_formats"][index]["name"] = Value::String(value)); } />
-                                    </div>
-                                    <label class="check-inline"><input type="checkbox" prop:checked=enabled on:change=move |event| { let value = event_target_checked(&event); policy.update(|p| p["custom_formats"][index]["enabled"] = Value::Bool(value)); } />{ctx_tr("Attivo")}</label>
-                                    <div class="field"><span>{ctx_tr("Punteggio")}</span>
-                                        <input prop:value=score.to_string() on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["custom_formats"][index]["score"] = value.trim().parse::<i64>().map(Value::from).unwrap_or(Value::from(0))); } />
-                                    </div>
-                                    <div class="table-wrap">
-                                        <table class="data-table">
-                                            <thead><tr><th>{ctx_tr("Tipo")}</th><th>{ctx_tr("Valore")}</th><th>{ctx_tr("Nega")}</th><th>{ctx_tr("Obblig.")}</th><th></th></tr></thead>
-                                            <tbody>
-                                                {format.get("conditions").and_then(Value::as_array).cloned().unwrap_or_default().iter().enumerate().map(|(ci, condition)| {
-                                                    let kind = raw(condition, "kind", "title");
-                                                    let negate = flag(condition, "negate", false);
-                                                    let required = flag(condition, "required", false);
-                                                    view! {
-                                                        <tr>
-                                                            <td>
-                                                                <select prop:value=kind on:change=move |event| { let value = event_target_value(&event); policy.update(|p| p["custom_formats"][index]["conditions"][ci]["kind"] = Value::String(value)); }>
-                                                                    <option value="title">"title"</option>
-                                                                    <option value="group">"group"</option>
-                                                                    <option value="resolution">"resolution"</option>
-                                                                    <option value="source">"source"</option>
-                                                                    <option value="codec">"codec"</option>
-                                                                    <option value="audio">"audio"</option>
-                                                                    <option value="language">"language"</option>
-                                                                    <option value="hdr">"hdr"</option>
-                                                                    <option value="size">"size"</option>
-                                                                    <option value="indexer">"indexer"</option>
-                                                                    <option value="release_type">"release_type"</option>
-                                                                </select>
-                                                            </td>
-                                                            <td><input prop:value=raw(condition, "value", "") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["custom_formats"][index]["conditions"][ci]["value"] = Value::String(value)); } /></td>
-                                                            <td><input type="checkbox" prop:checked=negate on:change=move |event| { let value = event_target_checked(&event); policy.update(|p| p["custom_formats"][index]["conditions"][ci]["negate"] = Value::Bool(value)); } /></td>
-                                                            <td><input type="checkbox" prop:checked=required on:change=move |event| { let value = event_target_checked(&event); policy.update(|p| p["custom_formats"][index]["conditions"][ci]["required"] = Value::Bool(value)); } /></td>
-                                                            <td><button class="btn sm danger" on:click=move |_| policy.update(|p| { if let Some(items) = p["custom_formats"][index]["conditions"].as_array_mut() { if ci < items.len() { items.remove(ci); } } })>"X"</button></td>
-                                                        </tr>
-                                                    }
-                                                }).collect_view()}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                    <div class="toolbar">
-                                        <button class="btn sm" on:click=move |_| policy.update(|p| { if let Some(items) = p["custom_formats"][index]["conditions"].as_array_mut() { items.push(json!({"kind":"title","value":"","negate":false,"required":false})); } })>{ctx_tr("Aggiungi condizione")}</button>
-                                        <button class="btn sm danger" on:click=move |_| policy.update(|p| { if let Some(items) = p["custom_formats"].as_array_mut() { if index < items.len() { items.remove(index); } } })>{ctx_tr("Rimuovi format")}</button>
-                                    </div>
-                                </div>
-                            </section>
-                        }
-                    }).collect_view()}
-                </div>
-                <div class="toolbar">
-                    <button class="btn sm" on:click=move |_| policy.update(|p| { if let Some(items) = p["custom_formats"].as_array_mut() { items.push(json!({"name":"Nuovo format","enabled":true,"score":0,"conditions":[]})); } })>{ctx_tr("Aggiungi custom format")}</button>
-                </div>
-            </Panel>
-
-            <Panel title="Limiti di dimensione">
-                <p class="hint">{ctx_tr("Intervalli min/max in MB per risoluzione (0 = nessun limite). Una release con dimensione sconosciuta non viene mai rifiutata per questi limiti.")}</p>
-                <div class="table-wrap">
-                    <table class="data-table">
-                        <thead><tr><th>{ctx_tr("Risoluzione")}</th><th>{ctx_tr("Min (MB)")}</th><th>{ctx_tr("Max (MB)")}</th><th></th></tr></thead>
-                        <tbody>
-                            {move || policy.get()["size_rules"].as_array().cloned().unwrap_or_default().iter().enumerate().map(|(index, rule)| {
-                                view! {
-                                    <tr>
-                                        <td><input prop:value=raw(rule, "resolution", "") on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["size_rules"][index]["resolution"] = Value::String(value)); } /></td>
-                                        <td><input prop:value=rule.get("min_mb").and_then(Value::as_i64).unwrap_or(0).to_string() on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["size_rules"][index]["min_mb"] = value.trim().parse::<i64>().map(Value::from).unwrap_or(Value::from(0))); } /></td>
-                                        <td><input prop:value=rule.get("max_mb").and_then(Value::as_i64).unwrap_or(0).to_string() on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["size_rules"][index]["max_mb"] = value.trim().parse::<i64>().map(Value::from).unwrap_or(Value::from(0))); } /></td>
-                                        <td><button class="btn sm danger" on:click=move |_| policy.update(|p| { if let Some(items) = p["size_rules"].as_array_mut() { if index < items.len() { items.remove(index); } } })>"X"</button></td>
-                                    </tr>
-                                }
-                            }).collect_view()}
-                        </tbody>
-                    </table>
-                </div>
-                <div class="toolbar">
-                    <button class="btn sm" on:click=move |_| policy.update(|p| { if let Some(items) = p["size_rules"].as_array_mut() { items.push(json!({"resolution":"any","min_mb":0,"max_mb":0})); } })>{ctx_tr("Aggiungi limite")}</button>
-                </div>
-                <div class="field"><span>{ctx_tr("Punteggio minimo custom format (vuoto = disattivo)")}</span>
-                    <input prop:value=move || policy.get()["min_custom_format_score"].as_i64().map(|v| v.to_string()).unwrap_or_default() on:input=move |event| { let value = event_target_value(&event); policy.update(|p| p["min_custom_format_score"] = if value.trim().is_empty() { Value::Null } else { value.trim().parse::<i64>().map(Value::from).unwrap_or(Value::Null) }); } />
-                </div>
-                <div class="toolbar">
-                    <button class="btn primary" on:click=save.clone()>{ctx_tr("Salva regole")}</button>
-                    <small class="muted">{move || message.get()}</small>
-                </div>
-            </Panel>
-
-            <Panel title="Simulatore policy">
-                <div class="field"><span>{ctx_tr("Titolo release")}</span>
-                    <input prop:value=move || preview_title.get() on:input=move |event| preview_title.set(event_target_value(&event)) />
-                </div>
-                <div class="field"><span>{ctx_tr("Media")}</span>
-                    <select prop:value=move || preview_kind.get() on:change=move |event| preview_kind.set(event_target_value(&event))>
-                        <option value="movie">{ctx_tr("Film")}</option>
-                        <option value="series">{ctx_tr("Serie")}</option>
-                        <option value="comic">{ctx_tr("Fumetti")}</option>
-                    </select>
-                </div>
-                <div class="field"><span>{ctx_tr("Dimensione (MB, facoltativa)")}</span>
-                    <input prop:value=move || preview_size.get() on:input=move |event| preview_size.set(event_target_value(&event)) />
-                </div>
-                <div class="toolbar">
-                    <button class="btn primary" on:click=move |_| {
-                        let title = preview_title.get();
-                        let kind = preview_kind.get();
-                        let size_bytes = preview_size.get().trim().parse::<f64>().unwrap_or(0.0);
-                        let size_bytes = (size_bytes * 1_048_576.0) as i64;
-                        spawn_local(async move {
-                            match send("POST", "/api/policy/preview", Some(json!({"title": title, "kind": kind, "size_bytes": size_bytes}))).await {
-                                Ok(value) => preview.set(value),
-                                Err(error) => preview.set(json!({"ok": false, "error": error})),
-                            }
-                        });
-                    }>{ctx_tr("Simula")}</button>
-                </div>
-                <Show when=move || !preview.get().is_null()>
-                    <div class="stack">
-                        <p>
-                            <strong>{ctx_tr("Esito:")} " "</strong>
-                            {move || if preview.get()["allowed"].as_bool().unwrap_or(false) { "Accettata" } else { "Rifiutata" }.to_string()}
-                        </p>
-                        <p class="muted">{move || {
-                            let rejections = preview.get()["rejections"].as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
-                            if rejections.is_empty() { preview.get()["error"].as_str().unwrap_or("").to_string() } else { rejections }
-                        }}</p>
-                        <p>{ctx_tr("Custom format: ")}{move || preview.get()["matched_formats"].as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")}</p>
-                        <p>{ctx_tr("Punteggio policy: ")}{move || preview.get()["policy_score_delta"].as_i64().unwrap_or(0).to_string()}</p>
-                        <p>{ctx_tr("Punteggio totale: ")}{move || preview.get()["total_score"].as_i64().unwrap_or(0).to_string()}</p>
-                    </div>
-                </Show>
-            </Panel>
-
-            <EventHooksPanel />
-
-            <WatchedFoldersPanel />
-
-            <QualityProfilesPanel />
-        </div>
-    }
-}
-
-#[component]
-fn QualityProfilesPanel() -> impl IntoView {
-    let profiles = RwSignal::new(Vec::<Value>::new());
-    let message = RwSignal::new(String::new());
-    Effect::new(move |_| {
-        spawn_local(async move {
-            if let Ok(value) = get("/api/quality-profiles").await {
-                profiles.set(array(&value, "items"));
-            }
-        });
-    });
-    view! {
-        <Panel title="Profili qualità">
-            <p class="hint">{ctx_tr("Profili di qualità riutilizzabili. In un titolo, scrivi profile:Nome nel campo qualità per usare un profilo. \"Consentite\" è una lista ordinata di risoluzioni (es. 2160p, 1080p, 720p); vuota = tutte. Il cutoff è la risoluzione oltre cui non si aggiorna più.")}</p>
-            <div class="stack">
-                {move || profiles.get().iter().enumerate().map(|(index, profile)| {
-                    let upgrade_allowed = flag(profile, "upgrade_allowed", true);
-                    view! {
-                        <section class="setting-group">
-                            <h4>{raw(profile, "name", "Profilo")}</h4>
-                            <div class="setting-group-body">
-                                <div class="field"><span>{ctx_tr("Nome")}</span>
-                                    <input prop:value=raw(profile, "name", "") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["name"] = Value::String(value); } }); } />
-                                </div>
-                                <div class="field"><span>{ctx_tr("Risoluzioni consentite (separate da virgola)")}</span>
-                                    <input prop:value=policy_csv(profile, "allowed") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { policy_set_csv(item, "allowed", &value); } }); } />
-                                </div>
-                                <div class="field"><span>{ctx_tr("Cutoff (risoluzione, vuoto = nessuno)")}</span>
-                                    <input prop:value=raw(profile, "cutoff", "") on:input=move |event| { let value = event_target_value(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["cutoff"] = Value::String(value); } }); } />
-                                </div>
-                                <label class="check-inline"><input type="checkbox" prop:checked=upgrade_allowed on:change=move |event| { let value = event_target_checked(&event); profiles.update(|items| { if let Some(item) = items.get_mut(index) { item["upgrade_allowed"] = Value::Bool(value); } }); } />{ctx_tr("Consenti aggiornamenti")}</label>
-                                <div class="toolbar">
-                                    <button class="btn sm danger" on:click=move |_| profiles.update(|items| { if index < items.len() { items.remove(index); } })>{ctx_tr("Rimuovi profilo")}</button>
-                                </div>
-                            </div>
-                        </section>
-                    }
-                }).collect_view()}
-            </div>
-            <div class="toolbar">
-                <button class="btn sm" title=ctx_tr("Aggiunge profili pronti all'uso come in Sonarr/Radarr, senza toccare quelli esistenti") on:click=move |_| profiles.update(|items| {
-                    let defaults = [
-                        json!({"name":"Qualsiasi","allowed":[],"cutoff":"","upgrade_allowed":true}),
-                        json!({"name":"Best","allowed":["2160p","1080p","720p"],"cutoff":"2160p","upgrade_allowed":true}),
-                        json!({"name":"4K","allowed":["2160p","1080p"],"cutoff":"2160p","upgrade_allowed":true}),
-                        json!({"name":"1080p","allowed":["1080p","720p"],"cutoff":"1080p","upgrade_allowed":true}),
-                        json!({"name":"720p","allowed":["720p","576p"],"cutoff":"720p","upgrade_allowed":true}),
-                    ];
-                    for candidate in defaults {
-                        let name = candidate.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                        if !items.iter().any(|item| raw(item, "name", "") == name) {
-                            items.push(candidate);
-                        }
-                    }
-                })>{ctx_tr("Profili predefiniti")}</button>
-                <button class="btn sm" on:click=move |_| profiles.update(|items| items.push(json!({"name":"Nuovo profilo","allowed":[],"cutoff":"","upgrade_allowed":true})))>{ctx_tr("Aggiungi profilo")}</button>
-                <button class="btn primary" on:click=move |_| {
-                    let payload = Value::Array(profiles.get());
-                    spawn_local(async move {
-                        match send("POST", "/api/quality-profiles", Some(payload)).await {
-                            Ok(_) => message.set("Profili salvati".into()),
-                            Err(error) => message.set(error),
-                        }
-                    });
-                }>{ctx_tr("Salva profili")}</button>
-                <small class="muted">{move || message.get()}</small>
-            </div>
-        </Panel>
-    }
 }
 
 #[component]
@@ -6401,7 +5982,7 @@ fn EventHooksPanel() -> impl IntoView {
                                 </div>
                                 <label class="check-inline"><input type="checkbox" prop:checked=enabled on:change=move |event| { let value = event_target_checked(&event); hooks.update(|items| { if let Some(item) = items.get_mut(index) { item["enabled"] = Value::Bool(value); } }); } />{ctx_tr("Attivo")}</label>
                                 <div class="field"><span>{ctx_tr("Eventi (separati da virgola, vuoto = tutti)")}</span>
-                                    <input prop:value=policy_csv(hook, "events") on:input=move |event| { let value = event_target_value(&event); hooks.update(|items| { if let Some(item) = items.get_mut(index) { policy_set_csv(item, "events", &value); } }); } />
+                                    <input prop:value=csv_list(hook, "events") on:input=move |event| { let value = event_target_value(&event); hooks.update(|items| { if let Some(item) = items.get_mut(index) { set_csv_list(item, "events", &value); } }); } />
                                 </div>
                                 <div class="field"><span>{ctx_tr("Programma (percorso eseguibile)")}</span>
                                     <input prop:value=raw(hook, "program", "") on:input=move |event| { let value = event_target_value(&event); hooks.update(|items| { if let Some(item) = items.get_mut(index) { item["program"] = Value::String(value); } }); } />
@@ -6513,11 +6094,11 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
             </Show>
             <Show when=move || tab.get() == "acquisition">
                 <Panel title="Acquisizione automatica">
-                    <p class="muted">{ctx_tr("Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. I profili qualità e le regole release si gestiscono nella pagina Automazione.")}</p>
+                    <p class="muted">{ctx_tr("Attesa prima del download, protezione dagli episodi vecchi e pulizia periodica. Le regole di sanità (sottotitoli hardcoded e dimensione anomala) sono automatiche.")}</p>
                     <TextSetting label="Delay serie (minuti, 0 = nessuno)" setting_key="delay_torrent_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_torrent_minutes", "0")) placeholder="0" />
                     <TextSetting label="Delay film (minuti, 0 = nessuno)" setting_key="delay_movies_minutes" value=Signal::derive(move || raw(&data.get().config, "delay_movies_minutes", "0")) placeholder="0" />
                     <TextSetting label="Bypassa il delay sopra questo punteggio (0 = mai)" setting_key="delay_bypass_score" value=Signal::derive(move || raw(&data.get().config, "delay_bypass_score", "0")) placeholder="0" />
-                    <p class="muted">{ctx_tr("Rextto non scarica mai un episodio più vecchio fuori dai buchi riconosciuti quando possiede già episodi successivi: è una regola fissa, non disattivabile. Un vero upgrade sotto il cutoff del profilo resta permesso, e gap-fill e azioni manuali passano sempre.")}</p>
+                    <p class="muted">{ctx_tr("Rextto non scarica mai un episodio più vecchio fuori dai buchi riconosciuti quando possiede già episodi successivi: è una regola fissa, non disattivabile. Un vero upgrade di qualità resta permesso, e gap-fill e azioni manuali passano sempre.")}</p>
                     <BooleanSetting label="Housekeeping periodico attivo" setting_key="housekeeping_enabled" value=Signal::derive(move || raw(&data.get().config, "housekeeping_enabled", "true")) />
                     <TextSetting label="Housekeeping — intervallo (ore)" setting_key="housekeeping_interval_hours" value=Signal::derive(move || raw(&data.get().config, "housekeeping_interval_hours", "24")) placeholder="24" />
                     <TextSetting label="Housekeeping — cicli conservati" setting_key="housekeeping_retain_cycles" value=Signal::derive(move || raw(&data.get().config, "housekeeping_retain_cycles", "200")) placeholder="200" />
@@ -6528,6 +6109,7 @@ fn SettingsView(data: RwSignal<Data>) -> impl IntoView {
                         <button class="btn" title=ctx_tr("Azzera i periodi di disattivazione di tutte le sorgenti") on:click=move |_| { run_post(data, "/api/providers/status", Some(json!({})), "Backoff sorgenti azzerato"); }>{ctx_tr("Azzera backoff sorgenti")}</button>
                     </div>
                 </Panel>
+                <WatchedFoldersPanel />
             </Show>
             <Show when=move || tab.get() == "sources">
                 <Panel title="Sorgenti di ricerca">
@@ -8307,6 +7889,7 @@ fn IntegrationsView(data: RwSignal<Data>) -> impl IntoView {
                     }>{ctx_tr("Registra gestore magnet nel browser")}</button>
                 </div>
             </Panel>
+            <EventHooksPanel />
         </div>
     }
 }

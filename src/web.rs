@@ -691,8 +691,6 @@ pub fn router(state: AppState) -> Router {
             "/api/tag-dir-rules",
             get(tag_dir_rules).post(save_tag_dir_rules),
         )
-        .route("/api/policy", get(policy_view).post(save_policy))
-        .route("/api/policy/preview", post(policy_preview))
         .route("/api/event-hooks", get(event_hooks_view).post(save_event_hooks))
         .route(
             "/api/providers/status",
@@ -700,10 +698,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/media-info", get(media_info_get))
         .route("/api/media-info/probe", post(media_info_probe))
-        .route(
-            "/api/quality-profiles",
-            get(quality_profiles_view).post(save_quality_profiles),
-        )
         .route(
             "/api/watched-folders",
             get(watched_folders_view).post(save_watched_folders),
@@ -1455,7 +1449,6 @@ async fn config_view(State(s): State<AppState>) -> Json<serde_json::Value> {
         "libtorrent_temp_limit_enabled": cfg.settings.get("libtorrent_temp_limit_enabled").cloned().unwrap_or_else(|| "0".into()),
         "libtorrent_temp_limit_until": cfg.settings.get("libtorrent_temp_limit_until").cloned().unwrap_or_else(|| "0".into()),
         "score_settings": cfg.settings.iter().filter(|(key, _)| key.starts_with("score_")).collect::<std::collections::BTreeMap<_, _>>(),
-        "quality_profiles": cfg.quality_profiles,
         "flaresolverr_configured": cfg.flaresolverr_url.is_some(),
         "tmdb_configured": cfg.tmdb_api_key.is_some(),
         "jellyfin_configured": cfg.settings.get("jellyfin_url").is_some_and(|value| !value.trim().is_empty())
@@ -1619,292 +1612,6 @@ async fn save_tag_dir_rules(
         ),
     }
 }
-/// Request body for `/api/policy`: the complete configurable release policy.
-#[derive(serde::Deserialize, Default)]
-pub struct PolicyInput {
-    #[serde(default)]
-    pub release_rules: Vec<crate::policy::ReleaseRule>,
-    #[serde(default)]
-    pub custom_formats: Vec<crate::policy::CustomFormat>,
-    #[serde(default)]
-    pub size_rules: Vec<crate::policy::SizeRule>,
-    #[serde(default)]
-    pub min_custom_format_score: Option<i64>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct PolicyPreviewInput {
-    pub title: String,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub size_bytes: i64,
-    #[serde(default)]
-    pub seeders: Option<i64>,
-    #[serde(default)]
-    pub peers: Option<i64>,
-    #[serde(default)]
-    pub year: Option<i64>,
-}
-
-async fn policy_view(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let cfg = latest_config(&s);
-    Json(serde_json::json!({
-        "ok": true,
-        "release_rules": cfg.release_rules,
-        "custom_formats": cfg.custom_formats,
-        "size_rules": cfg.size_rules,
-        "min_custom_format_score": cfg.min_custom_format_score,
-    }))
-}
-
-const POLICY_MAX_ITEMS: usize = 200;
-
-/// Validates the policy before persisting it. Broken regexes and oversized or
-/// unnamed items are rejected here so the engine never sees a half-valid rule.
-fn policy_validation_error(input: &PolicyInput) -> Option<String> {
-    if input.release_rules.len() > POLICY_MAX_ITEMS
-        || input.custom_formats.len() > POLICY_MAX_ITEMS
-        || input.size_rules.len() > POLICY_MAX_ITEMS
-    {
-        return Some(format!(
-            "too many policy items (max {POLICY_MAX_ITEMS} per category)"
-        ));
-    }
-    for rule in &input.release_rules {
-        if rule.name.trim().is_empty() {
-            return Some("a release rule has an empty name".into());
-        }
-        if rule.name.len() > 200
-            || rule.match_terms.len() > 100
-            || rule.required_terms.len() > 100
-            || rule.except_terms.len() > 100
-            || rule.resolutions.len() > 50
-            || rule.sources.len() > 50
-            || rule.codecs.len() > 50
-            || rule.audio.len() > 50
-            || rule.groups.len() > 200
-            || rule.languages.len() > 50
-        {
-            return Some(format!("release rule '{}' is too large", rule.name));
-        }
-        for term in rule
-            .match_terms
-            .iter()
-            .chain(rule.required_terms.iter())
-            .chain(rule.except_terms.iter())
-        {
-            if let Err(error) = crate::policy::validate_term(term) {
-                return Some(format!(
-                    "release rule '{}' has an invalid pattern '{term}': {error}",
-                    rule.name
-                ));
-            }
-        }
-    }
-    for format in &input.custom_formats {
-        if format.name.trim().is_empty() {
-            return Some("a custom format has an empty name".into());
-        }
-        if format.name.len() > 200 || format.conditions.len() > 100 {
-            return Some(format!("custom format '{}' is too large", format.name));
-        }
-        for condition in &format.conditions {
-            use crate::policy::ConditionKind;
-            if matches!(
-                condition.kind,
-                ConditionKind::Title
-                    | ConditionKind::Group
-                    | ConditionKind::Codec
-                    | ConditionKind::Audio
-                    | ConditionKind::Language
-                    | ConditionKind::Indexer
-            ) {
-                if let Err(error) = crate::policy::validate_term(&condition.value) {
-                    return Some(format!(
-                        "custom format '{}' has an invalid pattern '{}': {error}",
-                        format.name, condition.value
-                    ));
-                }
-            }
-        }
-    }
-    for rule in &input.size_rules {
-        if rule.resolution.trim().is_empty() || rule.resolution.len() > 32 {
-            return Some("a size rule has an invalid resolution".into());
-        }
-        if rule.min_mb < 0 || rule.max_mb < 0 {
-            return Some("a size rule has a negative bound".into());
-        }
-        if rule.max_mb > 0 && rule.min_mb > 0 && rule.max_mb < rule.min_mb {
-            return Some(format!(
-                "size rule '{}' has max below min",
-                rule.resolution
-            ));
-        }
-    }
-    None
-}
-
-async fn save_policy(
-    State(s): State<AppState>,
-    Json(input): Json<PolicyInput>,
-) -> impl IntoResponse {
-    if let Some(error) = policy_validation_error(&input) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":error})),
-        );
-    }
-    let serialized = [
-        ("release_rules", serde_json::to_string(&input.release_rules)),
-        ("custom_formats", serde_json::to_string(&input.custom_formats)),
-        ("size_rules", serde_json::to_string(&input.size_rules)),
-        (
-            "min_custom_format_score",
-            Ok(input
-                .min_custom_format_score
-                .map(|value| value.to_string())
-                .unwrap_or_default()),
-        ),
-    ];
-    for (key, value) in serialized {
-        let value = match value {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-                )
-            }
-        };
-        if let Err(error) = Config::save_setting(&s.cfg.data_dir, key, &value) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-            );
-        }
-    }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "release_rules": input.release_rules,
-            "custom_formats": input.custom_formats,
-            "size_rules": input.size_rules,
-            "min_custom_format_score": input.min_custom_format_score,
-        })),
-    )
-}
-
-async fn policy_preview(
-    State(s): State<AppState>,
-    Json(input): Json<PolicyPreviewInput>,
-) -> impl IntoResponse {
-    let title = input.title.trim();
-    if title.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":"empty title"})),
-        );
-    }
-    let cfg = latest_config(&s);
-    let source = input
-        .source
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("preview");
-    // A throwaway magnet lets the shared parser classify the title exactly as
-    // it would for a real release, without touching the network.
-    let magnet = format!("magnet:?xt=urn:btih:{}", "0".repeat(40));
-    let Some(mut release) =
-        crate::parser::parse_release_source(title, &magnet, None, source, chrono::Utc::now())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":"could not parse the title"})),
-        );
-    };
-    if let Some(kind) = input.kind.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        release.kind = kind.to_string();
-    }
-    release.size_bytes = input.size_bytes.max(0);
-    release.seeders = input.seeders.unwrap_or(-1);
-    release.peers = input.peers.unwrap_or(-1);
-    if let Some(year) = input.year {
-        release.year = Some(year);
-    }
-    let decision = cfg.policy_decision(&release);
-    let base_score = release.quality.score_with_settings(&cfg.settings);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "allowed": decision.allowed,
-            "rejections": decision.rejections,
-            "matched_formats": decision.matched_formats,
-            "violated_rules": decision.violated_rules,
-            "policy_score_delta": decision.score_delta,
-            "base_score": base_score,
-            "total_score": cfg.release_score(&release),
-            "parsed": {
-                "kind": release.kind,
-                "series": release.series,
-                "season": release.season,
-                "episode": release.episode,
-                "resolution": release.quality.resolution,
-                "source": release.quality.source,
-                "codec": release.quality.codec,
-                "audio": release.quality.audio,
-                "group": release.quality.group,
-                "languages": release.quality.languages,
-            }
-        })),
-    )
-}
-
-async fn quality_profiles_view(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let cfg = latest_config(&s);
-    Json(serde_json::json!({"ok": true, "items": cfg.quality_profiles}))
-}
-
-async fn save_quality_profiles(
-    State(s): State<AppState>,
-    Json(profiles): Json<Vec<crate::config::QualityProfile>>,
-) -> impl IntoResponse {
-    if profiles.len() > 100 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":"too many quality profiles (max 100)"})),
-        );
-    }
-    if profiles
-        .iter()
-        .any(|profile| profile.name.trim().is_empty() || profile.name.len() > 200)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok":false,"error":"a quality profile has an empty or oversized name"})),
-        );
-    }
-    match serde_json::to_string(&profiles).and_then(|value| {
-        Config::save_setting(&s.cfg.data_dir, "quality_profiles", &value)
-            .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
-    }) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok": true, "items": profiles})),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
-        ),
-    }
-}
-
 #[derive(serde::Deserialize)]
 pub struct MediaProbeInput {
     pub path: String,
@@ -5615,7 +5322,6 @@ async fn save_setting(
     let allowed = input.key.starts_with("libtorrent_")
         || input.key.starts_with("delay_")
         || input.key.starts_with("housekeeping_")
-        || input.key == "quality_profiles"
         || input.key.starts_with("score_")
         || input.key.starts_with("tvdb_")
         || input.key.starts_with("trakt_")
@@ -8262,7 +7968,9 @@ async fn manual_search(
         if let Some(release) =
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))
         {
-            if s.cfg.release_allowed(&release) {
+            if let Some(reason) = s.cfg.all_release_denied_reason(&release) {
+                crate::rules::log_rejection(&release, &reason);
+            } else {
                 results.push(release);
             }
         }
@@ -8540,6 +8248,7 @@ async fn tmdb_add(State(s): State<AppState>, Json(input): Json<TmdbAddInput>) ->
             exclude: input.exclude.trim().into(),
             language_requirements: String::new(),
             subtitle_requirements: String::new(),
+            disable_upgrades: false,
         });
     } else {
         if cfg
@@ -8575,6 +8284,7 @@ async fn tmdb_add(State(s): State<AppState>, Json(input): Json<TmdbAddInput>) ->
             enabled: true,
             ignored_seasons: Vec::new(),
             season_subfolders: false,
+            disable_upgrades: false,
         });
     }
     match Config::save_library(&s.cfg.data_dir, &cfg.series, &cfg.movies) {
@@ -13912,122 +13622,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_endpoints_persist_validate_and_preview() {
-        let (state, root) = test_state();
-        let app = router(state);
-        let post = |uri: &'static str, body: &'static str| {
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("x-rextto-token", "test-token")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap()
-        };
-        // Auth is enforced for the new surface as well.
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/policy")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-        let save = app
-            .clone()
-            .oneshot(post(
-                "/api/policy",
-                r#"{
-                    "release_rules": [{
-                        "name": "block cam",
-                        "enabled": true,
-                        "match_terms": ["CAM"],
-                        "action": {"type": "reject", "reason": "cam rip"}
-                    }],
-                    "custom_formats": [{
-                        "name": "x265",
-                        "enabled": true,
-                        "score": 300,
-                        "conditions": [{"kind": "codec", "value": "x265"}]
-                    }],
-                    "size_rules": [{"resolution": "1080p", "min_mb": 500, "max_mb": 0}],
-                    "min_custom_format_score": null
-                }"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(save.status(), StatusCode::OK);
-
-        // Persisted: the view returns the saved policy.
-        let view = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/policy")
-                    .header("x-rextto-token", "test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(view.status(), StatusCode::OK);
-        let body = to_bytes(view.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["release_rules"][0]["name"], "block cam");
-        assert_eq!(value["custom_formats"][0]["score"], 300);
-
-        // Preview: the reject rule fires.
-        let blocked = app
-            .clone()
-            .oneshot(post(
-                "/api/policy/preview",
-                r#"{"title":"Movie.2026.CAM.1080p.x265","kind":"movie","size_bytes":5000000000}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(blocked.status(), StatusCode::OK);
-        let body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["allowed"], false);
-        assert!(value["rejections"][0]
-            .as_str()
-            .unwrap()
-            .contains("cam rip"));
-
-        // Preview: the custom format adds its score.
-        let scored = app
-            .clone()
-            .oneshot(post(
-                "/api/policy/preview",
-                r#"{"title":"Movie.2026.1080p.WEB-DL.x265","kind":"movie","size_bytes":5000000000}"#,
-            ))
-            .await
-            .unwrap();
-        let body = to_bytes(scored.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["allowed"], true);
-        assert_eq!(value["policy_score_delta"], 300);
-        assert_eq!(value["matched_formats"][0], "x265");
-
-        // A broken regex is rejected at save time.
-        let invalid = app
-            .clone()
-            .oneshot(post(
-                "/api/policy",
-                r#"{"release_rules":[{"name":"bad","enabled":true,"match_terms":["/[/"],"action":{"type":"reject"}}]}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn event_hooks_endpoint_validates_and_reloads_runtime() {
         let (state, root) = test_state();
         let notifier = state.notifier.clone();
@@ -14066,53 +13660,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn quality_profiles_endpoint_roundtrips() {
-        let (state, root) = test_state();
-        let app = router(state);
-        let post = |body: &'static str| {
-            Request::builder()
-                .method("POST")
-                .uri("/api/quality-profiles")
-                .header("x-rextto-token", "test-token")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap()
-        };
-        let invalid = app
-            .clone()
-            .oneshot(post(r#"[{"name":"  ","allowed":[]}]"#))
-            .await
-            .unwrap();
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-
-        let save = app
-            .clone()
-            .oneshot(post(
-                r#"[{"name":"HD","allowed":["1080p","720p"],"cutoff":"1080p","upgrade_allowed":true}]"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(save.status(), StatusCode::OK);
-
-        let view = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/quality-profiles")
-                    .header("x-rextto-token", "test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body = to_bytes(view.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["items"][0]["name"], "HD");
-        assert_eq!(value["items"][0]["allowed"][0], "1080p");
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[tokio::test]
     async fn watched_folders_endpoint_roundtrips() {

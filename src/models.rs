@@ -26,6 +26,9 @@ pub struct Quality {
     pub has_subtitle: bool,
     #[serde(default)]
     pub subtitle_languages: Vec<String>,
+    /// Burned-in subtitles (`HC`/`hardcoded`): refused by a built-in rule.
+    #[serde(default)]
+    pub hardcoded_subs: bool,
 }
 
 impl Quality {
@@ -316,9 +319,6 @@ pub struct ApprovalContext {
     /// True when this candidate fills a known archive gap. Gap-fill always
     /// wins over the "no older episode" best-practice guard.
     pub gap_episode: bool,
-    /// Resolution rank at which the quality profile stops upgrading, used by
-    /// the same guard to accept a genuine upgrade while below the cutoff.
-    pub cutoff_rank: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
