@@ -48,9 +48,12 @@ o disco locale).
   hook eventi verso programmi esterni, cartelle osservate e simulatore dal vivo,
   modificabili dalla nuova pagina *Automazione*.
 - **Regolazione acquisizione** — delay profile con coda di attesa, profili
-  qualità con cutoff, smart episode opzionale, ispezione reale dei file con
-  `ffprobe`, backoff progressivo delle sorgenti e housekeeping/VACUUM
-  programmato.
+  qualità con cutoff, ispezione reale dei file con `ffprobe`, backoff
+  progressivo delle sorgenti e housekeeping/VACUUM programmato.
+- **Libreria monotona** — Rextto non scarica mai un episodio più vecchio fuori
+  dai buchi riconosciuti quando possiede già episodi successivi (un vero
+  upgrade sotto il cutoff del profilo passa comunque); gap-fill e azioni
+  manuali vincono sempre.
 - **Backup** — manuali o programmati (locale, FTP, cartella cloud, Telegram).
   Salvano database e configurazione, non i media né lo stato torrent.
 

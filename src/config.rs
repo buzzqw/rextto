@@ -694,15 +694,6 @@ impl Config {
             .to_string()
     }
 
-    /// Opt-in smart episode guard (autobrr): refuse a new episode when a later
-    /// one is already archived. Off by default because it trades off backfill.
-    pub fn smart_episode_guard(&self) -> bool {
-        self.settings
-            .get("smart_episode_guard")
-            .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
-            .unwrap_or(false)
-    }
-
     /// Delay profile: minutes a series (`series`) or movie (`movie`) release is
     /// held before grabbing. `0` disables the delay.
     pub fn delay_minutes(&self, kind: &str) -> i64 {

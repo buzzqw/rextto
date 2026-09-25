@@ -720,57 +720,28 @@ pub async fn run_cycle_domain(
                 .map(|movie| movie.quality.clone())
                 .unwrap_or_default()
         };
-        let cutoff_reached = cfg
-            .upgrade_cutoff_rank(&requirement)
-            .is_some_and(|cutoff| {
-                archive_index
-                    .best_for(release.season.unwrap_or(0), release.episode.unwrap_or(0))
-                    .is_some_and(|(quality, _)| quality.resolution_rank() >= cutoff)
-            });
+        // Cutoff and upgrade policy come from the title's quality profile; the
+        // gap flag feeds the always-on "no orphan older episode" best practice.
+        let cutoff_rank = cfg.upgrade_cutoff_rank(&requirement);
+        let cutoff_reached = cutoff_rank.is_some_and(|cutoff| {
+            archive_index
+                .best_for(release.season.unwrap_or(0), release.episode.unwrap_or(0))
+                .is_some_and(|(quality, _)| quality.resolution_rank() >= cutoff)
+        });
         let forbid_upgrade = !cfg.upgrade_allowed(&requirement) || cutoff_reached;
         let approval_context = crate::models::ApprovalContext {
             archive: archive_index,
             live: live_downloads.clone(),
             forbid_upgrade,
+            gap_episode: is_gap,
+            cutoff_rank,
         };
-        // The smart episode guard must never block a deliberate backfill: a
-        // candidate that fills a known archive gap is always allowed.
-        // A genuine quality upgrade over the later archived episode, while still
-        // below the profile cutoff, is allowed through even with the guard on.
-        let smart_episode = release.kind == "series"
-            && !release.is_pack
-            && cfg.smart_episode_guard()
-            && !is_gap
-            && match (release.series.as_deref(), release.season, release.episode) {
-                (Some(series_name), Some(season), Some(episode)) => {
-                    let later_rank = db
-                        .lock()
-                        .unwrap()
-                        .later_archived_max_resolution_rank(series_name, season, episode)
-                        .unwrap_or(None);
-                    let candidate_rank = release.quality.resolution_rank();
-                    let cutoff = cfg
-                        .find_series_match(series_name, release.season)
-                        .and_then(|series| cfg.upgrade_cutoff_rank(&series.quality));
-                    let upgrade_and_below_cutoff = later_rank
-                        .is_some_and(|later_rank| candidate_rank > later_rank)
-                        && cutoff.is_none_or(|cutoff| candidate_rank < cutoff);
-                    !upgrade_and_below_cutoff
-                }
-                _ => true,
-            };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
             let score = cfg.release_score(&release);
             let min_diff = cfg.upgrade_min_score_diff;
             let result = if release.kind == "series" {
-                db.check_series_scored_guarded(
-                    &release,
-                    score,
-                    min_diff,
-                    &approval_context,
-                    smart_episode,
-                )?
+                db.check_series_scored(&release, score, min_diff, &approval_context)?
             } else {
                 db.check_movie_scored_with(&release, score, min_diff, forbid_upgrade)?
             };

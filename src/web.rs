@@ -5615,7 +5615,6 @@ async fn save_setting(
     let allowed = input.key.starts_with("libtorrent_")
         || input.key.starts_with("delay_")
         || input.key.starts_with("housekeeping_")
-        || input.key == "smart_episode_guard"
         || input.key == "quality_profiles"
         || input.key.starts_with("score_")
         || input.key.starts_with("tvdb_")

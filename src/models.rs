@@ -313,6 +313,12 @@ pub struct ApprovalContext {
     /// quality profile with `upgrade_allowed = false` or when the cutoff
     /// resolution is already reached.
     pub forbid_upgrade: bool,
+    /// True when this candidate fills a known archive gap. Gap-fill always
+    /// wins over the "no older episode" best-practice guard.
+    pub gap_episode: bool,
+    /// Resolution rank at which the quality profile stops upgrading, used by
+    /// the same guard to accept a genuine upgrade while below the cutoff.
+    pub cutoff_rank: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -515,7 +515,6 @@ impl Database {
             Self::DEFAULT_UPGRADE_MIN_SCORE_DIFF,
             &crate::models::ApprovalContext::default(),
             false,
-            false,
         )
     }
 
@@ -526,29 +525,7 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
-        self.check_series_scored_inner(release, score, min_score_diff, context, false, false)
-    }
-
-    /// Like [`Self::check_series_scored`] but also applies the opt-in smart
-    /// episode guard: refuse a brand-new episode when a later episode/season is
-    /// already archived. Callers must pass `false` for gap-fill candidates, or
-    /// deliberate backfill would be blocked.
-    pub fn check_series_scored_guarded(
-        &self,
-        release: &Release,
-        score: i64,
-        min_score_diff: i64,
-        context: &crate::models::ApprovalContext,
-        smart_episode: bool,
-    ) -> Result<(bool, String)> {
-        self.check_series_scored_inner(
-            release,
-            score,
-            min_score_diff,
-            context,
-            false,
-            smart_episode,
-        )
+        self.check_series_scored_inner(release, score, min_score_diff, context, false)
     }
 
     /// Approvazione dell'azione esplicita “Accoda”. Per questa azione un
@@ -563,7 +540,7 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
     ) -> Result<(bool, String)> {
-        self.check_series_scored_inner(release, score, min_score_diff, context, true, false)
+        self.check_series_scored_inner(release, score, min_score_diff, context, true)
     }
 
     fn check_series_scored_inner(
@@ -573,7 +550,6 @@ impl Database {
         min_score_diff: i64,
         context: &crate::models::ApprovalContext,
         manual: bool,
-        smart_episode: bool,
     ) -> Result<(bool, String)> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         if self.is_blocklisted(&hash)? {
@@ -607,25 +583,37 @@ impl Database {
             return Ok((false, "active_episode".into()));
         }
         if !manual && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM torrent_meta WHERE lower(series_name)=lower(?1) AND season=?2 AND episode=?3 AND status NOT IN ('completed','error','removed'))", params![series_name, season, episode], |row| row.get::<_, bool>(0))? { return Ok((false, "active_episode".into())); }
-        // Smart episode guard (opt-in, from autobrr): refuse a *brand-new*
-        // episode when a later episode or season is already archived. Upgrades
-        // of an already-present episode and gap-fill candidates are exempt
-        // (the caller passes `smart_episode = false` for gaps), so deliberate
-        // backfill keeps working.
-        if smart_episode {
+        // Core best practice (always on, no user option): never fetch an older
+        // episode that is not a recognised gap when a later episode or season is
+        // already archived. A genuine quality upgrade over the later archived
+        // episode, while still below the profile cutoff, is accepted; gap-fill
+        // and manual actions are always exempt. This is what keeps the library
+        // monotonic without ever blocking a deliberate backfill.
+        if !manual && !context.gap_episode {
             let archived_here: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=?1 AND season=?2 AND episode=?3 AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>''))",
                 params![sid, season, episode],
                 |row| row.get(0),
             )?;
             if !archived_here {
-                let later_archived: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=?1 AND (season > ?2 OR (season = ?2 AND episode > ?3)) AND (downloaded_at IS NOT NULL OR COALESCE(archive_path,'')<>''))",
-                    params![sid, season, episode],
+                let later_exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM episodes e JOIN series s ON s.id=e.series_id WHERE s.name=?1 AND (e.season > ?2 OR (e.season = ?2 AND e.episode > ?3)) AND (e.downloaded_at IS NOT NULL OR COALESCE(e.archive_path,'')<>''))",
+                    params![series_name, season, episode],
                     |row| row.get(0),
                 )?;
-                if later_archived {
-                    return Ok((false, "smart_episode".into()));
+                if later_exists {
+                    let candidate_rank = release.quality.resolution_rank();
+                    let later_rank = self
+                        .later_archived_max_resolution_rank(series_name, season, episode)?;
+                    let upgrade_below_cutoff = later_rank.is_some_and(|later_rank| {
+                        candidate_rank > later_rank
+                            && context
+                                .cutoff_rank
+                                .is_none_or(|cutoff| candidate_rank < cutoff)
+                    });
+                    if !upgrade_below_cutoff {
+                        return Ok((false, "smart_episode".into()));
+                    }
                 }
             }
         }
@@ -3772,7 +3760,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: index,
             live: crate::models::LiveDownloads::default(),
-            forbid_upgrade: false,
+            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3815,7 +3803,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
-            forbid_upgrade: false,
+            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -3831,7 +3819,7 @@ mod tests {
         let context = crate::models::ApprovalContext {
             archive: Default::default(),
             live,
-            forbid_upgrade: false,
+            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
         };
         let (approved, reason) = db
             .check_series_scored(&release, score, 200, &context)
@@ -5046,7 +5034,7 @@ mod tests {
         let allowed_context = crate::models::ApprovalContext {
             archive: index.clone(),
             live: Default::default(),
-            forbid_upgrade: false,
+            forbid_upgrade: false, gap_episode: false, cutoff_rank: None,
         };
         let (approved, reason) = db
             .check_series_scored(&candidate, score, 200, &allowed_context)
@@ -5063,7 +5051,7 @@ mod tests {
         let cutoff_context = crate::models::ApprovalContext {
             archive: index,
             live: Default::default(),
-            forbid_upgrade: true,
+            forbid_upgrade: true, gap_episode: false, cutoff_rank: None,
         };
         let (approved, reason) = db
             .check_series_scored(&candidate, score, 200, &cutoff_context)
@@ -5078,7 +5066,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_episode_guard_blocks_only_when_enabled() {
+    fn smart_episode_is_always_on_but_exempts_gaps_and_upgrades() {
         let path = std::env::temp_dir().join(format!(
             "rextto-smart-episode-{}-{}.db",
             std::process::id(),
@@ -5096,10 +5084,18 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO episodes(series_id,season,episode,title,quality_score,downloaded_at,archive_path) \
-                 VALUES (?1,1,5,'Show.S01E05',1000,'2024-01-01T00:00:00+00:00','/nas/e5.mkv')",
+                 VALUES (?1,1,5,'Show.S01E05.1080p',1000,'2024-01-01T00:00:00+00:00','/nas/e5.mkv')",
                 [series_id],
             )
             .unwrap();
+        let clear_episode = || {
+            db.conn
+                .execute(
+                    "DELETE FROM episodes WHERE series_id=?1 AND season=1 AND episode=1",
+                    [series_id],
+                )
+                .unwrap();
+        };
 
         let mut candidate = release();
         candidate.kind = "series".into();
@@ -5107,27 +5103,54 @@ mod tests {
         candidate.season = Some(1);
         candidate.episode = Some(1);
         candidate.is_pack = false;
+        candidate.quality = Quality {
+            resolution: "1080p".into(),
+            source: "webdl".into(),
+            ..Default::default()
+        };
         let score = candidate.quality.score();
 
-        // Guard disabled (default): the earlier episode is approved.
+        // Always on: same-quality older episode is refused with no option set.
         let (approved, reason) = db
             .check_series_scored(&candidate, score, 200, &crate::models::ApprovalContext::default())
             .unwrap();
-        assert!(approved, "expected approval, got {reason}");
-        db.conn
-            .execute("DELETE FROM episodes WHERE series_id=?1 AND season=1 AND episode=1", [series_id])
-            .unwrap();
+        assert!(!approved);
+        assert_eq!(reason, "smart_episode");
 
-        // Guard enabled: the earlier episode is refused because a later one
-        // is already archived.
+        // Gap-fill is exempt: the same candidate is accepted.
+        let gap_context = crate::models::ApprovalContext {
+            gap_episode: true,
+            ..Default::default()
+        };
         let (approved, reason) = db
-            .check_series_scored_guarded(
-                &candidate,
-                score,
-                200,
-                &crate::models::ApprovalContext::default(),
-                true,
-            )
+            .check_series_scored(&candidate, score, 200, &gap_context)
+            .unwrap();
+        assert!(approved, "expected gap approval, got {reason}");
+        clear_episode();
+
+        // A genuine upgrade over the later episode, below the cutoff, is accepted.
+        candidate.quality = Quality {
+            resolution: "2160p".into(),
+            source: "webdl".into(),
+            ..Default::default()
+        };
+        let below_cutoff = crate::models::ApprovalContext {
+            cutoff_rank: Some(7),
+            ..Default::default()
+        };
+        let (approved, reason) = db
+            .check_series_scored(&candidate, candidate.quality.score(), 200, &below_cutoff)
+            .unwrap();
+        assert!(approved, "expected upgrade approval, got {reason}");
+        clear_episode();
+
+        // At or above the cutoff it is refused again.
+        let at_cutoff = crate::models::ApprovalContext {
+            cutoff_rank: Some(5),
+            ..Default::default()
+        };
+        let (approved, reason) = db
+            .check_series_scored(&candidate, candidate.quality.score(), 200, &at_cutoff)
             .unwrap();
         assert!(!approved);
         assert_eq!(reason, "smart_episode");

@@ -48,7 +48,7 @@ Terza convergenza: **ingestione da cartelle osservate** (qBittorrent
 | 2 | Inviluppi di dimensione per qualità (min/max MB) | Sonarr/Radarr | alto | S | **integrato** |
 | 3 | Hook eventi (programma esterno) con variabili | qBittorrent/Sonarr/BiglyBT/autobrr | alto | S | **integrato** |
 | 4 | Cartelle osservate | qBittorrent/BiglyBT | medio-alto | S | **integrato** |
-| 5 | Smart episode guard (monotonia episodio) | autobrr | alto | S | **integrato** (opt-in) |
+| 5 | Smart episode guard (monotonia episodio) | autobrr | alto | S | **integrato** (core, sempre attivo) |
 | 6 | Delay profile + coda "pending" | Sonarr/Radarr | alto | M | **integrato** |
 | 7 | Quality profile ordinati con cutoff/gruppi | Sonarr/Radarr | alto | L | **integrato** (cutoff su archivio) |
 | 8 | MediaInfo/ffprobe sul file reale | Sonarr/Radarr | alto | M | **integrato** |
@@ -313,12 +313,24 @@ Integrazione:
 - Worker `watched_folders_worker` in `web.rs` (ogni 15 s, salta il dry-run,
   max 5 tentativi per file) registrato tra i worker di lunga durata.
 
-### 8.4 Smart episode (opt-in)
+### 8.4 Smart episode (logica core, sempre attiva)
 
-`Database::check_series_scored_guarded` rifiuta un episodio **nuovo** quando uno
-successivo (o una stagione successiva) è già archiviato. È spento di default e
-l'orchestratore passa `false` per i candidati che riempiono un gap, così il
-gap-fill deliberato non viene bloccato. Settaggio `smart_episode_guard`.
+Non è un'opzione: è una regola fissa del decision engine. In
+`Database::check_series_scored_inner`, un episodio **non ancora archiviato**
+viene rifiutato (`smart_episode`) quando esiste un episodio o una stagione
+successivi già archiviati, con queste esenzioni:
+
+- **gap-fill**: `ApprovalContext.gap_episode` (calcolato sui gap riconosciuti)
+  passa sempre, così il backfill deliberato non è mai bloccato;
+- **upgrade reale sotto cutoff**: se la risoluzione candidata è superiore a
+  quella del migliore episodio successivo archiviato e resta sotto il
+  `cutoff_rank` del profilo, l'episodio passa;
+- **azioni manuali**: `check_series_manual_scored` bypassa sempre;
+- i **season pack** non sono interessati (logica per-episodio già esistente).
+
+Se l'episodio bersaglio è già archiviato, la regola non interviene affatto e
+vale il normale confronto di upgrade (soggetto a `forbid_upgrade`). In pratica
+la libreria resta monotona senza mai impedire di riempire un buco.
 
 ### 8.5 Delay profile
 

@@ -50,9 +50,11 @@ disk).
   external event hooks, watched folders and a live simulator, all editable
   from the new *Automation* page.
 - **Acquisition tuning** — delay profiles with pending queue, named quality
-  profiles with cutoff, opt-in smart-episode guard, ground-truth media
-  inspection via `ffprobe`, escalating provider backoff and scheduled
-  housekeeping/VACUUM.
+  profiles with cutoff, ground-truth media inspection via `ffprobe`,
+  escalating provider backoff and scheduled housekeeping/VACUUM.
+- **Monotonic library** — Rextto never pulls an older episode outside a
+  recognised gap while it already owns later ones (a genuine upgrade below the
+  profile cutoff still passes); gap-fill and manual actions always win.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
   They include databases and configuration, not media files or torrent state.
 
