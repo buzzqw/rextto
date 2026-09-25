@@ -29,6 +29,25 @@ Rextto runs as a single service. Open the web UI at `http://<host>:5000`.
   mode* in *Configuration → Daemon* only when you are ready.
 - Add series/movies from **Explore** (TMDB) or **Series / Movies → Add**.
 
+### Command line and updates
+
+The daemon is normally run by the systemd service. When invoked directly it
+understands:
+
+- `rexttod --version` — print the installed version, the release marker and the
+  bundled libtorrent;
+- `rexttod --help` — usage summary;
+- `rexttod --update` — download and install the latest daemon and web UI;
+- `rexttod --config <file>` and `rexttod --dry-run` — as used by the service and
+  by local tests.
+
+`--update` downloads the official `rextto-linux-<arch>.tar.gz`, verifies its
+checksum when published, and swaps in the executable and UI atomically. It never
+touches `REXTTO_DATA_DIR`. Options: `--channel stable`, `--release <tag>`,
+`--install-dir <dir>`, `--archive <file>` (offline), `--no-restart`, `--force`.
+It restarts `rextto.service` when run as root. The same payload can be used
+manually as a standalone package (see the README, *Standalone Linux package*).
+
 ## 2. Dashboard
 
 - **Manual global search** — searches archive + indexers + web engines.

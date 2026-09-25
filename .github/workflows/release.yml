@@ -37,11 +37,11 @@ jobs:
 
       - name: Package release
         run: |
-          mkdir -p package/ui
-          cp target/release/rexttod package/rexttod
-          cp -a ui/target/site/. package/ui/
-          tar -C package -czf rextto-linux-x86_64.tar.gz rexttod ui
-          sha256sum rextto-linux-x86_64.tar.gz > rextto-linux-x86_64.tar.gz.sha256
+          scripts/package-linux.sh \
+            --binary target/release/rexttod \
+            --ui ui/target/site \
+            --output rextto-linux-x86_64.tar.gz \
+            --label "${GITHUB_REF_NAME:-release}"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

@@ -26,5 +26,11 @@ fn main() {
     println!("cargo:rustc-link-lib=torrent-rasterbar");
     println!("cargo:rustc-link-lib=ssl");
     println!("cargo:rustc-link-lib=crypto");
+    // Look for a bundled libtorrent next to the executable (`lib/`), which is how
+    // the standalone release archive ships it. When the directory is absent (as
+    // in development) the loader simply falls back to the system library.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
+    }
     println!("cargo:rustc-env=REXTTO_BUILD={}", next_build_number());
 }

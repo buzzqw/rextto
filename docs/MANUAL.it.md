@@ -29,6 +29,26 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
   *modalità attiva* in *Configurazione → Daemon* solo quando sei pronto.
 - Aggiungi serie/film da **Esplora** (TMDB) oppure da **Serie TV / Film → Aggiungi**.
 
+### Riga di comando e aggiornamenti
+
+Il demone gira normalmente nel servizio systemd. Eseguito direttamente
+comprende:
+
+- `rexttod --version` — mostra la versione installata, il marker di release e la
+  libtorrent inclusa;
+- `rexttod --help` — riepilogo d'uso;
+- `rexttod --update` — scarica e installa l'ultima versione di demone e UI web;
+- `rexttod --config <file>` e `rexttod --dry-run` — usati dal servizio e per le
+  prove locali.
+
+`--update` scarica `rextto-linux-<arch>.tar.gz`, verifica il checksum quando
+pubblicato e sostituisce eseguibile e UI con rename atomici. Non tocca mai
+`REXTTO_DATA_DIR`. Opzioni: `--channel stable`, `--release <tag>`,
+`--install-dir <dir>`, `--archive <file>` (offline), `--no-restart`, `--force`.
+Riavvia `rextto.service` quando eseguito come root. Lo stesso payload si può
+usare manualmente come pacchetto autonomo (vedi il README, *Pacchetto Linux
+autonomo*).
+
 ## 2. Dashboard
 
 - **Ricerca manuale globale** — cerca in archivio + indexer + motori web.

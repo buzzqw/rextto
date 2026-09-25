@@ -109,6 +109,24 @@ sudo systemctl status rextto.service
 sudo journalctl -u rextto.service -f
 ```
 
+### Pacchetto Linux autonomo
+
+Ogni push su `main` (e ogni tag di release) pubblica
+`rextto-linux-x86_64.tar.gz`, un archivio autonomo con il demone `rexttod`, la
+UI web compilata e libtorrent incluso. Si estrae e si esegue senza compilatore:
+
+```bash
+mkdir rextto && tar -xzf rextto-linux-x86_64.tar.gz -C rextto
+cd rextto
+./run.sh --version
+REXTTO_DATA_DIR="$PWD/data" REXTTO_DRY_RUN=1 REXTTO_ACTIVE=0 ./run.sh
+```
+
+L'archivio è prodotto da [`scripts/package-linux.sh`](scripts/package-linux.sh)
+ed è quello che `rexttod --update` installa. Richiede un Linux 64 bit recente
+(glibc, libstdc++, OpenSSL 3, zlib, libzstd); `ffprobe` è opzionale. Per
+un'installazione gestita come servizio usa l'installer descritto sopra.
+
 ### Compila da un checkout (sviluppo)
 
 Per gli sviluppatori, installa le dipendenze di compilazione e compila il demone:
@@ -267,6 +285,55 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | `x` | nella scheda Health, pulisce il trash (chiede conferma) |
 | `/` / `f` | nella scheda Logs, filtra / attiva-disattiva il follow |
 
+### Riga di comando
+
+Il demone parte normalmente come servizio systemd. Eseguito direttamente,
+`rexttod` accetta anche alcune opzioni:
+
+| Comando | Cosa fa |
+|---|---|
+| `rexttod --version` | mostra la versione installata e la libtorrent inclusa |
+| `rexttod --help` | mostra il riepilogo d'uso |
+| `rexttod --update` | scarica e installa l'ultima versione di demone e UI web |
+| `rexttod --config <file>` | usa un file di configurazione specifico |
+| `rexttod --dry-run` | avvia senza download reali |
+
+`rexttod --update` riusa gli stessi asset dell'installer: scarica
+`rextto-linux-<arch>.tar.gz`, verifica il `.sha256` pubblicato e sostituisce
+eseguibile e UI web con rename atomici. Configurazione, database e download in
+`REXTTO_DATA_DIR` non vengono toccati, e un download o un checksum fallito
+lascia intatta l'installazione corrente. Opzioni utili:
+
+```bash
+rexttod --update --channel stable      # ultima release con tag
+rexttod --update --release v0.2.0      # installa un tag specifico
+rexttod --update --install-dir /opt/rextto --no-restart
+rexttod --update --archive ./rextto-linux-x86_64.tar.gz   # offline
+```
+
+Il servizio viene riavviato automaticamente quando il comando gira come root.
+
+### Dove trovare i dettagli
+
+Il README è la panoramica pratica; il [manuale](docs/MANUAL.it.md) documenta ogni
+schermata. Indice rapido:
+
+| Argomento | README | Manuale |
+|---|---|---|
+| Installazione, aggiornamento, servizio | *Installazione*, *Riga di comando* | — |
+| Primo avvio e modalità | *Primo avvio* | [1. Primo avvio](docs/MANUAL.it.md#1-primo-avvio) |
+| Dashboard, cicli, statistiche | *Cicli e download* | [2. Dashboard](docs/MANUAL.it.md#2-dashboard) |
+| Torrent, stalled, storico | *Cicli e download* | [3. Scarico](docs/MANUAL.it.md#3-scarico) |
+| Serie, episodi, gap | *Aggiungi serie e film* | [4. Serie TV](docs/MANUAL.it.md#4-serie-tv) |
+| Film | *Aggiungi serie e film* | [5. Film](docs/MANUAL.it.md#5-film) |
+| Esplora, Archivio, Fumetti | *Le sezioni della UI* | [6. Esplora, Archivio, Fumetti](docs/MANUAL.it.md#6-esplora-archivio-fumetti) |
+| Sorgenti, punteggi, rinomina | *Configura le sorgenti* | [7. Configurazione](docs/MANUAL.it.md#7-configurazione) |
+| Trakt, Jellyfin, hook | *Le sezioni della UI* | [8. Integrazioni](docs/MANUAL.it.md#8-integrazioni) |
+| Backup, duplicati, DB | *Le sezioni della UI* | [9. Manutenzione](docs/MANUAL.it.md#9-manutenzione) |
+| Salute, log, grafici | *Leggere i log* | [10. Salute, Log, Grafici](docs/MANUAL.it.md#10-salute-log-grafici) |
+| Notifiche | *Le sezioni della UI* | [11. Notifiche](docs/MANUAL.it.md#11-notifiche) |
+| Problemi comuni | — | [12. Risoluzione problemi](docs/MANUAL.it.md#12-risoluzione-problemi) |
+
 ### Dati e log
 
 - Data directory di default: `data/` (modificabile con `REXTTO_DATA_DIR`).
@@ -280,6 +347,9 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 | `REXTTO_DATA_DIR` | Data directory (database, log, download) |
 | `REXTTO_LISTEN` | Indirizzo UI/API (default `0.0.0.0:5000`) |
 | `REXTTO_ENGINE_LISTEN` | Canale interno del motore (default `127.0.0.1:8889`) |
+| `REXTTO_UI_DIR` | Directory della UI web compilata (installazioni pacchettizzate) |
+| `REXTTO_INSTALL_DIR` | Directory di installazione usata da `--update` |
+| `REXTTO_REPO` | Repository GitHub usato da `--update` (default `buzzqw/rextto`) |
 | `REXTTO_ACTIVE` | `1` abilita i cicli di acquisizione |
 | `REXTTO_DRY_RUN` | `1` disabilita i download reali |
 | `REXTTO_API_TOKEN` | Token bearer opzionale per API/UI |
@@ -288,6 +358,8 @@ Schede: **Status · Torrents · Logs · Health** (auto-refresh).
 
 ## Sviluppo
 
+### Compila, prova ed esegui
+
 ```bash
 cargo build --profile fast       # build rapida del demone (target/fast/rexttod)
 cargo build --release            # build del demone per produzione
@@ -295,6 +367,54 @@ cargo check                      # feedback più rapido
 cargo test --all-targets         # test
 cargo clean                      # rimuove gli artefatti quando serve
 ```
+
+La UI web è un workspace Leptos/WASM separato:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install cargo-leptos
+cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
+```
+
+`scripts/acceptance.sh` esegue il collaudo isolato descritto in
+[`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md): usa una data directory temporanea e
+porte dedicate in dry-run, quindi non tocca mai un'installazione reale.
+
+### Packaging
+
+[`scripts/package-linux.sh`](scripts/package-linux.sh) produce l'archivio
+autonomo usato dall'installer e da `rexttod --update`:
+
+```bash
+cargo build --release --locked
+cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
+scripts/package-linux.sh --binary target/release/rexttod --ui ui/target/site
+# -> rextto-linux-x86_64.tar.gz + rextto-linux-x86_64.tar.gz.sha256
+```
+
+L'archivio contiene `rexttod`, la `ui/` compilata, la libtorrent in `lib/`, il
+launcher `run.sh` e un breve README. Il demone è linkato con rpath `$ORIGIN/lib`
+e cerca una `ui/` accanto a sé, quindi parte direttamente dall'archivio
+estratto; `install.sh` copia lo stesso payload in `/opt/rextto`.
+
+### Come sono fatte le parti
+
+| Componente / risorsa | Ruolo | Funzioni che abilita |
+|---|---|---|
+| Rust + Tokio + Axum | runtime del demone e server HTTP | cicli, API REST, stream SSE dei log, UI statica |
+| Leptos + WASM (`ui/`) | front-end single-page | dashboard, schermate libreria, impostazioni, UI bilingue |
+| SQLite (rusqlite bundled) | persistenza locale | serie/episodi, film, archivio, fumetti, config, statistiche cicli, metadati torrent |
+| libtorrent (`native/libtorrent_bridge.cpp`, `src/libtorrent.rs`) | motore BitTorrent integrato | coda e limiti, politica di seeding, tracker, file, peer, fastresume, killswitch VPN |
+| reqwest + scraper + quick-xml (`src/rss.rs`, `src/websearch.rs`) | acquisizione sorgenti | feed RSS/HTML, indexer Torznab, motori web, fallback FlareSolverr |
+| TMDB / TVDB (`src/tmdb.rs`, `src/tvdb.rs`) | provider metadati | locandine, stagioni, date episodi, scoperta |
+| ffprobe / MediaInfo (`src/mediainfo.rs`) | ispezione reale dei file | dati codec/HDR/audio/lingue usati nei confronti di upgrade |
+| Trakt / Simkl / Jellyfin / Plex (`src/integrations.rs`) | integrazioni media server | watchlist, calendario, scrobble, refresh libreria |
+| Telegram / SMTP / webhook (`src/notifier.rs`) | notifiche | avvisi di completamento/errore, webhook firmati HMAC |
+| FTP / cloud / Telegram (`src/backup.rs`, suppaftp) | backup programmati | snapshot di database e configurazione |
+| zip, flate2, sha1/hmac/sha2 | utilità | gestione archivi, hashing, firma webhook |
+| parser + rules + scoring (`src/parser.rs`, `src/rules.rs`, `src/config.rs`) | logica di dominio | parsing release, punteggio qualità, controlli di sanità, upgrade |
+| installer + packaging + systemd | operazioni | install da sorgente/release, self-update, servizio, archivio autonomo |
+| importatore legacy (`src/importer.rs`) | CLI di migrazione | import una tantum dei database di un'installazione precedente |
 
 Le build di sviluppo restano piccole e non crescono all'infinito:
 

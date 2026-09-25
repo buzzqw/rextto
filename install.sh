@@ -194,8 +194,11 @@ download_release() {
     [[ -n "$ui_bundle" ]] || die "release archive does not contain the web UI"
     local site="${ui_bundle%/pkg/ui.js}"
     [[ -f "$site/pkg/ui.js" ]] || die "release archive does not contain the web UI"
+    local lib_dir
+    lib_dir="$(find "$TMP_DIR/release" -type d -name lib -print -quit)"
     PAYLOAD_BINARY="$binary"
     PAYLOAD_UI="$site"
+    PAYLOAD_LIB="$lib_dir"
     PAYLOAD_VERSION="$RELEASE"
     return 0
 }
@@ -231,6 +234,7 @@ build_from_source() {
     (cd "$source_dir" && cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only)
     PAYLOAD_BINARY="$source_dir/target/release/rexttod"
     PAYLOAD_UI="$source_dir/ui/target/site"
+    PAYLOAD_LIB=""
     PAYLOAD_VERSION="source-$SOURCE_REF"
 }
 
@@ -242,6 +246,10 @@ install_payload() {
     root_cmd install -m 0755 "$PAYLOAD_BINARY" "$INSTALL_DIR/rexttod"
     root_cmd rm -rf "$INSTALL_DIR/ui"
     root_cmd cp -a "$PAYLOAD_UI" "$INSTALL_DIR/ui"
+    if [[ -n "${PAYLOAD_LIB:-}" && -d "$PAYLOAD_LIB" ]]; then
+        root_cmd install -d -m 0755 "$INSTALL_DIR/lib"
+        root_cmd cp -a "$PAYLOAD_LIB/." "$INSTALL_DIR/lib/"
+    fi
     printf '%s\n' "$PAYLOAD_VERSION" | root_cmd tee "$INSTALL_DIR/VERSION" >/dev/null
 }
 
@@ -267,7 +275,7 @@ Restart=on-failure
 RestartSec=10
 Environment=REXTTO_DATA_DIR=$DATA_DIR
 Environment=REXTTO_UI_DIR=$INSTALL_DIR/ui
-Environment=LD_LIBRARY_PATH=$LIBTORRENT_PREFIX/lib:$LIBTORRENT_PREFIX/lib64
+Environment=LD_LIBRARY_PATH=$INSTALL_DIR/lib:$LIBTORRENT_PREFIX/lib:$LIBTORRENT_PREFIX/lib64
 Environment=REXTTO_LISTEN=0.0.0.0:$PORT
 Environment=REXTTO_ENGINE_LISTEN=127.0.0.1:$ENGINE_PORT
 Environment=REXTTO_ACTIVE=${REXTTO_ACTIVE:-1}

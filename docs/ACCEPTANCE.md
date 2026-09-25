@@ -66,3 +66,35 @@ systemd unit and initial databases.
 
 Only after the checks above, set `REXTTO_ACTIVE=1` / `REXTTO_DRY_RUN=0` and make
 sure no other service is using the web/engine ports.
+
+## 7. Command line and self-update
+
+```bash
+target/release/rexttod --version   # daemon + build + libtorrent
+target/release/rexttod --help
+```
+
+`--update` must preserve the data directory and stay atomic. Test it against a
+local archive and a throwaway install directory:
+
+```bash
+scripts/package-linux.sh \
+  --binary target/release/rexttod --ui ui/target/site \
+  --output /tmp/rextto-linux-x86_64.tar.gz
+mkdir -p /tmp/rextto-update-check
+target/release/rexttod --update \
+  --archive /tmp/rextto-linux-x86_64.tar.gz \
+  --install-dir /tmp/rextto-update-check --no-restart
+/tmp/rextto-update-check/rexttod --version
+```
+
+The archive must contain `rexttod`, `ui/pkg/ui.js`, `lib/libtorrent-rasterbar.so.2.0`
+and `run.sh`:
+
+```bash
+tar -tzf /tmp/rextto-linux-x86_64.tar.gz
+```
+
+Finally, extract it in a clean machine or container **without** libtorrent
+installed and confirm `./run.sh --version` and a dry-run start work, proving the
+bundled library and UI are complete.

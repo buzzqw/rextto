@@ -112,6 +112,25 @@ sudo systemctl status rextto.service
 sudo journalctl -u rextto.service -f
 ```
 
+### Standalone Linux package
+
+Every push to `main` (and every release tag) publishes a self-contained
+`rextto-linux-x86_64.tar.gz` containing the `rexttod` daemon, the compiled web
+UI and the bundled libtorrent. Extract it and run it directly, without a
+compiler:
+
+```bash
+mkdir rextto && tar -xzf rextto-linux-x86_64.tar.gz -C rextto
+cd rextto
+./run.sh --version
+REXTTO_DATA_DIR="$PWD/data" REXTTO_DRY_RUN=1 REXTTO_ACTIVE=0 ./run.sh
+```
+
+The archive is built by [`scripts/package-linux.sh`](scripts/package-linux.sh)
+and is what `rexttod --update` installs. It requires a modern 64-bit Linux
+(glibc, libstdc++, OpenSSL 3, zlib, libzstd); `ffprobe` is optional. For a
+managed service install use the installer above.
+
 ### Build from a checkout (development)
 
 For contributors, install the build dependencies and build the daemon:
@@ -268,6 +287,55 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | `x` | on the Health tab, clean the trash (asks for confirmation) |
 | `/` / `f` | on the Logs tab, filter / toggle follow mode |
 
+### Command line
+
+The daemon is normally started by the systemd service. When you run `rexttod`
+directly it also accepts a few options:
+
+| Command | What it does |
+|---|---|
+| `rexttod --version` | print the installed version and the bundled libtorrent |
+| `rexttod --help` | print the usage summary |
+| `rexttod --update` | download and install the latest daemon + web UI |
+| `rexttod --config <file>` | use a specific configuration file |
+| `rexttod --dry-run` | start without real downloads |
+
+`rexttod --update` reuses the same assets as the installer: it downloads
+`rextto-linux-<arch>.tar.gz`, verifies the published `.sha256`, and replaces the
+executable and web UI with atomic swaps. Your configuration, databases and
+downloads in `REXTTO_DATA_DIR` are never touched, and a failed download or
+checksum leaves the current installation working. Useful flags:
+
+```bash
+rexttod --update --channel stable      # use the latest tagged release
+rexttod --update --release v0.2.0      # install a specific tag
+rexttod --update --install-dir /opt/rextto --no-restart
+rexttod --update --archive ./rextto-linux-x86_64.tar.gz   # offline
+```
+
+The service is restarted automatically when the command runs as root.
+
+### Where to find the details
+
+The README is the practical overview; the [manual](docs/MANUAL.en.md) documents
+every screen. Quick index:
+
+| Topic | README | Manual |
+|---|---|---|
+| Install, update, service | *Installation*, *Command line* | — |
+| First run and modes | *First run* | [1. First start](docs/MANUAL.en.md#1-first-start) |
+| Dashboard, cycles, stats | *Cycles and downloads* | [2. Dashboard](docs/MANUAL.en.md#2-dashboard) |
+| Torrents, stalled, history | *Cycles and downloads* | [3. Downloads](docs/MANUAL.en.md#3-downloads) |
+| Series, episodes, gaps | *Add series and movies* | [4. Series](docs/MANUAL.en.md#4-series) |
+| Movies | *Add series and movies* | [5. Movies](docs/MANUAL.en.md#5-movies) |
+| Explore, Archive, Comics | *UI sections* | [6. Explore, Archive, Comics](docs/MANUAL.en.md#6-explore-archive-comics) |
+| Sources, scoring, renaming | *Configure the sources* | [7. Configuration](docs/MANUAL.en.md#7-configuration) |
+| Trakt, Jellyfin, hooks | *UI sections* | [8. Integrations](docs/MANUAL.en.md#8-integrations) |
+| Backups, duplicates, DB | *UI sections* | [9. Maintenance](docs/MANUAL.en.md#9-maintenance) |
+| Health, logs, charts | *Reading the logs* | [10. Health, Logs, Charts](docs/MANUAL.en.md#10-health-logs-charts) |
+| Notifications | *UI sections* | [11. Notifications](docs/MANUAL.en.md#11-notifications) |
+| Common problems | — | [12. Troubleshooting](docs/MANUAL.en.md#12-troubleshooting) |
+
 ### Data and logs
 
 - Default data directory: `data/` (override with `REXTTO_DATA_DIR`).
@@ -281,6 +349,9 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 | `REXTTO_DATA_DIR` | Data directory (databases, logs, downloads) |
 | `REXTTO_LISTEN` | Web UI/API address (default `0.0.0.0:5000`) |
 | `REXTTO_ENGINE_LISTEN` | Internal engine channel (default `127.0.0.1:8889`) |
+| `REXTTO_UI_DIR` | Directory of the compiled web UI (packaged installs) |
+| `REXTTO_INSTALL_DIR` | Installation directory used by `--update` |
+| `REXTTO_REPO` | GitHub repository used by `--update` (default `buzzqw/rextto`) |
 | `REXTTO_ACTIVE` | `1` enables the acquisition cycles |
 | `REXTTO_DRY_RUN` | `1` disables real downloads |
 | `REXTTO_API_TOKEN` | Optional bearer token for the API/UI |
@@ -289,6 +360,8 @@ Tabs: **Status · Torrents · Logs · Health** (auto-refresh).
 
 ## Development
 
+### Build, test and run
+
 ```bash
 cargo build --profile fast      # fast daemon build (target/fast/rexttod)
 cargo build --release            # production daemon build
@@ -296,6 +369,55 @@ cargo check                      # fastest feedback
 cargo test --all-targets         # tests
 cargo clean                      # remove build artefacts when needed
 ```
+
+The web UI is a separate Leptos/WASM workspace:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install cargo-leptos
+cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
+```
+
+`scripts/acceptance.sh` runs the isolated smoke test described in
+[`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md): it uses a temporary data directory
+and dedicated ports in dry-run, so it never touches a real installation.
+
+### Packaging
+
+[`scripts/package-linux.sh`](scripts/package-linux.sh) builds the standalone
+archive that the installer and `rexttod --update` consume:
+
+```bash
+cargo build --release --locked
+cargo leptos --manifest-path ui/Cargo.toml build --release --frontend-only
+scripts/package-linux.sh --binary target/release/rexttod --ui ui/target/site
+# -> rextto-linux-x86_64.tar.gz + rextto-linux-x86_64.tar.gz.sha256
+```
+
+The archive contains `rexttod`, the compiled `ui/`, the bundled libtorrent in
+`lib/`, a `run.sh` launcher and a short README. The daemon is linked with an
+`$ORIGIN/lib` rpath and looks for a sibling `ui/` directory, so it runs straight
+from the extracted archive; `install.sh` copies the same payload into
+`/opt/rextto`.
+
+### How the pieces fit
+
+| Component / resource | Role | Functions it powers |
+|---|---|---|
+| Rust + Tokio + Axum | daemon runtime and HTTP server | cycles, REST API, SSE log stream, static UI |
+| Leptos + WASM (`ui/`) | single-page front-end | dashboard, library screens, settings, bilingual UI |
+| SQLite (rusqlite, bundled) | local persistence | series/episodes, movies, archive, comics, config, cycle stats, torrent metadata |
+| libtorrent (`native/libtorrent_bridge.cpp`, `src/libtorrent.rs`) | embedded BitTorrent engine | queue and limits, seeding policy, trackers, files, peers, fastresume, VPN killswitch |
+| reqwest + scraper + quick-xml (`src/rss.rs`, `src/websearch.rs`) | source acquisition | RSS/HTML listings, Torznab indexers, web engines, FlareSolverr fallback |
+| TMDB / TVDB (`src/tmdb.rs`, `src/tvdb.rs`) | metadata providers | posters, seasons, episode dates, discovery |
+| ffprobe / MediaInfo (`src/mediainfo.rs`) | real media inspection | codec/HDR/audio/language data that feeds upgrade comparisons |
+| Trakt / Simkl / Jellyfin / Plex (`src/integrations.rs`) | media-server integrations | watchlist, calendar, scrobble, library refresh |
+| Telegram / SMTP / webhook (`src/notifier.rs`) | notifications | completion/error alerts, HMAC-signed webhooks |
+| FTP / cloud / Telegram (`src/backup.rs`, suppaftp) | scheduled backups | database and configuration snapshots |
+| zip, flate2, sha1/hmac/sha2 | utilities | archive handling, hashing, webhook signing |
+| parser + rules + scoring (`src/parser.rs`, `src/rules.rs`, `src/config.rs`) | domain logic | release parsing, quality scoring, sanity checks, upgrades |
+| installer + packaging + systemd | operations | source/release install, self-update, service, standalone archive |
+| legacy importer (`src/importer.rs`) | migration CLI | one-off import of an older installation's databases |
 
 Development builds stay small and never accumulate forever:
 

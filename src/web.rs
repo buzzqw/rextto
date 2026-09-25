@@ -877,11 +877,21 @@ fn setup_marker(cfg: &Config) -> std::path::PathBuf {
 /// Returns the directory containing the built static UI.
 ///
 /// Development keeps the historical `ui/target/site` default, while packaged
-/// installations point this at their immutable `/opt/rextto/ui` directory.
+/// installations point this at their immutable `/opt/rextto/ui` directory (or
+/// ship a `ui/` directory next to the executable, which is found automatically).
 fn ui_site_dir() -> PathBuf {
-    std::env::var_os("REXTTO_UI_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ui/target/site"))
+    if let Some(dir) = std::env::var_os("REXTTO_UI_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let candidate = parent.join("ui");
+            if candidate.join("pkg").is_dir() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("ui/target/site")
 }
 
 fn ui_pkg_dir() -> PathBuf {

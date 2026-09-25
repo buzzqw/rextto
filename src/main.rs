@@ -1,7 +1,7 @@
 use anyhow::Result;
-use clapless::Args;
 use rextto::{
     archive::Archive,
+    cli::{self, Command},
     comics::ComicsDb,
     config::Config,
     database::Database,
@@ -19,73 +19,32 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod clapless {
-    pub enum Command {
-        Serve {
-            dry_run: bool,
-            config: Option<String>,
-        },
-        Import {
-            source: String,
-            data_dir: String,
-        },
-    }
-    pub struct Args;
-    impl Args {
-        pub fn parse() -> Command {
-            let mut args = std::env::args().skip(1);
-            if args.next().as_deref() == Some("import") {
-                let mut source = std::env::var("REXTTO_IMPORT_SOURCE")
-                    .unwrap_or_else(|_| "/path/to/legacy".to_string());
-                let mut data_dir = "data".to_string();
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "--from-copy" => {
-                            if let Some(v) = args.next() {
-                                source = v
-                            }
-                        }
-                        "--data-dir" => {
-                            if let Some(v) = args.next() {
-                                data_dir = v
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Command::Import { source, data_dir }
-            } else {
-                let mut dry_run = false;
-                let mut config = None;
-                for arg in args {
-                    match arg.as_str() {
-                        "--dry-run" => dry_run = true,
-                        "--config" => {
-                            config = std::env::args()
-                                .skip(1)
-                                .skip_while(|v| v != "--config")
-                                .nth(1)
-                        }
-                        _ => {}
-                    }
-                }
-                Command::Serve { dry_run, config }
-            }
+#[tokio::main]
+async fn main() -> Result<()> {
+    let command = cli::parse(std::env::args().skip(1));
+    match command {
+        Command::Version => {
+            println!("{}", rextto::update::version_string());
+            return Ok(());
         }
+        Command::Help => {
+            print!("{}", cli::usage());
+            return Ok(());
+        }
+        Command::Update(options) => {
+            rextto::update::run(&options).await?;
+            return Ok(());
+        }
+        Command::Import { source, data_dir } => {
+            let report = importer::import_extto(&PathBuf::from(source), &PathBuf::from(data_dir))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        Command::Serve { dry_run, config } => run_daemon(dry_run, config).await,
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let command = Args::parse();
-    if let clapless::Command::Import { source, data_dir } = command {
-        let report = importer::import_extto(&PathBuf::from(source), &PathBuf::from(data_dir))?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    let clapless::Command::Serve { dry_run, config } = command else {
-        unreachable!()
-    };
+async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
     let config_path = config
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("rextto.json"));

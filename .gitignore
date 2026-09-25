@@ -57,3 +57,10 @@ __pycache__/
 /run-safe.sh
 /start-rextto-service.sh
 /scripts/*.sh
+
+# Standalone packaging script (part of the release pipeline).
+!/scripts/package-linux.sh
+
+# Local release artefacts (produced by scripts/package-linux.sh)
+/*.tar.gz
+/*.tar.gz.sha256
