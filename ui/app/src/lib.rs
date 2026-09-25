@@ -1014,7 +1014,7 @@ pub fn App() -> impl IntoView {
                                 if dry {
                                     view! { <span class="mode-badge dry">{move || tr(data, "Dry-run · solo test")}</span> }.into_any()
                                 } else {
-                                    view! { <span class="mode-badge active">{move || tr(data, "Attivo · download abilitati")}</span> }.into_any()
+                                    view! { <span class="mode-badge active">{move || tr(data, "Attivo")}</span> }.into_any()
                                 }
                             }}
                             <span class="system-pill"><span class="pulse"></span>{move || text(&data.get().health, "status", "offline")}</span>
