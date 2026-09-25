@@ -119,6 +119,10 @@ aliases, exclusions, NAS path, subtitles, timeframe).
   completeness), and, if configured, a **“disabled seasons”** badge.
 - Actions: search missing, scan archive, refresh from TMDB, rename preview /
   execute, edit.
+  The rename preview lists the *Old → New* names and has a **Force rename**
+  button: it reprocesses files that already pass the quick check, recomputing
+  the exact target name from the template and the TMDB/TVDB metadata, useful
+  when a file looks correct but does not match the configured template.
 - **Episodes**: per-season accordion; per episode you can search, copy magnet,
   ignore/reactivate, force, re-download or delete; the manual search marks
   results already present in the feed.

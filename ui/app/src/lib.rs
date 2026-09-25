@@ -493,6 +493,77 @@ fn run_delete(data: RwSignal<Data>, path: &str, success: &'static str) {
     });
 }
 
+/// Executes a per-series rename and updates the preview modal state.
+///
+/// `force` also reprocesses files that already pass the quick naming check, so
+/// the exact target name is recomputed from the template and TMDB metadata.
+#[allow(clippy::too_many_arguments)]
+fn run_series_rename(
+    data: RwSignal<Data>,
+    path: String,
+    items: RwSignal<Vec<Value>>,
+    busy: RwSignal<bool>,
+    message: RwSignal<String>,
+    already_signal: RwSignal<usize>,
+    force: bool,
+) {
+    busy.set(true);
+    message.set(tr(
+        data,
+        if force {
+            "Rinomina forzata in corso…"
+        } else {
+            "Rinomina in corso…"
+        },
+    ));
+    spawn_local(async move {
+        match send("POST", &path, Some(json!({ "force": force }))).await {
+            Ok(value) => {
+                let list = array(&value, "items");
+                let already_ok = value
+                    .get("already_ok_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let discarded = value
+                    .get("discarded_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let errors = list.iter().filter(|item| item.get("error").is_some()).count();
+                if errors > 0 {
+                    message.set(tr_format(
+                        data,
+                        "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino, {errors} errori",
+                        &[
+                            ("{renamed}", list.len().saturating_sub(discarded + errors).to_string()),
+                            ("{discarded}", discarded.to_string()),
+                            ("{errors}", errors.to_string()),
+                        ],
+                    ));
+                } else {
+                    message.set(tr_format(
+                        data,
+                        "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino ({already_ok} già corretti)",
+                        &[
+                            ("{renamed}", list.len().saturating_sub(discarded).to_string()),
+                            ("{discarded}", discarded.to_string()),
+                            ("{already_ok}", already_ok.to_string()),
+                        ],
+                    ));
+                }
+                items.set(list);
+                already_signal.set(already_ok);
+                trigger_refresh();
+            }
+            Err(error) => message.set(tr_format(
+                data,
+                "Rinomina non riuscita: {error}",
+                &[("{error}", error)],
+            )),
+        }
+        busy.set(false);
+    });
+}
+
 /// Pulisce i torrent completati e riporta l'esito reale (rimossi/saltati) invece
 /// di un messaggio generico: rende chiaro che vengono tolti solo quelli che
 /// hanno già raggiunto i limiti di seed e che ora sono nello Storico.
@@ -4108,45 +4179,35 @@ fn SeriesPanel(data: RwSignal<Data>, selected: RwSignal<Option<String>>) -> impl
                                     <button type="button" class="btn primary" disabled=move || rename_busy.get() || (rename_items.get().is_empty() && rename_already_ok.get() == 0) on:click=move |_| {
                                         if let Some(name) = selected.get() {
                                             let path = format!("/api/series/{}/rename-execute", urlencoding::encode(&name));
-                                            let items = rename_items;
-                                            let busy = rename_busy;
-                                            let msg = rename_message;
-                                            let already_signal = rename_already_ok;
                                             let already = rename_already_ok.get();
                                             let pending = rename_items.get().len();
                                             // Chiede se rinominare solo i file da
                                             // sistemare o anche quelli già corretti.
-                                             let force = if already > 0 {
-                                                 web_sys::window()
-                                                     .and_then(|window| window.confirm_with_message(&tr_format(data, "{pending} file da rinominare, {already} già corretti. Rinominare anche quelli già corretti? OK = tutti, Annulla = solo i {pending}.", &[("{pending}", pending.to_string()), ("{already}", already.to_string())])).ok())
+                                            let force = if already > 0 {
+                                                web_sys::window()
+                                                    .and_then(|window| window.confirm_with_message(&tr_format(data, "{pending} file da rinominare, {already} già corretti. Rinominare anche quelli già corretti? OK = tutti, Annulla = solo i {pending}.", &[("{pending}", pending.to_string()), ("{already}", already.to_string())])).ok())
                                                     .unwrap_or(false)
                                             } else {
                                                 false
                                             };
-                                            busy.set(true);
-                                                     msg.set(tr(data, "Rinomina in corso…"));
-                                            spawn_local(async move {
-                                                match send("POST", &path, Some(json!({"force": force}))).await {
-                                                    Ok(value) => {
-                                                        let list = array(&value, "items");
-                                                         let already_ok = value.get("already_ok_count").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                                         let discarded = value.get("discarded_count").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                                         let errors = list.iter().filter(|item| item.get("error").is_some()).count();
-                                                         if errors > 0 {
-                                                              msg.set(tr_format(data, "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino, {errors} errori", &[("{renamed}", list.len().saturating_sub(discarded + errors).to_string()), ("{discarded}", discarded.to_string()), ("{errors}", errors.to_string())]));
-                                                         } else {
-                                                              msg.set(tr_format(data, "Rinomina eseguita: {renamed} rinominati, {discarded} duplicati nel cestino ({already_ok} già corretti)", &[("{renamed}", list.len().saturating_sub(discarded).to_string()), ("{discarded}", discarded.to_string()), ("{already_ok}", already_ok.to_string())]));
-                                                        }
-                                                        items.set(list);
-                                                        already_signal.set(already_ok);
-                                                        trigger_refresh();
-                                                    }
-                                                     Err(error) => msg.set(tr_format(data, "Rinomina non riuscita: {error}", &[("{error}", error)])),
-                                                }
-                                                busy.set(false);
-                                            });
+                                            run_series_rename(data, path, rename_items, rename_busy, rename_message, rename_already_ok, force);
                                         }
                                     }>{ctx_tr("Esegui rinomina")}</button>
+                                    <button type="button" class="btn" disabled=move || rename_busy.get() || (rename_items.get().is_empty() && rename_already_ok.get() == 0) title=ctx_tr("Rielabora il nome esatto di tutti i file, anche di quelli già corretti") on:click=move |_| {
+                                        if let Some(name) = selected.get() {
+                                            let already = rename_already_ok.get();
+                                            let pending = rename_items.get().len();
+                                            let total = already + pending;
+                                            let confirmed = web_sys::window()
+                                                .and_then(|window| window.confirm_with_message(&tr_format(data, "Forzare la rinomina di {total} file? Anche i {already} già corretti verranno rielaborati. L'operazione è irreversibile.", &[("{total}", total.to_string()), ("{already}", already.to_string())])).ok())
+                                                .unwrap_or(false);
+                                            if !confirmed {
+                                                return;
+                                            }
+                                            let path = format!("/api/series/{}/rename-execute", urlencoding::encode(&name));
+                                            run_series_rename(data, path, rename_items, rename_busy, rename_message, rename_already_ok, true);
+                                        }
+                                    }>{ctx_tr("Forza rinomina")}</button>
                                 </div>
                             </div>
                         </div>
@@ -5555,6 +5616,61 @@ fn archive_folder_label(path: &str) -> String {
 /* Comics                                                              */
 /* ------------------------------------------------------------------ */
 
+fn download_comic_post(
+    data: RwSignal<Data>,
+    post_url: String,
+    title: String,
+    save_path: String,
+) {
+    spawn_local(async move {
+        let links = match send(
+            "POST",
+            "/api/comics/links",
+            Some(json!({"url": post_url.clone()})),
+        )
+        .await
+        {
+            Ok(value) => value
+                .get("links")
+                .cloned()
+                .unwrap_or_else(|| value.clone()),
+            Err(error) => {
+                flash(data, Err(error), "Download avviato");
+                return;
+            }
+        };
+        let url = links
+            .get("download_now")
+            .and_then(Value::as_array)
+            .and_then(|items| items.iter().find_map(Value::as_str))
+            .or_else(|| {
+                links
+                    .get("direct")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.iter().find_map(Value::as_str))
+            })
+            .map(str::to_owned);
+        let Some(url) = url else {
+            flash_text(data, "err", "Download Now non trovato nella pagina GetComics.".into());
+            return;
+        };
+        let result = send(
+            "POST",
+            "/api/comics/download",
+            Some(json!({
+                "url": url,
+                "method": "direct",
+                "title": title,
+                "post_url": post_url,
+                "save_path": save_path,
+            })),
+        )
+        .await;
+        flash(data, result, "Download avviato");
+        trigger_refresh();
+    });
+}
+
 #[component]
 fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
     let save_path = RwSignal::new(String::new());
@@ -5594,15 +5710,22 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                          <tbody>{move || explore_items.get().iter().cloned().map(|item| {
                                 let item_title = text_tr(data, &item, "title", "Fumetto");
                              let item_url = text(&item, "url", "");
-                             let item_date = text(&item, "date", "");
-                             let item_for_select = item.clone();
-                             view! { <tr>
-                                 <td class="truncate"><a href=item_url target="_blank" rel="noopener">{item_title.clone()}</a></td>
-                                 <td class="muted">{if item_date.is_empty() { "-".to_string() } else { item_date }}</td>
-                                  <td><button class="btn sm primary" on:click=move |_| {
-                                      selected_comic.set(item_for_select.clone());
-                                  } >{ctx_tr("Seleziona")}</button></td>
-                              </tr> }
+                              let item_date = text(&item, "date", "");
+                              let item_for_select = item.clone();
+                              let download_url = item_url.clone();
+                              let download_title = item_title.clone();
+                              view! { <tr>
+                                  <td class="truncate"><a href=item_url target="_blank" rel="noopener">{item_title.clone()}</a></td>
+                                  <td class="muted">{if item_date.is_empty() { "-".to_string() } else { item_date }}</td>
+                                   <td><div class="toolbar">
+                                       <button class="btn sm" on:click=move |_| {
+                                           download_comic_post(data, download_url.clone(), download_title.clone(), save_path.get());
+                                       }>{ctx_tr("Scarica")}</button>
+                                       <button class="btn sm primary" on:click=move |_| {
+                                           selected_comic.set(item_for_select.clone());
+                                       } >{ctx_tr("Seleziona")}</button>
+                                   </div></td>
+                               </tr> }
                          }).collect_view()}</tbody>
                     </table>
                 </div>
@@ -5760,11 +5883,23 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                     <div class="stack">
                         {move || links.get().iter().cloned().map(|value| {
                             let source = value.get("links").cloned().unwrap_or_else(|| value.clone());
-                            let groups = [("direct", "HTTP"), ("mega", "Mega"), ("torrents", "Torrent"), ("magnets", "Magnet")];
+                            let download_now_urls = source
+                                .get("download_now")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            let groups = [("download_now", "Download Now"), ("direct", "HTTP"), ("mega", "Mega"), ("torrents", "Torrent"), ("magnets", "Magnet")];
                             view! {
                                 <div class="stack">
                                     {groups.into_iter().map(|(key, label)| {
                                         let urls = source.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+                                        let urls = if key == "direct" {
+                                            urls.into_iter()
+                                                .filter(|url| !download_now_urls.iter().any(|download| download == url))
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            urls
+                                        };
                                         view! {
                                             <div>
                                                 <strong>{label}</strong>
@@ -5826,7 +5961,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                 let enabled = !url.is_empty();
                                 let title = format!("Weekly {date}");
                                  let sent = !text(&item, "sent_at", "").is_empty();
-                                 let status = if sent { tr(data, "inviato") } else { tr(data, "trovato") };
+                                  let status = if sent { tr(data, "inviato") } else if enabled { tr(data, "trovato") } else { tr(data, "in attesa del link") };
                                 view! { <tr>
                                      <td class="truncate">{title.clone()}</td><td><span class="badge" class:ok=sent>{status}</span></td>
                                     <td><button class="btn sm" disabled=!enabled title=ctx_tr("Scarica di nuovo questo weekly pack") on:click=move |_| run_post(data, "/api/comics/download", Some(json!({"url":url.clone(),"method":method,"title":title.clone(),"post_url":"","save_path":""})), "Weekly pack forzato")>{ctx_tr("Forza")}</button></td>

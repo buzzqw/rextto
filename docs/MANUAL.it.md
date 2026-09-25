@@ -120,6 +120,10 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   completezza) e, se configurate, un badge **“stagioni disattivate”**.
 - Azioni: cerca mancanti, scansiona archivio, aggiorna da TMDB, anteprima/esegui
   rinomina, modifica.
+  L'anteprima di rinomina elenca i nomi *Vecchio → Nuovo* e ha un pulsante
+  **Forza rinomina**: rielabora anche i file che superano il controllo rapido,
+  ricalcolando il nome esatto dal template e dai metadati TMDB/TVDB; è utile
+  quando un file sembra corretto ma non rispetta il template configurato.
 - **Episodi**: accordion per stagione; per ogni episodio puoi cercare, copiare il
   magnet, ignorare/riattivare, forzare, riscaricare o eliminare; la ricerca
   manuale segnala i risultati già presenti nel feed.
