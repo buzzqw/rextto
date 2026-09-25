@@ -155,6 +155,19 @@ la barra “Salva tutte”.
   backoff**, con livello, scadenza, ultimo errore e reset per singola sorgente;
   e il **backfill MediaInfo** automatico (file per volta e intervallo
   configurabili), oltre al pulsante in Manutenzione per una scansione immediata.
+  L'**housekeeping non è la pulizia dell'Archivio**: mantiene ordinato il
+  database, ma non elimina i file della libreria, i download completati o le
+  release elencate nell'Archivio. Il campo *riepiloghi cicli acquisizione
+  conservati* riguarda solo le statistiche dei cicli: con valore `200`, il
+  201° ciclo elimina il riepilogo più vecchio, non la release scaricata.
+  *Visti nel feed* elimina solo le righe storiche dei feed oltre il numero di
+  giorni indicato (`0` = nessuna pulizia); *storico download* elimina solo le
+  righe dei torrent già rimossi (`0` = conserva). A ogni esecuzione vengono
+  inoltre eliminati automaticamente torrent in errore oltre 7 giorni, log dei
+  gap oltre 30 giorni, backup di upgrade oltre 30 giorni e backoff delle
+  sorgenti scaduti. Alla fine i database vengono compattati con `VACUUM`.
+  La retention dell'Archivio è separata e si trova in **Configurazione →
+  Avanzate**.
 - **Percorsi** — root libreria, cestino, cartelle download/temp/RAM disk, regole
   per tag. Il percorso RAM disk selezionato resta configurato, ma la directory
   creata sotto `/dev/shm` va ricreata dopo un riavvio.

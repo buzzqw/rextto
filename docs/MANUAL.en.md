@@ -152,6 +152,17 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
   with level, deadline, last error and per-source reset, and the automatic
   **MediaInfo backfill** (configurable files-per-run and interval), plus a
   Maintenance button for an immediate scan.
+  **Housekeeping is not Archive cleanup**: it keeps the database tidy, but it
+  does not delete library files, completed downloads, or releases listed in
+  the Archive. *Acquisition cycle summaries kept* concerns only cycle
+  statistics: with `200`, cycle 201 removes the oldest summary, not the
+  downloaded release. *Feed-seen entries* removes only historical feed rows
+  older than the selected number of days (`0` = no cleanup); *download history*
+  removes only rows for torrents already removed (`0` = keep). Each run also
+  automatically removes torrents in error older than 7 days, gap logs older
+  than 30 days, upgrade backups older than 30 days, and expired source
+  backoffs. The databases are compacted with `VACUUM` afterwards. Archive
+  retention is separate and is configured under **Configuration → Advanced**.
 - **Paths** — library root, trash, download/temp/RAM-disk dirs, per-tag rules.
   A selected RAM-disk path remains configured, but a directory created under
   `/dev/shm` must be recreated after a reboot.
