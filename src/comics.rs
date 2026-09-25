@@ -186,7 +186,8 @@ impl GetComicsClient {
         target_dir: &Path,
         title: &str,
     ) -> Result<PathBuf> {
-        download_http(&self.client, url, target_dir, title).await
+        let url = self.resolve_direct_url(url).await?;
+        download_http(&self.client, &url, target_dir, title).await
     }
     pub async fn download_torrent(&self, url: &str, target_dir: &Path) -> Result<PathBuf> {
         download_torrent_file(&self.client, url, target_dir).await
@@ -224,6 +225,37 @@ impl GetComicsClient {
                 })
             });
         found.ok_or_else(|| anyhow::anyhow!("Mega URL not found in GetComics redirect"))
+    }
+
+    /// GetComics currently exposes PixelDrain files through `/dls/...`, which
+    /// redirects to a PixelDrain HTML page. The HTML page is not downloadable
+    /// by `download_http`; convert the public file page to PixelDrain's binary
+    /// API endpoint first.
+    async fn resolve_direct_url(&self, url: &str) -> Result<String> {
+        let parsed = url::Url::parse(url)?;
+        let is_getcomics_redirect = parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("getcomics.org")
+                || host.eq_ignore_ascii_case("www.getcomics.org")
+        }) && parsed.path().starts_with("/dls/");
+        if !is_getcomics_redirect {
+            return Ok(url.to_owned());
+        }
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        let redirected = response.url();
+        if redirected.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("pixeldrain.com")
+                || host.eq_ignore_ascii_case("www.pixeldrain.com")
+        }) {
+            let mut segments = redirected.path_segments().into_iter().flatten();
+            if segments.next() == Some("u") {
+                if let Some(file_id) = segments.next().filter(|value| !value.is_empty()) {
+                    return Ok(format!(
+                        "https://pixeldrain.com/api/file/{file_id}?download=1"
+                    ));
+                }
+            }
+        }
+        Ok(redirected.to_string())
     }
 
     pub async fn weekly_links(&self, date: &str) -> Result<(String, ComicLinks)> {
@@ -314,6 +346,27 @@ fn clean_search_title(title: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Extracts a comic issue number from titles such as `Poison Ivy #41 (2026)`.
+/// A monitored issue must not be replaced by a newer issue or a collected
+/// edition merely because the tag URL is stale and the name search is broad.
+fn issue_number(title: &str) -> Option<String> {
+    let after_marker = title.split('#').nth(1)?;
+    let digits = after_marker
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then_some(digits)
+}
+
+fn matches_monitored_issue(monitored_title: &str, post_title: &str) -> bool {
+    match (issue_number(monitored_title), issue_number(post_title)) {
+        (Some(monitored), Some(post)) => monitored == post,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
 }
 
 fn parse_articles(html: &str, from_date: &str, page_url: &str) -> Vec<ComicPost> {
@@ -423,7 +476,7 @@ pub async fn run_cycle(
         };
         match (tag_error.as_deref(), search_posts.is_empty()) {
             (Some(error), false) => {
-                tracing::info!(comic=%comic.title, %error, "comics: tag unavailable, using name search")
+                tracing::debug!(comic=%comic.title, %error, "comics: tag unavailable, using name search")
             }
             (Some(error), true) => {
                 tracing::warn!(comic=%comic.title, %error, "comics tag fetch failed and name search returned nothing")
@@ -432,6 +485,14 @@ pub async fn run_cycle(
         }
         let mut merged: BTreeMap<String, ComicPost> = BTreeMap::new();
         for post in posts.drain(..).chain(search_posts) {
+            if !matches_monitored_issue(&comic.title, &post.title) {
+                tracing::debug!(
+                    comic = %comic.title,
+                    post = %post.title,
+                    "comics: ignoring post for a different issue or collection"
+                );
+                continue;
+            }
             if !comic.from_date.trim().is_empty()
                 && !post.date.is_empty()
                 && post.date.as_str() < comic.from_date.as_str()
@@ -723,6 +784,15 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
         };
         let href = joined.to_string();
         let text = anchor.text().collect::<String>().to_ascii_lowercase();
+        let normalized_text = text.replace(['-', '_'], " ");
+        let path = joined.path().to_ascii_lowercase();
+        // The site's help link contains "download" but is not a file. The
+        // hyphen in "how-to" previously bypassed the text check and became
+        // the first direct link, causing every comic download to fetch the
+        // help page instead of the file.
+        if path.contains("/how-to-download") || normalized_text.contains("how to") {
+            continue;
+        }
         if href.starts_with("magnet:") {
             if !links.magnets.contains(&href) {
                 links.magnets.push(href);
@@ -738,8 +808,15 @@ fn parse_links(html: &str, page_url: &str) -> Result<ComicLinks> {
             if !links.torrents.contains(&href) {
                 links.torrents.push(href);
             }
-        } else if text.contains("download")
-            && !text.contains("how to")
+        } else if ((path.starts_with("/dls/")
+            && joined.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("getcomics.org")
+                    || host.eq_ignore_ascii_case("www.getcomics.org")
+            }))
+            || [".cbr", ".cbz", ".rar", ".zip"]
+                .iter()
+                .any(|extension| path.ends_with(extension))
+            || text.contains("download"))
             && !links.direct.contains(&href)
         {
             links.direct.push(href);
@@ -1412,6 +1489,24 @@ mod tests {
         assert_eq!(clean_search_title(""), "");
     }
 
+    #[test]
+    fn monitored_issue_does_not_accept_newer_issue_or_collection() {
+        assert_eq!(issue_number("Poison Ivy #41 (2026)"), Some("41".into()));
+        assert!(matches_monitored_issue(
+            "Poison Ivy #41 (2026)",
+            "Poison Ivy #41 (2026)"
+        ));
+        assert!(!matches_monitored_issue(
+            "Poison Ivy #41 (2026)",
+            "Poison Ivy #47 (2026)"
+        ));
+        assert!(!matches_monitored_issue(
+            "Poison Ivy #41 (2026)",
+            "Poison Ivy Vol. 7 – Amuse-Bouche (TPB) (2026)"
+        ));
+        assert!(matches_monitored_issue("Batman (2026)", "Batman Vol. 1 (2026)"));
+    }
+
     #[tokio::test]
     #[ignore]
     async fn debug_weekly_links_network() {
@@ -1437,6 +1532,20 @@ mod tests {
         let links = parse_links(html, "https://getcomics.org/post/").expect("parse");
         assert_eq!(links.magnets.len(), 1);
         assert_eq!(links.torrents.len(), 1);
+    }
+
+    #[test]
+    fn parse_links_skips_help_page_and_keeps_getcomics_file_redirect() {
+        let html = r#"
+            <a href="https://getcomics.info/how-to-download/">how-to download page</a>
+            <a href="https://getcomics.org/dls/pixeldrain-token">PIXELDRAIN</a>
+            <a href="https://datanodes.to/file/example.cbr">DATANODES</a>
+        "#;
+        let links = parse_links(html, "https://getcomics.org/post/example").expect("parse");
+        assert_eq!(links.direct, vec![
+            "https://getcomics.org/dls/pixeldrain-token",
+            "https://datanodes.to/file/example.cbr",
+        ]);
     }
 
     /// Riproduce lo stream troncato dietro Cloudflare ("error decoding response
