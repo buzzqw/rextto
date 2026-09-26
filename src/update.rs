@@ -304,25 +304,22 @@ fn validate_release(root: &Path) -> Result<()> {
 }
 
 /// Install the staged payload. Everything is copied next to the final
-/// destination first and then swapped in with renames.
+/// destination first; the live installation is only touched once every piece is
+/// staged, and any failure during the swap restores the previous binary and
+/// directories.
 fn install(root: &Path, install_dir: &Path) -> Result<()> {
     fs::create_dir_all(install_dir)
         .with_context(|| format!("cannot create {}", install_dir.display()))?;
     let suffix = format!(".{}.new", std::process::id());
 
-    // Executable: copy, chmod and atomically replace.
+    // Stage the executable and the directories before touching what is live.
+    let binary = install_dir.join(crate::constants::APP_NAME);
     let new_binary = install_dir.join(format!("{}{}", crate::constants::APP_NAME, suffix));
     fs::copy(root.join(crate::constants::APP_NAME), &new_binary)
         .context("cannot stage the new executable")?;
     set_executable(&new_binary)?;
-    let binary = install_dir.join(crate::constants::APP_NAME);
-    if binary.is_file() {
-        let backup = install_dir.join(format!("{}.bak", crate::constants::APP_NAME));
-        fs::copy(&binary, &backup).context("cannot back up the current executable")?;
-    }
-    fs::rename(&new_binary, &binary).context("cannot replace the executable")?;
 
-    // Directories (web UI and optional bundled libraries): stage, swap, roll back.
+    let mut staged_dirs: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     for directory in ["ui", "lib"] {
         let source = root.join(directory);
         if !source.is_dir() {
@@ -332,22 +329,64 @@ fn install(root: &Path, install_dir: &Path) -> Result<()> {
         remove_path(&staged);
         copy_dir(&source, &staged)
             .with_context(|| format!("cannot stage the {directory} directory"))?;
-        let destination = install_dir.join(directory);
         let previous = install_dir.join(format!(".{directory}.old{}", std::process::id()));
         remove_path(&previous);
+        staged_dirs.push((directory.to_string(), staged, previous));
+    }
+
+    // Snapshot the current executable so the whole swap can be undone.
+    let backup = install_dir.join(format!("{}.bak", crate::constants::APP_NAME));
+    let had_binary = binary.is_file();
+    if had_binary {
+        fs::copy(&binary, &backup).context("cannot back up the current executable")?;
+    }
+    let rollback = |committed: &[(PathBuf, PathBuf)]| {
+        for (destination, previous) in committed.iter().rev() {
+            if previous.exists() {
+                remove_path(destination);
+                let _ = fs::rename(previous, destination);
+            }
+        }
+        if had_binary {
+            let _ = fs::copy(&backup, &binary);
+        }
+        remove_path(&backup);
+    };
+
+    if let Err(error) = fs::rename(&new_binary, &binary) {
+        remove_path(&new_binary);
+        rollback(&[]);
+        return Err(error).context("cannot replace the executable");
+    }
+
+    let mut committed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (directory, staged, previous) in staged_dirs {
+        let destination = install_dir.join(&directory);
         if destination.exists() {
-            fs::rename(&destination, &previous)
-                .with_context(|| format!("cannot move the current {directory} aside"))?;
+            if let Err(error) = fs::rename(&destination, &previous) {
+                remove_path(&staged);
+                rollback(&committed);
+                return Err(error)
+                    .with_context(|| format!("cannot move the current {directory} aside"));
+            }
         }
         if let Err(error) = fs::rename(&staged, &destination) {
             if previous.exists() {
                 let _ = fs::rename(&previous, &destination);
             }
             remove_path(&staged);
-            return Err(error).with_context(|| format!("cannot install the {directory} directory"));
+            rollback(&committed);
+            return Err(error)
+                .with_context(|| format!("cannot install the {directory} directory"));
         }
+        committed.push((destination, previous));
+    }
+
+    // Success: the previous versions are no longer needed.
+    for (_, previous) in committed {
         remove_path(&previous);
     }
+    remove_path(&backup);
 
     // Keep the launcher and the release notes alongside the payload when shipped.
     for file in ["run.sh", "README.md"] {

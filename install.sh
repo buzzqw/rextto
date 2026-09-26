@@ -24,6 +24,11 @@ readonly SERVICE_NAME="rextto.service"
 TMP_DIR=""
 SERVICE_USER=""
 SERVICE_GROUP=""
+PAYLOAD_BINARY=""
+PAYLOAD_UI=""
+PAYLOAD_LIB=""
+PAYLOAD_ROOT=""
+PAYLOAD_VERSION=""
 
 if [[ ${EUID} -eq 0 ]]; then
     SUDO=()
@@ -94,7 +99,7 @@ install_system_packages() {
                 base-devel binutils mold cmake openssl boost mediainfo
             ;;
         *)
-            die "unsupported distribution '$id'. Supported: Debian, Ubuntu, Fedora, openSUSE and Arch Linux."
+            die "unsupported distribution '$id'. Supported: Debian/Ubuntu, Fedora/RHEL/Rocky/Alma, openSUSE and Arch Linux."
             ;;
     esac
 }
@@ -167,8 +172,8 @@ select_service_account() {
 
 download_release() {
     local arch="$1" base archive checksum
-    archive="$TMP_DIR/rextto.tar.gz"
-    checksum="$TMP_DIR/rextto.tar.gz.sha256"
+    archive="$TMP_DIR/rextto-linux-$arch.tar.gz"
+    checksum="$archive.sha256"
     if [[ "$RELEASE" == latest || "$RELEASE" == stable ]]; then
         base="https://github.com/$REPO/releases/latest/download"
     else
@@ -180,7 +185,15 @@ download_release() {
         return 1
     fi
     if curl -fsSL --retry 3 "$base/rextto-linux-$arch.tar.gz.sha256" -o "$checksum"; then
-        (cd "$TMP_DIR" && sha256sum -c "$(basename "$checksum")") || die "release checksum verification failed"
+        # Compare the hashes directly: the published .sha256 may name the file
+        # differently (e.g. an absolute path from the packaging step), and
+        # `sha256sum -c` would then fail only because the filename is missing.
+        local expected actual
+        expected="$(awk '{print $1; exit}' "$checksum" | tr 'A-F' 'a-f')"
+        actual="$(sha256sum "$archive" | awk '{print $1}')"
+        [[ -n "$expected" && "$expected" == "$actual" ]] \
+            || die "release checksum verification failed"
+        log "release checksum verified"
     else
         log "release has no checksum asset; continuing with HTTPS transport verification"
     fi
@@ -199,6 +212,7 @@ download_release() {
     PAYLOAD_BINARY="$binary"
     PAYLOAD_UI="$site"
     PAYLOAD_LIB="$lib_dir"
+    PAYLOAD_ROOT="$(dirname "$binary")"
     PAYLOAD_VERSION="$RELEASE"
     return 0
 }
@@ -235,6 +249,7 @@ build_from_source() {
     PAYLOAD_BINARY="$source_dir/target/release/rexttod"
     PAYLOAD_UI="$source_dir/ui/target/site"
     PAYLOAD_LIB=""
+    PAYLOAD_ROOT="$source_dir"
     PAYLOAD_VERSION="source-$SOURCE_REF"
 }
 
@@ -249,6 +264,26 @@ install_payload() {
     if [[ -n "${PAYLOAD_LIB:-}" && -d "$PAYLOAD_LIB" ]]; then
         root_cmd install -d -m 0755 "$INSTALL_DIR/lib"
         root_cmd cp -a "$PAYLOAD_LIB/." "$INSTALL_DIR/lib/"
+    fi
+    # Launcher and release notes: prefer the ones shipped in the payload, then
+    # fall back to a generated launcher so `run.sh` always exists (the README
+    # documents it and manual runs use it).
+    if [[ -n "${PAYLOAD_ROOT:-}" && -f "$PAYLOAD_ROOT/run.sh" ]]; then
+        root_cmd install -m 0755 "$PAYLOAD_ROOT/run.sh" "$INSTALL_DIR/run.sh"
+    else
+        root_cmd tee "$INSTALL_DIR/run.sh" >/dev/null <<'RUN'
+#!/usr/bin/env bash
+# Launcher for the installed Rextto payload.
+set -Eeuo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export REXTTO_UI_DIR="${REXTTO_UI_DIR:-$here/ui}"
+exec "$here/rexttod" "$@"
+RUN
+        root_cmd chmod 0755 "$INSTALL_DIR/run.sh"
+    fi
+    if [[ -n "${PAYLOAD_ROOT:-}" && -f "$PAYLOAD_ROOT/README.md" ]]; then
+        root_cmd install -m 0644 "$PAYLOAD_ROOT/README.md" "$INSTALL_DIR/README.md"
     fi
     printf '%s\n' "$PAYLOAD_VERSION" | root_cmd tee "$INSTALL_DIR/VERSION" >/dev/null
 }
@@ -303,8 +338,10 @@ main() {
     arch="$(detect_arch)"
     install_system_packages
     select_service_account
-    build_libtorrent
+    # A prebuilt release already bundles libtorrent in `lib/`, so only build it
+    # from source when we have to compile the daemon ourselves.
     if ! download_release "$arch"; then
+        build_libtorrent
         build_from_source
     fi
     # Stop only after the new payload is ready. This keeps an update available
