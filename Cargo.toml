@@ -44,7 +44,12 @@ suppaftp = "6"
 cc = "1"
 
 [dev-dependencies]
+criterion = "0.5"
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "performance"
+harness = false
 
 # Build di sviluppo più leggere: target/debug non deve gonfiarsi all'infinito.
 # Teniamo solo le tabelle di riga per backtrace leggibili e nessuna info di

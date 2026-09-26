@@ -1440,6 +1440,15 @@ impl Database {
             |row| row.get(0),
         )?)
     }
+
+    /// Loads the immutable blocklist snapshot used during one orchestration
+    /// cycle. Callers can then perform candidate lookups without one SQLite
+    /// query per release.
+    pub fn blocklisted_hashes(&self) -> Result<std::collections::HashSet<String>> {
+        let mut statement = self.conn.prepare("SELECT lower(magnet_hash) FROM blocklist")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
+    }
     pub fn blocklist(&self, release: &Release, reason: &str) -> Result<()> {
         let hash = magnet_hash(&release.magnet).context("invalid magnet hash")?;
         // Per un film `series` è None: l'identità utile è nome/anno del film.
@@ -1783,20 +1792,142 @@ impl Database {
                 .and_modify(|value| *value = (*value).max(count))
                 .or_insert(count);
         }
+        // Materialize the three sets once. The previous implementation ran a
+        // complete-pack query, an episode query, and one ignored-episode query
+        // for every season/episode in the gap range.
+        let mut complete_packs = std::collections::HashSet::new();
+        let mut packs = self.conn.prepare(
+            "SELECT s.name,e.season FROM episodes e JOIN series s ON s.id=e.series_id
+             WHERE e.episode=0 AND (e.downloaded_at IS NOT NULL OR EXISTS(
+                 SELECT 1 FROM torrent_meta t WHERE t.hash=e.magnet_hash
+                 AND t.status NOT IN ('error','removed')))",
+        )?;
+        for row in packs.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            complete_packs.insert(row?);
+        }
+        let mut present = std::collections::HashMap::<(String, i64), std::collections::HashSet<i64>>::new();
+        let mut episodes = self.conn.prepare(
+            "SELECT s.name,e.season,e.episode FROM episodes e JOIN series s ON s.id=e.series_id",
+        )?;
+        for row in episodes.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (name, season, episode) = row?;
+            present.entry((name, season)).or_default().insert(episode);
+        }
+        let mut ignored = std::collections::HashSet::new();
+        let mut ignored_rows = self
+            .conn
+            .prepare("SELECT series_name,season,episode FROM ignored_episodes")?;
+        for row in ignored_rows.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            ignored.insert(row?);
+        }
         let mut gaps = Vec::new();
         for ((name, season_number), max_episode) in season_targets {
-            let complete_pack = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM episodes e JOIN series s ON s.id=e.series_id WHERE s.name=?1 AND e.season=?2 AND e.episode=0 AND (e.downloaded_at IS NOT NULL OR EXISTS(SELECT 1 FROM torrent_meta t WHERE t.hash=e.magnet_hash AND t.status NOT IN ('error','removed'))))", params![name, season_number], |row| row.get::<_, bool>(0))?;
-            if complete_pack {
+            if complete_packs.contains(&(name.clone(), season_number)) {
                 continue;
             }
-            let mut present = self.conn.prepare("SELECT episode FROM episodes e JOIN series s ON s.id=e.series_id WHERE s.name=?1 AND e.season=?2")?;
             let episodes = present
-                .query_map(params![name, season_number], |row| row.get::<_, i64>(0))?
-                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+                .get(&(name.clone(), season_number))
+                .cloned()
+                .unwrap_or_default();
             for episode in 1..=max_episode {
-                let ignored: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM ignored_episodes WHERE series_name=?1 AND season=?2 AND episode=?3)", params![name, season_number, episode], |row| row.get(0))?;
-                if !ignored && !episodes.contains(&episode) {
+                if !ignored.contains(&(name.clone(), season_number, episode))
+                    && !episodes.contains(&episode)
+                {
                     gaps.push((name.clone(), season_number, episode));
+                }
+            }
+        }
+        Ok(gaps)
+    }
+
+    /// Same gap calculation restricted to one series. Detail views should not
+    /// rebuild the gap index for the entire library just to filter it back to
+    /// the requested title.
+    pub fn archive_gaps_for_series(&self, series_name: &str) -> Result<Vec<(i64, i64)>> {
+        let mut targets = std::collections::BTreeMap::<i64, i64>::new();
+        let mut seasons = self.conn.prepare(
+            "SELECT season,MAX(episode) FROM episodes
+             WHERE series_id=(SELECT id FROM series WHERE name=?1)
+             GROUP BY season",
+        )?;
+        for row in seasons.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (season, count) = row?;
+            targets
+                .entry(season)
+                .and_modify(|value| *value = (*value).max(count))
+                .or_insert(count);
+        }
+        let mut metadata = self.conn.prepare(
+            "SELECT season,episode_count FROM series_metadata WHERE series_name=?1",
+        )?;
+        for row in metadata.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (season, count) = row?;
+            targets
+                .entry(season)
+                .and_modify(|value| *value = (*value).max(count))
+                .or_insert(count);
+        }
+        // A complete pack is season-specific, so retain the seasons in a set
+        // rather than treating the whole series as complete.
+        let mut complete_seasons = std::collections::HashSet::new();
+        let mut pack_seasons = self.conn.prepare(
+            "SELECT e.season FROM episodes e
+             WHERE e.series_id=(SELECT id FROM series WHERE name=?1)
+               AND e.episode=0
+               AND (e.downloaded_at IS NOT NULL OR EXISTS(
+                   SELECT 1 FROM torrent_meta t WHERE t.hash=e.magnet_hash
+                   AND t.status NOT IN ('error','removed')))",
+        )?;
+        for row in pack_seasons.query_map([series_name], |row| row.get::<_, i64>(0))? {
+            complete_seasons.insert(row?);
+        }
+        let mut present = std::collections::HashSet::new();
+        let mut episodes = self.conn.prepare(
+            "SELECT season,episode FROM episodes
+             WHERE series_id=(SELECT id FROM series WHERE name=?1)",
+        )?;
+        for row in episodes.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            present.insert(row?);
+        }
+        let mut ignored = std::collections::HashSet::new();
+        let mut ignored_rows = self.conn.prepare(
+            "SELECT season,episode FROM ignored_episodes WHERE series_name=?1",
+        )?;
+        for row in ignored_rows.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            ignored.insert(row?);
+        }
+        let mut gaps = Vec::new();
+        for (season, count) in targets {
+            if complete_seasons.contains(&season) {
+                continue;
+            }
+            for episode in 1..=count {
+                if !ignored.contains(&(season, episode))
+                    && !present.contains(&(season, episode))
+                {
+                    gaps.push((season, episode));
                 }
             }
         }
@@ -1863,18 +1994,24 @@ impl Database {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })?
             .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        let mut ignored = std::collections::HashSet::new();
+        let mut ignored_rows = self.conn.prepare(
+            "SELECT season,episode FROM ignored_episodes WHERE series_name=?1",
+        )?;
+        for row in ignored_rows.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            ignored.insert(row?);
+        }
         let mut missing = Vec::new();
         for (season, count) in targets {
             if ignored_seasons.contains(&season) {
                 continue;
             }
             for episode in 1..=count {
-                let ignored: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM ignored_episodes WHERE series_name=?1 AND season=?2 AND episode=?3)",
-                    params![series_name, season, episode],
-                    |row| row.get(0),
-                )?;
-                if !ignored && !archived.contains(&(season, episode)) {
+                if !ignored.contains(&(season, episode))
+                    && !archived.contains(&(season, episode))
+                {
                     missing.push((season, episode));
                 }
             }
@@ -1890,7 +2027,7 @@ impl Database {
         series_name: &str,
         extra_ignored: &[i64],
     ) -> Result<Vec<EpisodeView>> {
-        let mut ignored_seasons: Vec<i64> = self
+        let mut ignored_seasons: std::collections::HashSet<i64> = self
             .conn
             .query_row(
                 "SELECT COALESCE(ignored_seasons,'[]') FROM series WHERE name=?1",
@@ -1899,11 +2036,11 @@ impl Database {
             )
             .ok()
             .and_then(|value| serde_json::from_str::<Vec<i64>>(&value).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         for season in extra_ignored {
-            if !ignored_seasons.contains(season) {
-                ignored_seasons.push(*season);
-            }
+            ignored_seasons.insert(*season);
         }
         let air_dates = {
             let mut statement = self.conn.prepare(
@@ -1916,7 +2053,28 @@ impl Database {
                 .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
             rows
         };
-        let mut statement = self.conn.prepare("SELECT e.id,s.name,e.season,e.episode,COALESCE(e.title,''),e.quality_score,e.downloaded_at,e.archive_path,COALESCE(e.size_bytes,0),e.magnet_hash,e.magnet_link,CASE WHEN e.downloaded_at IS NOT NULL THEN 'downloaded' ELSE COALESCE(t.status,'missing') END,COALESCE(t.error,''),EXISTS(SELECT 1 FROM ignored_episodes i WHERE i.series_name=s.name AND i.season=e.season AND i.episode=e.episode) FROM episodes e JOIN series s ON s.id=e.series_id LEFT JOIN torrent_meta t ON lower(t.hash)=lower(e.magnet_hash) WHERE s.name=?1 AND e.episode > 0 ORDER BY e.season,e.episode")?;
+        let mut ignored_episodes = std::collections::HashSet::new();
+        let mut ignored_statement = self
+            .conn
+            .prepare("SELECT season,episode FROM ignored_episodes WHERE series_name=?1")?;
+        for row in ignored_statement.query_map([series_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            ignored_episodes.insert(row?);
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT e.id,s.name,e.season,e.episode,COALESCE(e.title,''),e.quality_score,
+                    e.downloaded_at,e.archive_path,COALESCE(e.size_bytes,0),e.magnet_hash,
+                    e.magnet_link,
+                    CASE WHEN e.downloaded_at IS NOT NULL THEN 'downloaded'
+                         ELSE COALESCE(t.status,'missing') END,
+                    COALESCE(t.error,'')
+             FROM episodes e
+             JOIN series s ON s.id=e.series_id
+             LEFT JOIN torrent_meta t ON lower(t.hash)=lower(e.magnet_hash)
+             WHERE s.name=?1 AND e.episode > 0
+             ORDER BY e.season,e.episode",
+        )?;
         let rows = statement.query_map([series_name], |row| {
             let season = row.get::<_, i64>(2)?;
             let episode = row.get::<_, i64>(3)?;
@@ -1936,11 +2094,15 @@ impl Database {
                 magnet_link: row.get(10)?,
                 status: row.get(11)?,
                 error: row.get(12)?,
-                ignored: row.get(13)?,
+                ignored: ignored_episodes.contains(&(season, episode)),
             })
         })?;
         let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         items.retain(|item| !ignored_seasons.contains(&item.season));
+        let present = items
+            .iter()
+            .map(|item| (item.season, item.episode))
+            .collect::<std::collections::HashSet<_>>();
         let expected = {
             let mut metadata = self.conn.prepare("SELECT season,episode_count FROM series_metadata WHERE series_name=?1 ORDER BY season")?;
             let rows = metadata.query_map([series_name], |row| {
@@ -1953,13 +2115,10 @@ impl Database {
                 continue;
             }
             for episode in 1..=count {
-                if items
-                    .iter()
-                    .any(|item| item.season == season && item.episode == episode)
-                {
+                if present.contains(&(season, episode)) {
                     continue;
                 }
-                let ignored: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM ignored_episodes WHERE series_name=?1 AND season=?2 AND episode=?3)", params![series_name, season, episode], |value| value.get(0))?;
+                let ignored = ignored_episodes.contains(&(season, episode));
                 items.push(EpisodeView {
                     id: 0,
                     series_name: series_name.to_string(),
@@ -4183,8 +4342,8 @@ mod tests {
             ),
         );
         let context = crate::models::ApprovalContext {
-            archive: index,
-            live: crate::models::LiveDownloads::default(),
+            archive: std::sync::Arc::new(index),
+            live: std::sync::Arc::new(crate::models::LiveDownloads::default()),
             forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
@@ -4226,8 +4385,8 @@ mod tests {
         live.episodes
             .insert((crate::parser::normalize_series_name("Example"), 1, 1));
         let context = crate::models::ApprovalContext {
-            archive: Default::default(),
-            live,
+            archive: std::sync::Arc::new(Default::default()),
+            live: std::sync::Arc::new(live),
             forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
@@ -4242,8 +4401,8 @@ mod tests {
             magnet_hash(&release.magnet).unwrap().to_ascii_lowercase(),
         );
         let context = crate::models::ApprovalContext {
-            archive: Default::default(),
-            live,
+            archive: std::sync::Arc::new(Default::default()),
+            live: std::sync::Arc::new(live),
             forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
@@ -5548,8 +5707,8 @@ mod tests {
         );
         // With upgrades enabled the 2160p release is a real upgrade.
         let allowed_context = crate::models::ApprovalContext {
-            archive: index.clone(),
-            live: Default::default(),
+            archive: std::sync::Arc::new(index.clone()),
+            live: std::sync::Arc::new(Default::default()),
             forbid_upgrade: false, gap_episode: false,
         };
         let (approved, reason) = db
@@ -5565,8 +5724,8 @@ mod tests {
             )
             .unwrap();
         let cutoff_context = crate::models::ApprovalContext {
-            archive: index,
-            live: Default::default(),
+            archive: std::sync::Arc::new(index),
+            live: std::sync::Arc::new(Default::default()),
             forbid_upgrade: true, gap_episode: false,
         };
         let (approved, reason) = db

@@ -402,6 +402,12 @@ pub struct ComicDownloadInput {
     pub save_path: String,
 }
 #[derive(serde::Deserialize)]
+pub struct ComicDownloadTagInput {
+    pub id: String,
+    #[serde(default)]
+    pub tag: String,
+}
+#[derive(serde::Deserialize)]
 pub struct ComicWeeklyInput {
     pub date: String,
 }
@@ -574,6 +580,11 @@ pub struct SequentialInput {
 #[derive(serde::Deserialize)]
 pub struct TorrentTagInput {
     pub hash: String,
+    #[serde(default)]
+    pub tag: String,
+}
+#[derive(serde::Deserialize)]
+pub struct DownloadTagInput {
     #[serde(default)]
     pub tag: String,
 }
@@ -1069,6 +1080,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/comics", get(comics).post(add_comic))
         .route("/api/comics/explore", post(comic_explore))
         .route("/api/comics/downloads", get(comic_downloads))
+        .route("/api/comics/downloads/tag", post(comic_download_tag))
+        .route(
+            "/api/comics/downloads/{id}/pause",
+            post(comic_download_pause),
+        )
+        .route(
+            "/api/comics/downloads/{id}/resume",
+            post(comic_download_resume),
+        )
+        .route(
+            "/api/comics/downloads/{id}/remove",
+            post(comic_download_remove),
+        )
         .route("/api/comics/links", post(comic_links))
         .route("/api/comics/download", post(comic_download))
         .route("/api/comics/weekly/links", post(comic_weekly_links))
@@ -1179,6 +1203,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/torrents/unpin", post(unpin_torrent))
         .route("/api/torrents/sequential", post(set_sequential))
         .route("/api/torrent-tags", get(torrent_tags).post(set_torrent_tag))
+        .route(
+            "/api/download-tags",
+            get(download_tags_list).post(add_download_tag),
+        )
         .route("/api/torrents/{hash}/recheck", post(recheck_torrent))
         .route(
             "/api/torrents/{hash}/no_rename",
@@ -2120,9 +2148,16 @@ async fn save_watched_folders(
 
 async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
     let cfg = latest_config(&s);
-    let db = s.db.lock().unwrap();
-    let statuses = db.series_statuses().unwrap_or_default();
-    let season_counts = db.series_season_counts_bulk().unwrap_or_default();
+    // Keep the database lock only for individual reads. Building the complete
+    // JSON response (and iterating all episodes) must not block torrent/event
+    // workers for the duration of the request.
+    let (statuses, season_counts) = {
+        let db = s.db.lock().unwrap();
+        (
+            db.series_statuses().unwrap_or_default(),
+            db.series_season_counts_bulk().unwrap_or_default(),
+        )
+    };
     let series = cfg
         .series
         .iter()
@@ -2139,7 +2174,10 @@ async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
                     ignored_seasons.push(season);
                 }
             }
-            let episodes = db
+            let episodes = s
+                .db
+                .lock()
+                .unwrap()
                 .episodes_for_series(&series.name, &ignored_seasons)
                 .unwrap_or_default();
             let total = episodes.len() as i64;
@@ -2284,11 +2322,12 @@ async fn series_detail(State(s): State<AppState>, Path(name): Path<String>) -> i
     // (es. `8+`, `1-3,5`) è un secondo vincolo e deve dare la stessa vista
     // nel dettaglio, nei gap e nella ricerca manuale.
     let mut ignored_seasons = series.ignored_seasons.clone();
-    for (season, _) in db.series_season_counts(&series.name).unwrap_or_default() {
-        if !Config::season_allowed_for_scan(&series.seasons, season)
-            && !ignored_seasons.contains(&season)
+    let season_counts = db.series_season_counts(&series.name).unwrap_or_default();
+    for (season, _) in &season_counts {
+        if !Config::season_allowed_for_scan(&series.seasons, *season)
+            && !ignored_seasons.contains(season)
         {
-            ignored_seasons.push(season);
+            ignored_seasons.push(*season);
         }
     }
     let episodes = match db.episodes_for_series(&series.name, &ignored_seasons) {
@@ -2300,25 +2339,20 @@ async fn series_detail(State(s): State<AppState>, Path(name): Path<String>) -> i
             )
         }
     };
-    let gaps =
-        db
-            .archive_gaps()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(series_name, season, _)| {
-                series_name == &series.name
-                    && !ignored_seasons.contains(season)
-                    && Config::season_allowed_for_scan(&series.seasons, *season)
-            })
-            .map(|(_, season, episode)| serde_json::json!({"season":season,"episode":episode}))
-            .collect::<Vec<_>>();
-    let metadata =
-        db
-            .series_season_counts(&series.name)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(season, count)| serde_json::json!({"season": season, "count": count}))
-            .collect::<Vec<_>>();
+    let gaps = db
+        .archive_gaps_for_series(&series.name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(season, _)| {
+            !ignored_seasons.contains(season)
+                && Config::season_allowed_for_scan(&series.seasons, *season)
+        })
+        .map(|(season, episode)| serde_json::json!({"season":season,"episode":episode}))
+        .collect::<Vec<_>>();
+    let metadata = season_counts
+        .into_iter()
+        .map(|(season, count)| serde_json::json!({"season": season, "count": count}))
+        .collect::<Vec<_>>();
     (
         StatusCode::OK,
         Json(
@@ -5357,7 +5391,9 @@ async fn comic_check_links(Json(input): Json<ComicCheckLinksInput>) -> impl Into
 async fn comic_cycle(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = latest_config(&s);
     let client = GetComicsClient::new();
-    let default_root = cfg.data_dir.join("comics");
+    // Fallback destination for monitored titles without an explicit path: the
+    // same default download folder used by torrents, not the data directory.
+    let default_root = cfg.libtorrent_dir.clone();
     let _guard = s.cycle_lock.lock().await;
     match comics::run_cycle(
         s.comics.as_ref(),
@@ -6740,6 +6776,58 @@ async fn comics(State(s): State<AppState>) -> Json<Vec<ComicMonitored>> {
 async fn comic_downloads() -> Json<Vec<comics::ComicDownload>> {
     Json(comics::http_downloads())
 }
+async fn comic_download_tag(Json(input): Json<ComicDownloadTagInput>) -> impl IntoResponse {
+    if input.id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"download id is required"})),
+        );
+    }
+    if comics::set_http_download_tag(input.id.trim(), input.tag.trim()) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"id":input.id})),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"download not found"})),
+        )
+    }
+}
+async fn comic_download_pause(Path(id): Path<String>) -> impl IntoResponse {
+    if comics::pause_http_download(&id) {
+        (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"download non in scarico"})),
+        )
+    }
+}
+async fn comic_download_resume(Path(id): Path<String>) -> impl IntoResponse {
+    if comics::resume_http_download(&id) {
+        (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"download non in pausa"})),
+        )
+    }
+}
+async fn comic_download_remove(
+    Path(id): Path<String>,
+    Json(input): Json<RemoveCompletedInput>,
+) -> impl IntoResponse {
+    if comics::cancel_http_download(&id, input.delete_files) {
+        (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok":false,"error":"download non trovato"})),
+        )
+    }
+}
 async fn comic_links(Json(input): Json<ComicLinksInput>) -> impl IntoResponse {
     if input.url.trim().is_empty() || input.url.len() > 4096 {
         return (
@@ -6808,11 +6896,14 @@ async fn comic_download(
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     let target = if input.save_path.trim().is_empty() {
-        cfg.data_dir.join("comics")
+        // No explicit folder: use the configured default download directory,
+        // matching torrent downloads, instead of a comics folder inside `data`.
+        cfg.libtorrent_dir.clone()
     } else {
         PathBuf::from(input.save_path.trim())
     };
     let allowed = target.starts_with(&cfg.data_dir)
+        || target.starts_with(&cfg.libtorrent_dir)
         || monitored_paths.iter().any(|path| target.starts_with(path));
     if !allowed {
         return (
@@ -9178,6 +9269,62 @@ async fn set_torrent_tag(
         ),
     }
 }
+
+/// Tags the user created from the download list. Stored as a JSON array in the
+/// config settings so a new tag shows up in every tag dropdown and survives a
+/// restart, even before it is assigned to anything.
+fn stored_download_tags(cfg: &Config) -> Vec<String> {
+    cfg.settings
+        .get("download_tags")
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+async fn download_tags_list(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = latest_config(&s);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"items":stored_download_tags(&cfg)})),
+    )
+}
+
+async fn add_download_tag(
+    State(s): State<AppState>,
+    Json(input): Json<DownloadTagInput>,
+) -> impl IntoResponse {
+    let tag = input.tag.trim();
+    if tag.is_empty() || tag.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"tag non valido"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    let mut tags = stored_download_tags(&cfg);
+    if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+        tags.push(tag.to_string());
+        tags.sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
+        let payload = match serde_json::to_string(&tags) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+                )
+            }
+        };
+        if let Err(error) = Config::save_setting(&s.cfg.data_dir, "download_tags", &payload) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"items":tags})),
+    )
+}
 async fn recheck_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
     torrent_action(s.torrents.force_recheck(&hash))
 }
@@ -9576,10 +9723,14 @@ async fn remove_completed_torrents(
             }
         }
     }
+    // Completed/errored HTTP downloads (comics) are session rows without a
+    // libtorrent counterpart: "Pulisci completati" must clear them too. Files
+    // stay on disk, like the torrent cleanup keeps the archived copy.
+    let http_removed = comics::clear_finished_http_downloads();
     (
         StatusCode::OK,
         Json(
-            serde_json::json!({"ok":true,"success":true,"removed":removed.len(),"skipped":skipped,"items":removed}),
+            serde_json::json!({"ok":true,"success":true,"removed":removed.len(),"skipped":skipped,"http_removed":http_removed,"items":removed}),
         ),
     )
 }

@@ -335,6 +335,7 @@ struct Data {
     torrents: Vec<Value>,
     torrent_delta: i64,
     torrent_tags: Vec<Value>,
+    download_tags: Vec<String>,
     history: Vec<Value>,
     history_page: usize,
     history_pages: usize,
@@ -820,10 +821,11 @@ fn run_cleanup_completed(data: RwSignal<Data>) {
             Ok(value) => {
                 let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
                 let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
-                let message = if removed == 0 {
+                let http_removed = value.get("http_removed").and_then(Value::as_u64).unwrap_or(0);
+                let message = if removed == 0 && http_removed == 0 {
                     tr_format(data, "Nessun torrent rimosso: {skipped} non hanno ancora raggiunto i limiti di seed (ratio/tempo) o sono in seed infinito.", &[("{skipped}", skipped.to_string())])
                 } else {
-                    tr_format(data, "Rimossi {removed} completati · saltati {skipped} (limiti di seed non raggiunti o seed infinito). Sono ora nello Storico download.", &[("{removed}", removed.to_string()), ("{skipped}", skipped.to_string())])
+                    tr_format(data, "Rimossi {removed} torrent e {http} download HTTP completati · saltati {skipped} (limiti di seed non raggiunti o seed infinito). I torrent sono ora nello Storico download.", &[("{removed}", removed.to_string()), ("{http}", http_removed.to_string()), ("{skipped}", skipped.to_string())])
                 };
                 flash_text(data, "ok", message);
             }
@@ -863,6 +865,14 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
             .cloned()
             .unwrap_or_default();
         let torrent_tags = array(&get("/api/torrent-tags").await?, "items");
+        let download_tags = get("/api/download-tags")
+            .await
+            .ok()
+            .and_then(|value| value.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<String>>();
         // Storico download paginato: mantiene la pagina corrente anche durante i
         // refresh silenziosi, così la tabella non salta alla prima pagina.
         let history_page_wanted = data.get_untracked().history_page.max(1);
@@ -999,6 +1009,7 @@ async fn load(data: RwSignal<Data>, busy: RwSignal<bool>, silent: bool) {
             current.library = library;
             current.torrents = torrents;
             current.torrent_tags = torrent_tags;
+            current.download_tags = download_tags;
             current.history = history;
             current.history_page = history_page;
             current.history_pages = history_pages;
@@ -1159,6 +1170,13 @@ pub fn App() -> impl IntoView {
                     });
                 }
             }
+            // Anteprima live dei download HTTP (fumetti): così velocità e
+            // progresso scorrono con la stessa cadenza dei torrent.
+            if let Ok(value) = get("/api/comics/downloads").await {
+                if let Some(items) = value.as_array().cloned() {
+                    data.update(|current| current.comic_downloads = items);
+                }
+            }
         }
     });
     let reload = move || refresh.update(|value| *value += 1);
@@ -1233,11 +1251,17 @@ pub fn App() -> impl IntoView {
     let live_dl = Signal::derive(move || {
         size_str(
             data.with(|current| {
-                current
+                let torrents: f64 = current
                     .torrents
                     .iter()
                     .map(|item| value_f64(item, "download_rate"))
-                    .sum()
+                    .sum();
+                let http: f64 = current
+                    .comic_downloads
+                    .iter()
+                    .map(|item| value_f64(item, "speed_bytes"))
+                    .sum();
+                torrents + http
             }),
         )
     });
@@ -1531,7 +1555,14 @@ fn SettingsSearchOverlay(page: RwSignal<String>) -> impl IntoView {
 fn SidebarCount(page: RwSignal<String>, id: &'static str, data: RwSignal<Data>) -> impl IntoView {
     let count = Signal::derive(move || {
         data.with(|current| match id {
-            "downloads" => current.torrents.len(),
+            "downloads" => {
+                let http = current
+                    .comic_downloads
+                    .iter()
+                    .filter(|item| text(item, "status", "") == "downloading")
+                    .count();
+                current.torrents.len() + http
+            }
             "series" => array(&current.library, "series").len(),
             "movies" => array(&current.library, "movies").len(),
             "comics" => current.comics.len(),
@@ -2526,6 +2557,47 @@ fn torrent_tag_of(tags: &[Value], hash: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Applica il filtro tag della barra strumenti a torrent e download HTTP.
+fn tag_matches(term: &str, tag: &str) -> bool {
+    match term {
+        "" => true,
+        "__none__" => tag.is_empty(),
+        _ => tag == term,
+    }
+}
+
+/// Adatta un download HTTP (fumetti) alla forma usata dai torrent così la
+/// tabella unificata può filtrarlo, ordinarlo e disegnarlo con le stesse
+/// colonne. `__kind`/`__id` distinguono la riga e la identificano stabilmente.
+fn normalized_http_item(item: &Value) -> Value {
+    let status = text(item, "status", "");
+    let total = item.get("total_bytes").and_then(Value::as_u64).unwrap_or(0);
+    let done = item.get("downloaded_bytes").and_then(Value::as_u64).unwrap_or(0);
+    json!({
+        "__kind": "http",
+        "__id": text(item, "id", ""),
+        "hash": "",
+        "name": text(item, "title", ""),
+        "title": text(item, "title", ""),
+        "method": text(item, "method", ""),
+        "status": status,
+        "state": status,
+        "progress": item.get("progress").and_then(Value::as_f64).unwrap_or(-1.0),
+        "download_rate": value_f64(item, "speed_bytes"),
+        "upload_rate": 0.0,
+        "num_peers": 0,
+        "num_seeds": 0,
+        "all_time_upload": 0.0,
+        "all_time_download": done,
+        "total_size": total,
+        "total_done": done,
+        "has_metadata": true,
+        "tag": text(item, "tag", ""),
+        "error": text(item, "error", ""),
+        "updated_at": text(item, "updated_at", ""),
+    })
+}
+
 fn value_f64(value: &Value, key: &str) -> f64 {
     value.get(key).and_then(Value::as_f64).unwrap_or(0.0)
 }
@@ -2851,6 +2923,9 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     let sort_key = RwSignal::new("name".to_string());
     let sort_asc = RwSignal::new(true);
     let selected_torrents = RwSignal::new(Vec::<String>::new());
+    let selected_http = RwSignal::new(Vec::<String>::new());
+    let tag_assign = RwSignal::new(String::new());
+    let tag_assign_new = RwSignal::new(String::new());
     let add_save_path = RwSignal::new(String::new());
     let add_start = RwSignal::new(true);
     let add_no_rename = RwSignal::new(false);
@@ -2876,16 +2951,22 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
         let mut items: Vec<Value> = snapshot
             .torrents
             .iter()
-            .filter(|item| {
-                let tag = torrent_tag_of(&snapshot.torrent_tags, &text(item, "hash", ""));
-                match term.as_str() {
-                    "" => true,
-                    "__none__" => tag.is_empty(),
-                    _ => tag == term,
-                }
-            })
+            .filter(|item| tag_matches(&term, &torrent_tag_of(&snapshot.torrent_tags, &text(item, "hash", ""))))
             .cloned()
+            .map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("__kind".into(), json!("torrent"));
+                }
+                item
+            })
             .collect();
+        items.extend(
+            snapshot
+                .comic_downloads
+                .iter()
+                .map(normalized_http_item)
+                .filter(|item| tag_matches(&term, &text(item, "tag", ""))),
+        );
         let key = sort_key.get();
         let asc = sort_asc.get();
         items.sort_by(|a, b| {
@@ -2907,6 +2988,90 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             trigger_refresh();
         });
     };
+    let selected_count = Signal::derive(move || selected_torrents.get().len() + selected_http.get().len());
+    // Unione dei tag esistenti (registro persistente + torrent + download HTTP),
+    // condivisa dalla tendina di filtro e da quella di assegnazione.
+    let all_tags = Signal::derive(move || {
+        let snapshot = data.get();
+        let mut tags: Vec<String> = snapshot.download_tags.clone();
+        tags.extend(
+            snapshot
+                .torrent_tags
+                .iter()
+                .map(|item| text(item, "tag", ""))
+                .filter(|tag| !tag.is_empty()),
+        );
+        tags.extend(
+            snapshot
+                .comic_downloads
+                .iter()
+                .map(|item| text(item, "tag", ""))
+                .filter(|tag| !tag.is_empty()),
+        );
+        tags.sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
+        tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        tags
+    });
+    // Un tag per i selezionati, torrent e download HTTP insieme: un solo punto
+    // di ingresso al posto del pulsante per riga. La voce "__new__" crea un tag
+    // che viene registrato e ricompare nelle tendine.
+    let assign_tag = move |_| {
+        let chosen = tag_assign.get();
+        let is_new = chosen == "__new__";
+        let tag = if is_new {
+            tag_assign_new.get().trim().to_string()
+        } else {
+            chosen.clone()
+        };
+        let torrents = selected_torrents.get();
+        let http = selected_http.get();
+        let count = torrents.len() + http.len();
+        if is_new && tag.is_empty() {
+            flash_text(data, "err", tr(data, "Scrivi il nome del nuovo tag."));
+            return;
+        }
+        if !is_new && count == 0 {
+            flash_text(data, "err", tr(data, "Seleziona almeno un torrent o un download."));
+            return;
+        }
+        spawn_local(async move {
+            if !tag.is_empty() {
+                let _ = send("POST", "/api/download-tags", Some(json!({"tag": tag.clone()}))).await;
+            }
+            for hash in torrents {
+                let _ = send(
+                    "POST",
+                    "/api/torrent-tags",
+                    Some(json!({"hash": hash, "tag": tag.clone()})),
+                )
+                .await;
+            }
+            for id in http {
+                let _ = send(
+                    "POST",
+                    "/api/comics/downloads/tag",
+                    Some(json!({"id": id, "tag": tag.clone()})),
+                )
+                .await;
+            }
+            if count == 0 {
+                flash_text(data, "ok", tr(data, "Tag creato"));
+            } else {
+                flash_text(
+                    data,
+                    "ok",
+                    tr_format(
+                        data,
+                        "Tag assegnato a {count} elementi",
+                        &[("{count}", count.to_string())],
+                    ),
+                );
+            }
+            tag_assign.set(String::new());
+            tag_assign_new.set(String::new());
+            trigger_refresh();
+        });
+    };
     let set_sort = move |key: &'static str| {
         if sort_key.get() == key {
             sort_asc.update(|value| *value = !*value);
@@ -2917,7 +3082,22 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     };
     let all_selected = Signal::derive(move || {
         let items = filtered.get();
-        !items.is_empty() && items.iter().all(|item| selected_torrents.get().contains(&text(item, "hash", "")))
+        let torrents = items
+            .iter()
+            .filter(|item| text(item, "__kind", "torrent") != "http")
+            .collect::<Vec<_>>();
+        let http = items
+            .iter()
+            .filter(|item| text(item, "__kind", "torrent") == "http")
+            .collect::<Vec<_>>();
+        let torrents_selected = torrents.iter().all(|item| {
+            let hash = text(item, "hash", "");
+            hash.is_empty() || selected_torrents.get().contains(&hash)
+        });
+        let http_selected = http
+            .iter()
+            .all(|item| selected_http.get().contains(&text(item, "__id", "")));
+        (!torrents.is_empty() || !http.is_empty()) && torrents_selected && http_selected
     });
     let on_upload = move |event: leptos::ev::Event| {
         let input = event
@@ -3013,36 +3193,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 </form>
             </Panel>
             <Panel title="Download session">
-                <Show when=move || !data.get().comic_downloads.is_empty()>
-                    <div class="table-wrap" style="margin-bottom:10px">
-                        <table class="data-table">
-                            <thead><tr><th>{ctx_tr("Titolo")}</th><th>{ctx_tr("Metodo")}</th><th>{ctx_tr("Stato")}</th><th>{ctx_tr("Progresso")}</th><th>{ctx_tr("Velocità")}</th></tr></thead>
-                            <tbody>
-                                {move || data.get().comic_downloads.iter().cloned().map(|item| {
-                                    let status = text(&item, "status", "-");
-                                    let status_label = match status.as_str() {
-                                        "downloading" => tr(data, "In scarico"),
-                                        "completed" => tr(data, "Completato"),
-                                        "error" => tr(data, "errore"),
-                                        _ => status.clone(),
-                                    };
-                                    let progress = item.get("progress").and_then(Value::as_f64).unwrap_or(0.0);
-                                    let speed = item.get("speed_bytes").and_then(Value::as_f64).unwrap_or(0.0);
-                                    view! {
-                                        <tr>
-                                            <td class="truncate">{text(&item, "title", "-")}</td>
-                                            <td class="muted">{text(&item, "method", "-")}</td>
-                                            <td><span class="badge" class:ok=status == "completed">{status_label}</span></td>
-                                            <td class="numeric">{format!("{progress:.0}%")}</td>
-                                            <td class="numeric">{format!("{}/s", size_str(speed))}</td>
-                                        </tr>
-                                    }
-                                }).collect_view()}
-                            </tbody>
-                        </table>
-                    </div>
-                </Show>
-                <p class="muted">{ctx_tr("Torrent ancora nel client (download e seed). I download HTTP, come quelli dei fumetti, restano visibili qui fino al completamento o all'errore; il seed si applica solo ai torrent.")}</p>
+                <p class="muted">{ctx_tr("Torrent e download HTTP (fumetti) nella stessa lista. Il seed si applica solo ai torrent; i download HTTP restano visibili fino al completamento o all'errore. Il tag li filtra insieme ai torrent.")}</p>
                 <div class="toolbar" style="margin-bottom:10px">
                     <button class="btn sm" title=ctx_tr("Toglie dalla coda libtorrent i torrent completati che hanno già raggiunto i limiti di seed (ratio/tempo). Esclude il seed infinito e non cancella l'archivio NAS: i torrent escono dalla Sessione e passano allo Storico download.") on:click=move |_| run_cleanup_completed(data)>{ctx_tr("Pulisci completati")}</button>
                     <label class="check" title=ctx_tr("Elimina dalla sessione i torrent completati appena raggiungono i limiti di seed (ratio/tempo). Non cancella l'archivio NAS: la copia in libreria resta.")>
@@ -3052,15 +3203,10 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         } />
                         <span>{ctx_tr("Elimina i completati dopo il seed")}</span>
                     </label>
-                    <select style="width:auto" title=ctx_tr("Filtra i torrent per tag") prop:value=tag_filter on:change=move |event| tag_filter.set(event_target_value(&event))>
+                    <select style="width:auto" title=ctx_tr("Filtra torrent e download HTTP per tag") prop:value=tag_filter on:change=move |event| tag_filter.set(event_target_value(&event))>
                         <option value="">{ctx_tr("Tutti i tag")}</option>
                         <option value="__none__">{ctx_tr("Senza tag")}</option>
-                        {move || {
-                            let mut tags: Vec<String> = data.get().torrent_tags.iter().map(|item| text(item, "tag", "")).filter(|tag| !tag.is_empty()).collect();
-                            tags.sort();
-                            tags.dedup();
-                            tags.into_iter().map(|tag| { let value = tag.clone(); view! { <option value=value>{tag}</option> } }).collect_view()
-                        }}
+                        {move || all_tags.get().into_iter().map(|tag| { let value = tag.clone(); view! { <option value=value>{tag}</option> } }).collect_view()}
                     </select>
                     <span class="cycle-label" style="margin-left:12px">{ctx_tr("Limite temporaneo")}</span>
                     <input style="width:90px" prop:value=temp_dl on:input=move |event| temp_dl.set(event_target_value(&event)) placeholder=ctx_tr("DL KiB/s") title=ctx_tr("Download temporaneo in KiB/s (0 = illimitato)") />
@@ -3092,7 +3238,16 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     <small class="muted">{temp_message}</small>
                 </div>
                 <div class="toolbar" style="margin-bottom:10px">
-                    <span class="muted">{move || tr_format(data, "{count} selezionati", &[("{count}", selected_torrents.get().len().to_string())])}</span>
+                    <span class="muted">{move || tr_format(data, "{count} selezionati", &[("{count}", selected_count.get().to_string())])}</span>
+                    <select style="width:auto" title=ctx_tr("Tag da assegnare ai torrent e ai download HTTP selezionati") prop:value=tag_assign on:change=move |event| tag_assign.set(event_target_value(&event))>
+                        <option value="">{ctx_tr("— rimuovi il tag —")}</option>
+                        {move || all_tags.get().into_iter().map(|tag| { let value = tag.clone(); view! { <option value=value>{tag}</option> } }).collect_view()}
+                        <option value="__new__">{ctx_tr("➕ Nuovo tag…")}</option>
+                    </select>
+                    <Show when=move || tag_assign.get() == "__new__">
+                        <input style="width:150px" prop:value=tag_assign_new on:input=move |event| tag_assign_new.set(event_target_value(&event)) placeholder=ctx_tr("Nuovo tag") title=ctx_tr("Nome del nuovo tag: verrà salvato e comparirà nelle tendine") />
+                    </Show>
+                    <button class="btn sm primary" title=ctx_tr("Assegna il tag scelto a tutti gli elementi selezionati (vuoto = rimuove il tag)") on:click=assign_tag>{ctx_tr("Assegna tag")}</button>
                     <button class="btn sm" title=ctx_tr("Metti in pausa i torrent selezionati") on:click=move |_| bulk_post("pause", None)>{ctx_tr("Pausa")}</button>
                     <button class="btn sm" title=ctx_tr("Riprendi i torrent selezionati") on:click=move |_| bulk_post("resume", None)>{ctx_tr("Riprendi")}</button>
                     <button class="btn sm" title=ctx_tr("Riavvia il check dei torrent selezionati") on:click=move |_| bulk_post("recheck", None)>{ctx_tr("Recheck")}</button>
@@ -3104,14 +3259,32 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         <thead><tr>
                             <th><input type="checkbox" title=ctx_tr("Seleziona tutti") prop:checked=move || all_selected.get() on:change=move |_| {
                                 let items = filtered.get();
+                                let torrent_hashes: Vec<String> = items.iter()
+                                    .filter(|item| text(item, "__kind", "torrent") != "http")
+                                    .map(|item| text(item, "hash", ""))
+                                    .filter(|hash| !hash.is_empty())
+                                    .collect();
+                                let http_ids: Vec<String> = items.iter()
+                                    .filter(|item| text(item, "__kind", "torrent") == "http")
+                                    .map(|item| text(item, "__id", ""))
+                                    .filter(|id| !id.is_empty())
+                                    .collect();
+                                let all = all_selected.get_untracked();
                                 selected_torrents.update(|current| {
-                                    let all = !items.is_empty() && items.iter().all(|item| current.contains(&text(item, "hash", "")));
                                     if all {
-                                        current.clear();
+                                        current.retain(|hash| !torrent_hashes.contains(hash));
                                     } else {
-                                        for item in &items {
-                                            let hash = text(item, "hash", "");
-                                            if !current.contains(&hash) { current.push(hash); }
+                                        for hash in &torrent_hashes {
+                                            if !current.contains(hash) { current.push(hash.clone()); }
+                                        }
+                                    }
+                                });
+                                selected_http.update(|current| {
+                                    if all {
+                                        current.retain(|id| !http_ids.contains(id));
+                                    } else {
+                                        for id in &http_ids {
+                                            if !current.contains(id) { current.push(id.clone()); }
                                         }
                                     }
                                 });
@@ -3129,15 +3302,26 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         <tbody>
                             <For
                                 each=move || filtered.get()
-                                key=|item: &Value| text(item, "hash", "")
-                                children=move |item| view! {
-                                    <TorrentRow hash=text(&item, "hash", "") data selected=selected_torrents />
+                                key=|item: &Value| {
+                                    let kind = text(item, "__kind", "torrent");
+                                    if kind == "http" {
+                                        format!("http:{}", text(item, "__id", ""))
+                                    } else {
+                                        format!("torrent:{}", text(item, "hash", ""))
+                                    }
+                                }
+                                children=move |item| {
+                                    if text(&item, "__kind", "torrent") == "http" {
+                                        view! { <HttpDownloadRow id=text(&item, "__id", "") data selected=selected_http /> }.into_any()
+                                    } else {
+                                        view! { <TorrentRow hash=text(&item, "hash", "") data selected=selected_torrents /> }.into_any()
+                                    }
                                 }
                             />
                         </tbody>
                     </table>
                 </div>
-                <Show when=move || data.get().torrents.is_empty()><Empty text="Nessun torrent nella sessione." /></Show>
+                <Show when=move || data.get().torrents.is_empty() && data.get().comic_downloads.is_empty()><Empty text="Nessun download nella sessione." /></Show>
             </Panel>
             <Panel title="Storico download">
                 <p class="muted">{ctx_tr("Download conclusi negli ultimi 30 giorni. Il badge NAS indica che il file è stato archiviato (percorso in libreria/NAS); il tag è la regola di cartella applicata.")}</p>
@@ -3264,6 +3448,189 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                 </div>
             </Panel>
         </div>
+    }
+}
+
+#[component]
+fn HttpDownloadRow(id: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>>) -> impl IntoView {
+    let id_lookup = id.clone();
+    let id_check = id.clone();
+    let id_toggle = id.clone();
+    let id_pause = StoredValue::new(id.clone());
+    let id_resume = StoredValue::new(id.clone());
+    let id_remove = StoredValue::new(id.clone());
+    let item = Signal::derive(move || {
+        data.get()
+            .comic_downloads
+            .iter()
+            .find(|entry| text(entry, "id", "") == id_lookup)
+            .cloned()
+            .unwrap_or(Value::Null)
+    });
+    // Visione normalizzata: condivide con i torrent ETA, ordinamento e unità.
+    let row = Signal::derive(move || normalized_http_item(&item.get()));
+    let name = Signal::derive(move || text(&item.get(), "title", "—"));
+    let method = Signal::derive(move || text(&item.get(), "method", "http").to_uppercase());
+    let is_http = Signal::derive(move || text(&item.get(), "method", "") == "http");
+    let status = Signal::derive(move || text(&item.get(), "status", ""));
+    let status_label = Signal::derive(move || match status.get().as_str() {
+        "downloading" => tr(data, "In scarico"),
+        "paused" => tr(data, "In pausa"),
+        "completed" => tr(data, "Completato"),
+        "error" => tr(data, "errore"),
+        other => other.to_string(),
+    });
+    let tag = Signal::derive(move || text(&item.get(), "tag", ""));
+    let tag_label = Signal::derive(move || {
+        let value = tag.get();
+        if value.is_empty() { "—".to_string() } else { value }
+    });
+    let error = Signal::derive(move || text(&item.get(), "error", ""));
+    let url = Signal::derive(move || text(&item.get(), "url", "—"));
+    let destination = Signal::derive(move || {
+        let value = text(&item.get(), "destination", "");
+        if value.is_empty() { "—".into() } else { value }
+    });
+    let temporary = Signal::derive(move || {
+        let value = text(&item.get(), "temporary", "");
+        if value.is_empty() { "—".into() } else { value }
+    });
+    let downloaded = Signal::derive(move || size(&item.get(), "downloaded_bytes"));
+    let total = Signal::derive(move || {
+        item.get()
+            .get("total_bytes")
+            .and_then(Value::as_u64)
+            .map(|value| size_str(value as f64))
+            .unwrap_or_else(|| "—".into())
+    });
+    let speed = Signal::derive(move || format!("{}/s", size(&item.get(), "speed_bytes")));
+    let updated = Signal::derive(move || text(&item.get(), "updated_at", "—"));
+    let progress = Signal::derive(move || {
+        let value = item.get().get("progress").and_then(Value::as_f64).unwrap_or(-1.0);
+        if value < 0.0 { None } else { Some(value) }
+    });
+    let expanded = RwSignal::new(false);
+    let remove_confirm = RwSignal::new(false);
+    // Rimuove la riga; con `delete_files` cancella anche il `.part` e il file
+    // finale. Il closure cattura solo handle Copy, quindi resta riusabile.
+    let remove = move |delete_files: bool| {
+        let id = id_remove.get_value();
+        spawn_local(async move {
+            let result = send(
+                "POST",
+                &format!("/api/comics/downloads/{id}/remove"),
+                Some(json!({"delete_files": delete_files})),
+            )
+            .await;
+            flash(data, result, "Download rimosso");
+            trigger_refresh();
+        });
+    };
+    view! {
+        <tr>
+            <td><input type="checkbox" title=ctx_tr("Seleziona il download") prop:checked=move || selected.get().contains(&id_check) on:change=move |_| { let id = id_toggle.clone(); selected.update(|items| { if items.contains(&id) { items.retain(|value| value != &id); } else { items.push(id); } }); } /></td>
+            <td class="truncate" title=move || name.get()>
+                <div class="torrent-name">
+                    <span class="torrent-name-text">{move || name.get()}</span>
+                    <span class="badge" title=ctx_tr("Download HTTP, non un torrent")>{move || method.get()}</span>
+                    {move || {
+                        let tag = tag.get();
+                        (!tag.is_empty()).then(|| view! { <span class="badge ok" title=ctx_tr("Tag assegnato")>{tag}</span> })
+                    }}
+                </div>
+                <Show when=move || !error.get().is_empty()>
+                    <div class="muted" style="font-size:11px;white-space:normal">{move || error.get()}</div>
+                </Show>
+            </td>
+            <td><span class="badge" class:ok=move || status.get() == "completed" class:warn=move || status.get() == "paused" class:err=move || status.get() == "error">{move || status_label.get()}</span></td>
+            <td>
+                <div class=move || match status.get().as_str() {
+                    "completed" => "progress seed",
+                    "paused" | "error" => "progress paused",
+                    _ => "progress active",
+                }><span style=move || format!("width:{:.0}%", progress.get().unwrap_or(0.0).clamp(0.0, 100.0))></span></div>
+                <small class="muted">{move || progress.get().map(|value| format!("{value:.1}%")).unwrap_or_else(|| "—".into())}</small>
+            </td>
+            <td class="numeric">{move || format!("{}/s", size(&row.get(), "download_rate"))}</td>
+            <td class="numeric">"—"</td>
+            <td class="numeric" title=ctx_tr("Tempo stimato al completamento")>{move || eta_label(data, &row.get())}</td>
+            <td class="numeric">"—"</td>
+            <td class="numeric">"—"</td>
+            <td>
+                <div class="row-actions">
+                    <Show when=move || is_http.get() && status.get() == "downloading">
+                        <button class="btn sm" title=ctx_tr("Metti in pausa il download HTTP") on:click=move |_| run_post(data, &format!("/api/comics/downloads/{}/pause", id_pause.get_value()), None, "Download in pausa")>{ctx_tr("Pausa")}</button>
+                    </Show>
+                    <Show when=move || is_http.get() && status.get() == "paused">
+                        <button class="btn sm" title=ctx_tr("Riprendi il download HTTP") on:click=move |_| run_post(data, &format!("/api/comics/downloads/{}/resume", id_resume.get_value()), None, "Download ripreso")>{ctx_tr("Riprendi")}</button>
+                    </Show>
+                    <button class="btn sm" title=ctx_tr("Dettagli del download") on:click=move |_| expanded.update(|open| *open = !*open)>{ctx_tr("Dettagli")}</button>
+                    <button class="btn sm danger" title=ctx_tr("Rimuovi dalla lista; puoi scegliere se cancellare anche il file") on:click=move |_| remove_confirm.set(true)>{ctx_tr("Rimuovi")}</button>
+                </div>
+            </td>
+        </tr>
+        <Show when=move || expanded.get()>
+            <tr>
+                <td colspan="10">
+                    <div class="modal-backdrop" on:click=move |_| expanded.set(false)>
+                        <div class="modal torrent-modal" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
+                            <div class="modal-head">
+                                <strong>{move || name.get()}</strong>
+                                <div class="toolbar">
+                                    <span class="mono muted">{id.clone()}</span>
+                                    <button class="btn sm" on:click=move |_| expanded.set(false)>{ctx_tr("Chiudi")}</button>
+                                </div>
+                            </div>
+                            <div class="modal-body">
+                                <div class="grid-2">
+                                    <StatLine label="Stato" value=status_label />
+                                    <StatLine label="Metodo" value=method />
+                                    <StatLine label="Progresso" value=Signal::derive(move || progress.get().map(|value| format!("{value:.1}%")).unwrap_or_else(|| "—".into())) />
+                                    <StatLine label="Scaricato" value=downloaded />
+                                    <StatLine label="Dimensione" value=total />
+                                    <StatLine label="Velocità" value=speed />
+                                    <StatLine label="ETA" value=Signal::derive(move || eta_label(data, &row.get())) />
+                                    <StatLine label="Tag" value=tag_label />
+                                    <StatLine label="File finale" value=destination />
+                                    <StatLine label="File temporaneo" value=temporary />
+                                    <StatLine label="Aggiornato" value=updated />
+                                </div>
+                                <div class="row span-full" style="margin-top:8px">
+                                    <span class="muted">{ctx_tr("URL")}</span>
+                                    <strong class="mono" style="word-break:break-all;font-size:11px">{move || url.get()}</strong>
+                                </div>
+                                <Show when=move || !error.get().is_empty()>
+                                    <p class="muted" style="margin-top:8px">{move || format!("{}: {}", tr(data, "Errore"), error.get())}</p>
+                                </Show>
+                            </div>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+        </Show>
+        <Show when=move || remove_confirm.get()>
+            <tr>
+                <td colspan="10">
+                    <div class="modal-backdrop" on:click=move |_| remove_confirm.set(false)>
+                        <div class="modal" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
+                            <div class="modal-head">
+                                <strong>{ctx_tr("Rimuovi download")}</strong>
+                                <button class="btn sm" on:click=move |_| remove_confirm.set(false)>{ctx_tr("Chiudi")}</button>
+                            </div>
+                            <div class="modal-body">
+                                <p class="muted">{ctx_tr("Rimuovi solo la riga dalla lista oppure cancella anche il file scaricato (parziale o completo).")}</p>
+                                <div class="toolbar">
+                                    <button class="btn sm" on:click=move |_| { remove_confirm.set(false); remove(false); }>{ctx_tr("Rimuovi dalla lista")}</button>
+                                    <Show when=move || is_http.get()>
+                                        <button class="btn sm danger" on:click=move |_| { remove_confirm.set(false); remove(true); }>{ctx_tr("Rimuovi e cancella file")}</button>
+                                    </Show>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+        </Show>
     }
 }
 

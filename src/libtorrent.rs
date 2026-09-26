@@ -1111,14 +1111,14 @@ impl LibtorrentClient {
     /// Applies pending first/last priorities and metadata-only pauses. Called
     /// by the torrent event worker with the latest status snapshot.
     pub fn enforce_deferred_options(&self, torrents: &[TorrentView]) {
-        let pending_first_last: Vec<String> = self
+        let pending_first_last: HashSet<String> = self
             .first_last_pending
             .read()
             .unwrap()
             .iter()
             .cloned()
             .collect();
-        let pending_stop: Vec<String> = self
+        let pending_stop: HashSet<String> = self
             .stop_at_metadata
             .read()
             .unwrap()

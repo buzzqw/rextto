@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Quality {
@@ -334,8 +335,8 @@ impl LiveDownloads {
 /// cosa c'è già in download (sessione live).
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalContext {
-    pub archive: ArchiveQualityIndex,
-    pub live: LiveDownloads,
+    pub archive: Arc<ArchiveQualityIndex>,
+    pub live: Arc<LiveDownloads>,
     /// When true, an existing archived file is never replaced. Set from a
     /// quality profile with `upgrade_allowed = false` or when the cutoff
     /// resolution is already reached.

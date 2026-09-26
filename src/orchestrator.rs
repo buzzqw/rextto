@@ -74,7 +74,7 @@ pub async fn run_cycle_domain(
             comics,
             &GetComicsClient::new(),
             notifier,
-            &cfg.data_dir.join("comics"),
+            &cfg.libtorrent_dir,
             torrents,
             cfg,
         )
@@ -118,12 +118,19 @@ pub async fn run_cycle_domain(
     // Do not keep or reconsider releases whose infohash was permanently
     // rejected (for example a season pack whose real files belong to another
     // season). This also removes stale conflicting rows from the archive.
+    // The blocklist does not change during candidate selection. Keep one
+    // snapshot for all feed/archive/pending lookups instead of querying SQLite
+    // once per candidate.
+    let blocklisted_hashes = db
+        .lock()
+        .unwrap()
+        .blocklisted_hashes()
+        .unwrap_or_default();
     let blocked_hashes = {
-        let database = db.lock().unwrap();
         releases
             .iter()
             .filter_map(|release| crate::utils::magnet_hash(&release.magnet))
-            .filter(|hash| database.is_blocklisted(hash).unwrap_or(false))
+            .filter(|hash| blocklisted_hashes.contains(hash))
             .collect::<std::collections::HashSet<_>>()
     };
     for hash in &blocked_hashes {
@@ -143,27 +150,30 @@ pub async fn run_cycle_domain(
         tracing::debug!(%error, "feed seen recording failed");
     }
     let mut archive_queries = Vec::new();
+    let mut seen_archive_queries = std::collections::HashSet::new();
+    let mut add_archive_query = |query: String| {
+        if seen_archive_queries.insert(query.clone()) {
+            archive_queries.push(query);
+        }
+    };
     for series in cfg
         .series
         .iter()
         .filter(|series| series.enabled && domain != Some("movies"))
     {
-        archive_queries.push(series.name.clone());
-        archive_queries.extend(
-            series
-                .aliases
-                .iter()
-                .filter(|alias| !alias.trim().is_empty())
-                .cloned(),
-        );
+        add_archive_query(series.name.clone());
+        for alias in series
+            .aliases
+            .iter()
+            .filter(|alias| !alias.trim().is_empty())
+        {
+            add_archive_query(alias.clone());
+        }
     }
     if domain != Some("series") {
-        archive_queries.extend(
-            cfg.movies
-                .iter()
-                .filter(|movie| movie.enabled)
-                .map(|movie| movie.name.clone()),
-        );
+        for movie in cfg.movies.iter().filter(|movie| movie.enabled) {
+            add_archive_query(movie.name.clone());
+        }
     }
     let mut archive_hashes = std::collections::HashSet::new();
     for query in archive_queries {
@@ -171,12 +181,7 @@ pub async fn run_cycle_domain(
             let Some(hash) = magnet_hash(&magnet) else {
                 continue;
             };
-            if db
-                .lock()
-                .unwrap()
-                .is_blocklisted(&hash)
-                .unwrap_or(false)
-            {
+            if blocklisted_hashes.contains(&hash) {
                 continue;
             }
             if !archive_hashes.insert(hash) {
@@ -203,12 +208,7 @@ pub async fn run_cycle_domain(
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
-                if db
-                    .lock()
-                    .unwrap()
-                    .is_blocklisted(&hash)
-                    .unwrap_or(false)
-                {
+                if blocklisted_hashes.contains(&hash) {
                     continue;
                 }
                 ready_pending.insert(hash);
@@ -226,12 +226,7 @@ pub async fn run_cycle_domain(
                 continue;
             }
             if let Some(hash) = magnet_hash(&release.magnet) {
-                if db
-                    .lock()
-                    .unwrap()
-                    .is_blocklisted(&hash)
-                    .unwrap_or(false)
-                {
+                if blocklisted_hashes.contains(&hash) {
                     continue;
                 }
                 ready_pending.insert(hash);
@@ -335,12 +330,7 @@ pub async fn run_cycle_domain(
                 let Some(hash) = magnet_hash(&magnet) else {
                     continue;
                 };
-                if db
-                    .lock()
-                    .unwrap()
-                    .is_blocklisted(&hash)
-                    .unwrap_or(false)
-                {
+                if blocklisted_hashes.contains(&hash) {
                     continue;
                 }
                 if let Some(release) = parse_release(&title, &magnet, &format!("archive:{source}"))
@@ -606,11 +596,11 @@ pub async fn run_cycle_domain(
             }
         }
     }
-    let empty_archive_index = crate::models::ArchiveQualityIndex::default();
+    let empty_archive_index = Arc::new(crate::models::ArchiveQualityIndex::default());
     let mut archive_index_cache = std::collections::HashMap::new();
     // Downloads currently in the libtorrent session: do not propose an existing
     // hash or episode again, even when the database has not recorded it yet.
-    let live_downloads = {
+    let live_downloads = Arc::new({
         let mut live = crate::models::LiveDownloads::default();
         for torrent in torrents.list() {
             live.hashes.insert(torrent.hash.to_ascii_lowercase());
@@ -619,7 +609,7 @@ pub async fn run_cycle_domain(
             }
         }
         live
-    };
+    });
     let mut upgrades = 0usize;
     let mut new_items = 0usize;
     let mut started_details = Vec::new();
@@ -661,6 +651,7 @@ pub async fn run_cycle_domain(
         reconcile_pack_identity_from_magnet(&mut release);
         let is_ready_pending =
             magnet_hash(&release.magnet).is_some_and(|hash| ready_pending.contains(&hash));
+        let release_score = cfg.release_score(&release);
         // A candidate that fills a known archive gap, or that scores above the
         // bypass threshold, is never held by a delay profile.
         let is_gap = match (release.series.as_deref(), release.season, release.episode) {
@@ -671,7 +662,7 @@ pub async fn run_cycle_domain(
         };
         let bypass_delay = is_gap
             || (cfg.delay_bypass_score() > 0
-                && cfg.release_score(&release) >= cfg.delay_bypass_score());
+                && release_score >= cfg.delay_bypass_score());
         if release.kind == "series" && !is_ready_pending {
             if let Some(series) = release
                 .series
@@ -693,7 +684,7 @@ pub async fn run_cycle_domain(
                     db.lock().unwrap().queue_pending_scored(
                         &release,
                         delay_minutes,
-                        cfg.release_score(&release),
+                        release_score,
                     )?;
                     continue;
                 }
@@ -710,7 +701,7 @@ pub async fn run_cycle_domain(
                 db.lock().unwrap().queue_pending_movie_scored(
                     &release,
                     delay_minutes,
-                    cfg.release_score(&release),
+                    release_score,
                 )?;
                 continue;
             }
@@ -729,13 +720,13 @@ pub async fn run_cycle_domain(
                         .and_then(|name| cfg.find_series_match(name, season))
                         .map(|series| {
                             let archive = cfg.resolve_archive_path(series);
-                            crate::cleaner::index_archive(
+                            Arc::new(crate::cleaner::index_archive(
                                 &series.name,
                                 archive.as_deref().unwrap_or(std::path::Path::new("")),
                                 &cfg.settings,
-                            )
+                            ))
                         })
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| Arc::new(crate::models::ArchiveQualityIndex::default()))
                 })
                 .clone()
         } else {
@@ -761,14 +752,13 @@ pub async fn run_cycle_domain(
         };
         let (approved, approval_reason, score) = {
             let db = db.lock().unwrap();
-            let score = cfg.release_score(&release);
             let min_diff = cfg.upgrade_min_score_diff;
             let result = if release.kind == "series" {
-                db.check_series_scored(&release, score, min_diff, &approval_context)?
+                db.check_series_scored(&release, release_score, min_diff, &approval_context)?
             } else {
-                db.check_movie_scored_with(&release, score, min_diff, forbid_upgrade)?
+                db.check_movie_scored_with(&release, release_score, min_diff, forbid_upgrade)?
             };
-            (result.0, result.1, score)
+            (result.0, result.1, release_score)
         };
         let gap_episodes = gap_episodes_for_release(&release, &gap_targets);
         let from_archive = release.source.starts_with("archive:");

@@ -6,7 +6,10 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::io::AsyncWriteExt;
@@ -73,13 +76,62 @@ pub struct ComicDownload {
     pub speed_bytes: u64,
     pub eta_seconds: Option<u64>,
     pub error: Option<String>,
+    /// Free-form label assigned by the user, shown in the unified download list
+    /// together with the torrent tags. Kept in memory for the download lifetime
+    /// because the download row itself is not persisted.
+    pub tag: String,
+    /// Resolved URL the download is reading from.
+    pub url: String,
+    /// Final file path (available once the response headers are known).
+    pub destination: String,
+    /// Temporary `.part` path used while the download is in progress.
+    pub temporary: String,
     pub updated_at: String,
 }
 
+#[derive(Default)]
+struct HttpPaths {
+    temporary: Option<PathBuf>,
+    destination: Option<PathBuf>,
+}
+
+/// Runtime controls for one HTTP download. Kept beside the visible
+/// `ComicDownload` so pause/resume/cancel can act on the running task without
+/// leaking atomics into the JSON API. The spec (client/url/target/title) is
+/// stored here so a paused download can be resumed with a fresh task.
+struct HttpControl {
+    paused: AtomicBool,
+    cancelled: AtomicBool,
+    running: AtomicBool,
+    delete_on_cancel: AtomicBool,
+    url: String,
+    title: String,
+    target_dir: PathBuf,
+    client: reqwest::Client,
+    paths: Mutex<HttpPaths>,
+}
+
 static ACTIVE_HTTP_DOWNLOADS: OnceLock<Mutex<BTreeMap<String, ComicDownload>>> = OnceLock::new();
+static HTTP_CONTROLS: OnceLock<Mutex<BTreeMap<String, Arc<HttpControl>>>> = OnceLock::new();
 
 fn http_downloads_store() -> &'static Mutex<BTreeMap<String, ComicDownload>> {
     ACTIVE_HTTP_DOWNLOADS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn http_controls() -> &'static Mutex<BTreeMap<String, Arc<HttpControl>>> {
+    HTTP_CONTROLS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn http_control(id: &str) -> Option<Arc<HttpControl>> {
+    http_controls().lock().unwrap().get(id).cloned()
+}
+
+fn http_download_status(id: &str) -> Option<String> {
+    http_downloads_store()
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|download| download.status.clone())
 }
 
 fn update_http_download(id: &str, update: impl FnOnce(&mut ComicDownload)) {
@@ -87,6 +139,11 @@ fn update_http_download(id: &str, update: impl FnOnce(&mut ComicDownload)) {
         update(download);
         download.updated_at = chrono::Utc::now().to_rfc3339();
     }
+}
+
+fn remove_http_download(id: &str) {
+    http_downloads_store().lock().unwrap().remove(id);
+    http_controls().lock().unwrap().remove(id);
 }
 
 pub fn http_downloads() -> Vec<ComicDownload> {
@@ -100,7 +157,108 @@ pub fn http_downloads() -> Vec<ComicDownload> {
     items
 }
 
-fn register_http_download(title: &str, method: &str) -> String {
+/// Updates the user-assigned tag of an HTTP download. Returns `false` when the
+/// download is no longer in the store.
+pub fn set_http_download_tag(id: &str, tag: &str) -> bool {
+    let mut store = http_downloads_store().lock().unwrap();
+    match store.get_mut(id) {
+        Some(download) => {
+            download.tag = tag.trim().to_owned();
+            download.updated_at = chrono::Utc::now().to_rfc3339();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pauses a running HTTP download. The partial `.part` file is kept so the
+/// download can continue later with a Range request. The visible status moves
+/// to `paused` once the running task acknowledges the flag. Returns `false`
+/// when the download does not exist or is not currently downloading.
+pub fn pause_http_download(id: &str) -> bool {
+    if http_download_status(id).as_deref() != Some("downloading") {
+        return false;
+    }
+    let Some(control) = http_control(id) else {
+        return false;
+    };
+    control.paused.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Resumes a paused HTTP download, spawning a task when none is running.
+pub fn resume_http_download(id: &str) -> bool {
+    if http_download_status(id).as_deref() != Some("paused") {
+        return false;
+    }
+    let Some(control) = http_control(id) else {
+        return false;
+    };
+    control.cancelled.store(false, Ordering::SeqCst);
+    control.paused.store(false, Ordering::SeqCst);
+    update_http_download(id, |download| {
+        download.status = "downloading".into();
+        download.error = None;
+    });
+    if !control.running.load(Ordering::SeqCst) {
+        spawn_http_download(id.to_owned());
+    }
+    true
+}
+
+/// Removes a download from the list. With `delete_files` it also deletes the
+/// partial `.part` file and the finished file. Works for HTTP downloads and, at
+/// least as a list removal, for MEGA downloads.
+pub fn cancel_http_download(id: &str, delete_files: bool) -> bool {
+    match http_control(id) {
+        Some(control) => {
+            control.delete_on_cancel.store(delete_files, Ordering::SeqCst);
+            control.cancelled.store(true, Ordering::SeqCst);
+            control.paused.store(false, Ordering::SeqCst);
+            if !control.running.load(Ordering::SeqCst) {
+                finalize_cancelled(id, &control);
+            }
+            true
+        }
+        None => {
+            // MEGA or a download without controls: remove the row at least.
+            remove_http_download(id);
+            true
+        }
+    }
+}
+
+fn finalize_cancelled(id: &str, control: &HttpControl) {
+    remove_http_download(id);
+    if control.delete_on_cancel.load(Ordering::SeqCst) {
+        let paths = control.paths.lock().unwrap();
+        if let Some(temporary) = paths.temporary.as_ref() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        if let Some(destination) = paths.destination.as_ref() {
+            let _ = std::fs::remove_file(destination);
+        }
+    }
+}
+
+/// Removes finished (completed or errored) HTTP downloads from the list, used
+/// by "Pulisci completati". Files are kept, mirroring the torrent cleanup which
+/// never deletes the archived copy.
+pub fn clear_finished_http_downloads() -> usize {
+    let finished: Vec<String> = http_downloads_store()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, download)| matches!(download.status.as_str(), "completed" | "error"))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &finished {
+        remove_http_download(id);
+    }
+    finished.len()
+}
+
+fn register_http_download(title: &str, method: &str, url: &str) -> String {
     let id = format!("comic-{}", uuid::Uuid::new_v4());
     http_downloads_store().lock().unwrap().insert(
         id.clone(),
@@ -115,10 +273,45 @@ fn register_http_download(title: &str, method: &str) -> String {
             speed_bytes: 0,
             eta_seconds: None,
             error: None,
+            tag: String::new(),
+            url: url.to_owned(),
+            destination: String::new(),
+            temporary: String::new(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         },
     );
     id
+}
+
+fn install_http_control(
+    id: &str,
+    client: reqwest::Client,
+    url: &str,
+    target_dir: &Path,
+    title: &str,
+) -> Arc<HttpControl> {
+    let control = Arc::new(HttpControl {
+        paused: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        running: AtomicBool::new(false),
+        delete_on_cancel: AtomicBool::new(false),
+        url: url.to_owned(),
+        title: title.to_owned(),
+        target_dir: target_dir.to_path_buf(),
+        client,
+        paths: Mutex::new(HttpPaths::default()),
+    });
+    http_controls()
+        .lock()
+        .unwrap()
+        .insert(id.to_owned(), control.clone());
+    control
+}
+
+fn spawn_http_download(id: String) {
+    tokio::spawn(async move {
+        run_http_download(id).await;
+    });
 }
 
 #[derive(Clone)]
@@ -1336,14 +1529,70 @@ const HTTP_DOWNLOAD_ATTEMPTS: u32 = 3;
 /// pensato per le pagine HTML e taglierebbe i fumetti da decine/centinaia di MB.
 const HTTP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
 
+#[derive(Debug)]
+enum HttpOutcome {
+    Completed(PathBuf),
+    Paused,
+    Cancelled,
+}
+
+/// Applies the final state of a finished/paused/cancelled download to the
+/// visible row. Shared by the awaited and background entry points.
+fn handle_http_outcome(
+    id: &str,
+    control: &HttpControl,
+    outcome: Result<HttpOutcome>,
+) -> Result<PathBuf> {
+    match outcome {
+        Ok(HttpOutcome::Completed(path)) => {
+            update_http_download(id, |download| {
+                download.status = "completed".into();
+                download.progress = 100.0;
+                download.speed_bytes = 0;
+                download.eta_seconds = None;
+            });
+            tracing::info!(title=%control.title, download_id=%id, path=%path.display(), "comic HTTP download completed");
+            Ok(path)
+        }
+        Ok(HttpOutcome::Paused) => {
+            update_http_download(id, |download| {
+                download.status = "paused".into();
+                download.speed_bytes = 0;
+                download.eta_seconds = None;
+            });
+            Err(anyhow::anyhow!("comic download paused"))
+        }
+        Ok(HttpOutcome::Cancelled) => {
+            finalize_cancelled(id, control);
+            Err(anyhow::anyhow!("comic download cancelled"))
+        }
+        Err(error) => {
+            update_http_download(id, |download| {
+                download.status = "error".into();
+                download.error = Some(error.to_string());
+                download.speed_bytes = 0;
+                download.eta_seconds = None;
+            });
+            tracing::warn!(title=%control.title, download_id=%id, %error, "comic download failed");
+            Err(error)
+        }
+    }
+}
+
+/// Awaited HTTP download used by the automatic comics cycle. Registers a row
+/// and controls so it can still be paused/removed from the UI.
 pub async fn download_http(
     client: &reqwest::Client,
     url: &str,
     target_dir: &Path,
     title: &str,
 ) -> Result<PathBuf> {
-    let id = register_http_download(title, "http");
-    download_http_registered(client, url, target_dir, title, &id).await
+    let id = register_http_download(title, "http", url);
+    let control = install_http_control(&id, client.clone(), url, target_dir, title);
+    control.running.store(true, Ordering::SeqCst);
+    let outcome = download_http_registered(client, url, target_dir, title, &id, &control).await;
+    control.running.store(false, Ordering::SeqCst);
+    handle_http_outcome(&id, &control, outcome)
 }
 
 fn start_http_download(
@@ -1352,23 +1601,31 @@ fn start_http_download(
     target_dir: PathBuf,
     title: String,
 ) -> String {
-    let id = register_http_download(&title, "http");
+    let id = register_http_download(&title, "http", &url);
+    install_http_control(&id, client, &url, &target_dir, &title);
     tracing::info!(title=%title, download_id=%id, "comic HTTP download started");
-    let download_id = id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = download_http_registered(
-            &client,
-            &url,
-            &target_dir,
-            &title,
-            &download_id,
-        )
-        .await
-        {
-            tracing::warn!(title=%title, download_id=%download_id, %error, "comic background download failed");
-        }
-    });
+    spawn_http_download(id.clone());
     id
+}
+
+/// Drives one background HTTP download to completion, pause or cancellation and
+/// updates the visible row accordingly.
+async fn run_http_download(id: String) {
+    let Some(control) = http_control(&id) else {
+        return;
+    };
+    control.running.store(true, Ordering::SeqCst);
+    let outcome = download_http_registered(
+        &control.client,
+        &control.url,
+        &control.target_dir,
+        &control.title,
+        &id,
+        &control,
+    )
+    .await;
+    control.running.store(false, Ordering::SeqCst);
+    let _ = handle_http_outcome(&id, &control, outcome);
 }
 
 async fn download_http_registered(
@@ -1377,15 +1634,18 @@ async fn download_http_registered(
     target_dir: &Path,
     title: &str,
     id: &str,
-) -> Result<PathBuf> {
-    let mut outcome: Option<PathBuf> = None;
+    control: &HttpControl,
+) -> Result<HttpOutcome> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=HTTP_DOWNLOAD_ATTEMPTS {
-        match download_http_once(client, &id, url, target_dir, title).await {
-            Ok(path) => {
-                outcome = Some(path);
-                break;
-            }
+        if control.cancelled.load(Ordering::SeqCst) {
+            return Ok(HttpOutcome::Cancelled);
+        }
+        if control.paused.load(Ordering::SeqCst) {
+            return Ok(HttpOutcome::Paused);
+        }
+        match download_http_once(client, id, url, target_dir, title, control).await {
+            Ok(outcome) => return Ok(outcome),
             Err(error) => {
                 let error = error.context(format!("GET {url}"));
                 if attempt < HTTP_DOWNLOAD_ATTEMPTS {
@@ -1396,29 +1656,7 @@ async fn download_http_registered(
             }
         }
     }
-    let result = match (outcome, last_error) {
-        (Some(path), _) => Ok(path),
-        (None, Some(error)) => Err(error),
-        (None, None) => Err(anyhow::anyhow!("comic download failed")),
-    };
-    match &result {
-        Ok(_) => update_http_download(&id, |download| {
-            download.status = "completed".into();
-            download.progress = 100.0;
-            download.speed_bytes = 0;
-            download.eta_seconds = None;
-        }),
-        Err(error) => update_http_download(&id, |download| {
-            download.status = "error".into();
-            download.error = Some(error.to_string());
-            download.speed_bytes = 0;
-            download.eta_seconds = None;
-        }),
-    }
-    if let Ok(path) = &result {
-        tracing::info!(title=%title, download_id=%id, path=%path.display(), "comic HTTP download completed");
-    }
-    result
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("comic download failed")))
 }
 
 async fn download_http_once(
@@ -1427,7 +1665,14 @@ async fn download_http_once(
     url: &str,
     target_dir: &Path,
     title: &str,
-) -> Result<PathBuf> {
+    control: &HttpControl,
+) -> Result<HttpOutcome> {
+    if control.cancelled.load(Ordering::SeqCst) {
+        return Ok(HttpOutcome::Cancelled);
+    }
+    if control.paused.load(Ordering::SeqCst) {
+        return Ok(HttpOutcome::Paused);
+    }
     let parsed = url::Url::parse(url).context("invalid comic download URL")?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         anyhow::bail!("invalid comic download URL");
@@ -1451,6 +1696,17 @@ async fn download_http_once(
     );
     let destination = target_dir.join(filename);
     let temporary = destination.with_extension("part");
+    // Record the paths as soon as they are known so pause/cancel/remove can act
+    // even when no task is running (for example while paused).
+    {
+        let mut paths = control.paths.lock().unwrap();
+        paths.destination = Some(destination.clone());
+        paths.temporary = Some(temporary.clone());
+    }
+    update_http_download(id, |download| {
+        download.destination = destination.display().to_string();
+        download.temporary = temporary.display().to_string();
+    });
     let offset = std::fs::metadata(&temporary)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -1467,7 +1723,7 @@ async fn download_http_once(
     // Il file `.part` era già completo: il server risponde 416 e basta rinominarlo.
     if offset > 0 && response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         std::fs::rename(&temporary, &destination)?;
-        return Ok(destination);
+        return Ok(HttpOutcome::Completed(destination));
     }
     let mut response = response.error_for_status()?;
     if response
@@ -1496,10 +1752,22 @@ async fn download_http_once(
     update_http_download(id, |download| {
         download.total_bytes = total;
         download.downloaded_bytes = base;
+        download.status = "downloading".into();
+        download.error = None;
     });
     let started = Instant::now();
     let mut downloaded = base;
     while let Some(chunk) = response.chunk().await? {
+        // Pausa/annulla vengono onorati prima di scrivere il blocco: il file su
+        // disco resta la base da cui riparte la Range request.
+        if control.cancelled.load(Ordering::SeqCst) {
+            file.flush().await?;
+            return Ok(HttpOutcome::Cancelled);
+        }
+        if control.paused.load(Ordering::SeqCst) {
+            file.flush().await?;
+            return Ok(HttpOutcome::Paused);
+        }
         file.write_all(&chunk).await?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         let speed =
@@ -1526,7 +1794,7 @@ async fn download_http_once(
         anyhow::bail!("comic download is empty");
     }
     std::fs::rename(&temporary, &destination)?;
-    Ok(destination)
+    Ok(HttpOutcome::Completed(destination))
 }
 
 pub async fn download_torrent_file(
@@ -1560,7 +1828,7 @@ pub async fn download_torrent_file(
 }
 
 pub async fn download_mega(executable: &Path, url: &str, target_dir: &Path) -> Result<PathBuf> {
-    let id = register_http_download(url, "mega");
+    let id = register_http_download(url, "mega", url);
     let result = download_mega_inner(executable, url, target_dir).await;
     match &result {
         Ok(_) => update_http_download(&id, |download| {
@@ -1810,6 +2078,64 @@ mod tests {
             "The Amazing Spider Man"
         );
         assert_eq!(clean_search_title(""), "");
+    }
+
+    #[test]
+    fn http_download_tag_is_trimmed_and_reported_when_missing() {
+        let id = register_http_download("Test Comic", "http", "https://example.test/file.cbz");
+        assert!(set_http_download_tag(&id, "  fumetti  "));
+        let download = http_downloads()
+            .into_iter()
+            .find(|item| item.id == id)
+            .expect("registered download");
+        assert_eq!(download.tag, "fumetti");
+        assert_eq!(download.url, "https://example.test/file.cbz");
+        assert!(!set_http_download_tag("missing-download", "x"));
+        remove_http_download(&id);
+    }
+
+    #[test]
+    fn cancelling_a_download_removes_it_and_deletes_files_when_asked() {
+        let dir = std::env::temp_dir().join(format!(
+            "rextto-http-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("file.cbz");
+        let temporary = dir.join("file.part");
+        std::fs::write(&destination, b"done").unwrap();
+        std::fs::write(&temporary, b"part").unwrap();
+        let id = register_http_download("Cancel Comic", "http", "https://example.test/file.cbz");
+        let control = install_http_control(
+            &id,
+            reqwest::Client::new(),
+            "https://example.test/file.cbz",
+            &dir,
+            "Cancel Comic",
+        );
+        {
+            let mut paths = control.paths.lock().unwrap();
+            paths.destination = Some(destination.clone());
+            paths.temporary = Some(temporary.clone());
+        }
+        assert!(cancel_http_download(&id, true));
+        assert!(http_downloads().iter().all(|item| item.id != id));
+        assert!(!destination.exists());
+        assert!(!temporary.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_finished_http_downloads_skips_active_rows() {
+        let finished = register_http_download("Done Comic", "http", "https://example.test/a");
+        let active = register_http_download("Active Comic", "http", "https://example.test/b");
+        update_http_download(&finished, |download| download.status = "completed".into());
+        update_http_download(&active, |download| download.status = "downloading".into());
+        assert!(clear_finished_http_downloads() >= 1);
+        let remaining = http_downloads();
+        assert!(remaining.iter().all(|item| item.id != finished));
+        assert!(remaining.iter().any(|item| item.id == active));
+        remove_http_download(&active);
     }
 
     #[test]
