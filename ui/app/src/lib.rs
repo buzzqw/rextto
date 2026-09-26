@@ -9997,7 +9997,7 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
         <Panel title="Indexer e FlareSolverr">
             <div class="table-wrap">
                 <table class="data-table">
-                    <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("URL")}</th><th>{ctx_tr("Abilitato")}</th><th>{ctx_tr("Raggiungibile")}</th></tr></thead>
+                    <thead><tr><th>{ctx_tr("Nome")}</th><th>{ctx_tr("URL")}</th><th>{ctx_tr("Abilitato")}</th><th>{ctx_tr("Stato API")}</th></tr></thead>
                     <tbody>
                         {move || {
                             let items = indexers.get();
@@ -10007,13 +10007,26 @@ fn ServicesPanel(data: RwSignal<Data>) -> impl IntoView {
                             items.into_iter().map(|entry| {
                                 let is_flaresolverr = text(&entry, "kind", "") == "flaresolverr";
                                 let reachable = entry.get("reachable").and_then(Value::as_bool).unwrap_or(false);
+                                let healthy = entry.get("healthy").and_then(Value::as_bool).unwrap_or(reachable);
                                 let status = entry.get("status").and_then(Value::as_i64).map(|value| value.to_string()).unwrap_or_else(|| "-".into());
+                                let error = text(&entry, "error", "");
+                                let state_label = if !reachable {
+                                    tr(data, "non raggiungibile")
+                                } else if !healthy {
+                                    if error.is_empty() {
+                                        format!("{} ({status})", tr(data, "errore API"))
+                                    } else {
+                                        format!("{}: {error}", tr(data, "errore API"))
+                                    }
+                                } else {
+                                    format!("{} ({status})", tr(data, "ok"))
+                                };
                                 view! {
-                                    <tr title=if is_flaresolverr { Some(ctx_tr("Servizio FlareSolverr configurato come supporto anti-Cloudflare").get()) } else { None }>
+                                    <tr title=if !error.is_empty() { Some(error.clone()) } else if is_flaresolverr { Some(ctx_tr("Servizio FlareSolverr configurato come supporto anti-Cloudflare").get()) } else { None }>
                                         <td>{text(&entry, "name", "-")}</td>
                                         <td class="mono truncate muted">{text(&entry, "url", "-")}</td>
                                          <td><span class="badge ok">{if is_flaresolverr { tr(data, "configurato") } else { tr(data, "sì") }}</span></td>
-                                         <td><span class="badge" class:ok=reachable class:err=!reachable>{if reachable { format!("{} ({status})", tr(data, "ok")) } else { tr(data, "non raggiungibile") }}</span></td>
+                                         <td><span class="badge" class:ok=healthy class:err=!healthy>{state_label}</span></td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
