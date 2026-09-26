@@ -10,6 +10,7 @@ pub mod comics;
 pub mod config;
 pub mod constants;
 pub mod database;
+pub mod decision;
 pub mod engine;
 pub mod health;
 pub mod hooks;

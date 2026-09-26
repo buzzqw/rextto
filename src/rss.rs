@@ -72,6 +72,10 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
     let mut magnet = String::new();
     let mut torrent_url = String::new();
     let mut description = String::new();
+    // Jackett può includere il tracker reale nel campo `jackettindexer`.
+    // Manteniamo comunque il nome dell'adapter come prefisso: i filtri per
+    // sorgente già configurati continuano a funzionare.
+    let mut item_source = source.to_string();
     let mut size_bytes: Option<f64> = None;
     // Torznab attributes (`<torznab:attr name="seeders" value="5"/>`) or plain
     // `<seeders>` elements. Unknown stays `None` so policy rules that need a
@@ -101,18 +105,36 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                     magnet.clear();
                     torrent_url.clear();
                     description.clear();
+                    item_source = source.to_string();
                     size_bytes = None;
                     seeders = None;
                     peers = None;
                     discovered_at = Utc::now();
                 }
                 if in_item {
+                    if name == "jackettindexer" {
+                        if let Some(value) = attribute(&start, "name")
+                            .or_else(|| attribute(&start, "value"))
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            item_source = format!("{source}:{}", value.trim());
+                        }
+                    }
                     if name == "enclosure" {
                         if let Some(value) = attribute(&start, "length") {
                             size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                         }
                     }
                     if name == "attr" {
+                        if attribute(&start, "name")
+                            .is_some_and(|value| value.eq_ignore_ascii_case("jackettindexer"))
+                        {
+                            if let Some(value) = attribute(&start, "value")
+                                .filter(|value| !value.trim().is_empty())
+                            {
+                                item_source = format!("{source}:{}", value.trim());
+                            }
+                        }
                         apply_torznab_attr(&start, &mut size_bytes, &mut seeders, &mut peers);
                     }
                     if let Some(value) =
@@ -129,12 +151,29 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
             }
             Event::Empty(start) if in_item => {
                 let name = local_name(start.name().as_ref());
+                if name == "jackettindexer" {
+                    if let Some(value) = attribute(&start, "name")
+                        .or_else(|| attribute(&start, "value"))
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        item_source = format!("{source}:{}", value.trim());
+                    }
+                }
                 if name == "enclosure" {
                     if let Some(value) = attribute(&start, "length") {
                         size_bytes = value.trim().parse::<f64>().ok().filter(|v| *v > 0.0);
                     }
                 }
                 if name == "attr" {
+                    if attribute(&start, "name")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("jackettindexer"))
+                    {
+                        if let Some(value) = attribute(&start, "value")
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            item_source = format!("{source}:{}", value.trim());
+                        }
+                    }
                     apply_torznab_attr(&start, &mut size_bytes, &mut seeders, &mut peers);
                 }
                 if name == "link" || name == "enclosure" || name == "content" {
@@ -153,6 +192,9 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                 let value = text.unescape()?.into_owned();
                 if current == "title" {
                     title = value.clone();
+                }
+                if current == "jackettindexer" && !value.trim().is_empty() {
+                    item_source = format!("{source}:{}", value.trim());
                 }
                 if current == "description" {
                     description.push_str(&value);
@@ -238,7 +280,7 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
                             &title,
                             &magnet,
                             (!torrent_url.is_empty()).then_some(torrent_url.as_str()),
-                            source,
+                            &item_source,
                             discovered_at,
                         ) {
                             release.size_bytes = size_bytes
@@ -259,6 +301,29 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
         }
     }
     Ok(out)
+}
+
+/// Torznab usa HTTP 200 anche per errori applicativi, ad esempio API key
+/// errata o indexer non disponibile. Senza questo controllo il parser
+/// restituirebbe semplicemente zero risultati e il provider verrebbe marcato
+/// come sano, impedendo il backoff corretto di Jackett.
+fn torznab_error(body: &str) -> Option<String> {
+    let mut reader = Reader::from_str(body);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(start) | Event::Empty(start)
+                if local_name(start.name().as_ref()) == "error" =>
+            {
+                let code = attribute(&start, "code").unwrap_or_else(|| "?".into());
+                let description = attribute(&start, "description")
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "errore Torznab".into());
+                return Some(format!("Torznab {code}: {description}"));
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 fn is_cloudflare_challenge(body: &str) -> bool {
@@ -1117,6 +1182,9 @@ pub async fn fetch_torznab_flaresolverr(
             (content_type, body)
         }
     };
+    if let Some(error) = torznab_error(&body) {
+        return Err(anyhow::anyhow!(error));
+    }
     // Torznab/Prowlarr replies can be large. XML/JSON decoding also invokes the
     // release parser for every item, all of which is synchronous CPU work. Do
     // not let that monopolize Tokio's workers (and consequently Axum's accept
@@ -1130,6 +1198,24 @@ pub async fn fetch_torznab_flaresolverr(
         }
     })
     .await?
+}
+
+/// Endpoint read-only usato dal controllo salute. Per Jackett `t=caps` valida
+/// sia il servizio sia l'API key, a differenza di una semplice GET alla home.
+/// Gli altri adapter mantengono il probe storico e quindi non cambiano
+/// comportamento.
+pub(crate) fn health_probe_url(indexer: &IndexerConfig) -> String {
+    let endpoint = torznab_endpoint(indexer);
+    if !endpoint.contains("/api/v2.0/indexers/") {
+        return indexer.url.clone();
+    }
+    let Ok(mut url) = url::Url::parse(&endpoint) else {
+        return indexer.url.clone();
+    };
+    url.query_pairs_mut()
+        .append_pair("t", "caps")
+        .append_pair("apikey", &indexer.api_key);
+    url.to_string()
 }
 
 #[cfg(test)]
@@ -1191,6 +1277,41 @@ mod tests {
         let releases = parse_prowlarr_json(body, "prowlarr").unwrap();
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].source, "prowlarr:Knaben");
+    }
+
+    #[test]
+    fn detects_torznab_application_errors_in_http_200_responses() {
+        let body = r#"<rss><channel><error code="202" description="No indexers configured" /></channel></rss>"#;
+        assert_eq!(
+            torznab_error(body).as_deref(),
+            Some("Torznab 202: No indexers configured")
+        );
+    }
+
+    #[test]
+    fn keeps_jackett_tracker_identity_in_release_source() {
+        let body = r#"<rss><channel><item>
+            <title>Example.Show.S01E01.1080p.WEB-DL</title>
+            <attr name="jackettindexer" value="Tracker One" />
+            <link>magnet:?xt=urn:btih:0123456789012345678901234567890123456789</link>
+        </item></channel></rss>"#;
+        let releases = parse_feed_body(body, "jackett").unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].source, "jackett:Tracker One");
+    }
+
+    #[test]
+    fn jackett_health_probe_validates_api_key() {
+        let jackett = IndexerConfig {
+            name: "jackett".into(),
+            url: "http://host:9117".into(),
+            api_key: "secret".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            health_probe_url(&jackett),
+            "http://host:9117/api/v2.0/indexers/all/results/torznab/api?t=caps&apikey=secret"
+        );
     }
 
     #[test]

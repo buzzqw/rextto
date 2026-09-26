@@ -607,6 +607,10 @@ pub struct SearchAddInput {
     pub release: Release,
 }
 #[derive(serde::Deserialize)]
+pub struct ExplainReleaseInput {
+    pub release: Release,
+}
+#[derive(serde::Deserialize)]
 pub struct ArchiveAddInput {
     pub title: String,
     pub magnet: String,
@@ -1081,6 +1085,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/scan-all-archives", post(scan_all_archives))
         .route("/api/database/rescore", post(rescore_database))
         .route("/api/score/preview", post(score_preview))
+        .route("/api/search/explain", post(explain_release))
         .route("/api/database/cleanup", post(cleanup_database))
         .route("/api/log-level", post(set_log_level))
         .route("/api/log_level", get(log_level_get).post(set_log_level))
@@ -6751,6 +6756,56 @@ async fn score_preview(
         })),
     )
 }
+/// Spiegazione read-only dei controlli applicati a una release. Non registra la
+/// release e non crea placeholder: può quindi essere chiamata anche per
+/// risultati che l'utente vuole soltanto confrontare.
+async fn explain_release(
+    State(s): State<AppState>,
+    Json(input): Json<ExplainReleaseInput>,
+) -> impl IntoResponse {
+    if input.release.title.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"release senza titolo"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    // Scanning a NAS/archive can be slow. Keep it off Tokio's async workers;
+    // the database remains read-only and is queried only after the scan.
+    let scan_cfg = cfg.clone();
+    let scan_release = input.release.clone();
+    let disk = match tokio::task::spawn_blocking(move || {
+        crate::decision::archive_quality(&scan_cfg, &scan_release)
+    })
+    .await
+    {
+        Ok(disk) => disk,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok":false,"error":format!("archive scan failed: {error}")})),
+            )
+        }
+    };
+    let result = s
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database lock poisoned"))
+        .and_then(|db| {
+            crate::decision::explain_with_archive(&cfg, &db, &input.release, disk)
+        });
+    match result {
+        Ok(trace) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok":true,"trace":trace})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"ok":false,"error":error.to_string()})),
+        ),
+    }
+}
+
 async fn rescore_database(State(s): State<AppState>) -> impl IntoResponse {
     if s.cfg.dry_run {
         return (
@@ -10579,7 +10634,10 @@ async fn services_status(State(s): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     let mut indexers = Vec::new();
     for indexer in cfg.indexers.iter().filter(|indexer| indexer.enabled) {
-        let status = match client.get(&indexer.url).send().await {
+        // Per Jackett la home può rispondere anche quando l'API key o
+        // l'endpoint Torznab non funzionano: il probe dedicato usa `t=caps`.
+        let probe_url = crate::rss::health_probe_url(indexer);
+        let status = match client.get(&probe_url).send().await {
             Ok(response) => Some(response.status().as_u16()),
             Err(_) => None,
         };

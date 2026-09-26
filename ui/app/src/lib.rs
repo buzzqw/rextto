@@ -88,6 +88,13 @@ struct GlobalSearch {
     elapsed: RwSignal<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct DecisionExplanationState {
+    trace: RwSignal<Option<Value>>,
+    loading: RwSignal<bool>,
+    error: RwSignal<String>,
+}
+
 /// Tab del pannello Configurazione (id interno -> etichetta).
 const SETTINGS_TABS: &[(&str, &str)] = &[
     ("daemon", "Daemon"),
@@ -1080,6 +1087,11 @@ pub fn App() -> impl IntoView {
         searched: RwSignal::new(false),
         elapsed: RwSignal::new(0),
     });
+    provide_context(DecisionExplanationState {
+        trace: RwSignal::new(None),
+        loading: RwSignal::new(false),
+        error: RwSignal::new(String::new()),
+    });
     provide_context(SettingsNav {
         tab: RwSignal::new("daemon".to_string()),
         focus: RwSignal::new(None),
@@ -1435,7 +1447,103 @@ pub fn App() -> impl IntoView {
                 </main>
                 <ToastHost data />
                 <SettingsSearchOverlay page=page />
+                <DecisionExplanationOverlay />
             </div>
+    }
+}
+
+#[component]
+fn ExplainReleaseButton(release: Value) -> impl IntoView {
+    let state = use_context::<DecisionExplanationState>().expect("decision explanation context");
+    view! {
+        <button
+            type="button"
+            class="btn sm"
+            title=ctx_tr("Mostra le regole applicate e il confronto con l'archivio")
+            on:click=move |_| {
+                let state = state;
+                let release = release.clone();
+                state.loading.set(true);
+                state.error.set(String::new());
+                state.trace.set(None);
+                spawn_local(async move {
+                    match send("POST", "/api/search/explain", Some(json!({"release": release}))).await {
+                        Ok(value) => state.trace.set(value.get("trace").cloned()),
+                        Err(error) => state.error.set(error),
+                    }
+                    state.loading.set(false);
+                });
+            }
+        >{ctx_tr("Perché non questa?")}</button>
+    }
+}
+
+#[component]
+fn DecisionExplanationOverlay() -> impl IntoView {
+    let state = use_context::<DecisionExplanationState>().expect("decision explanation context");
+    view! {
+        <Show when=move || state.loading.get() || !state.error.get().is_empty() || state.trace.get().is_some()>
+            <div class="modal-backdrop" on:click=move |_| {
+                if !state.loading.get() { state.trace.set(None); state.error.set(String::new()); }
+            }>
+                <div class="modal" style="width:min(820px,100%)" on:click=move |event: leptos::ev::MouseEvent| event.stop_propagation()>
+                    <div class="modal-head">
+                        <strong>{ctx_tr("Perché non questa?")}</strong>
+                        <button type="button" class="btn sm" on:click=move |_| { state.trace.set(None); state.error.set(String::new()); }>{ctx_tr("Chiudi")}</button>
+                    </div>
+                    <div class="modal-body">
+                        <Show when=move || state.loading.get()>
+                            <div class="search-status"><span class="spinner"></span>{ctx_tr("Analisi delle regole…")}</div>
+                        </Show>
+                        <Show when=move || !state.error.get().is_empty()>
+                            <div class="notice err">{move || state.error.get()}</div>
+                        </Show>
+                        {move || state.trace.get().map(|trace| {
+                            let decision = text(&trace, "decision", "unknown");
+                            let decision_label = if decision == "eligible" { "Idonea (controlli candidato)" } else { "Rifiutata" };
+                            let decision_ok = decision == "eligible";
+                            let steps = array(&trace, "steps");
+                            view! {
+                                <div class="stack">
+                                    <div>
+                                        <strong>{text(&trace, "candidate", "Release")}</strong>
+                                        <small class="muted">{text(&trace, "target", "")}</small>
+                                    </div>
+                                    <div class="toolbar">
+                                        <span class="badge" class:ok=decision_ok class:err=!decision_ok>{decision_label}</span>
+                                        <span class="muted">{format!("Score: {}", number(&trace, "score"))}</span>
+                                        <span class="muted">{text(&trace, "reason", "")}</span>
+                                    </div>
+                                    <div class="toolbar muted">
+                                        {array(&trace, "score_components").into_iter().map(|component| view! {
+                                            <span>{format!("{}: {}", text(&component, "label", ""), number(&component, "value"))}</span>
+                                        }).collect_view()}
+                                    </div>
+                                    <div class="table-wrap">
+                                        <table class="data-table">
+                                            <thead><tr><th>{ctx_tr("Regola")}</th><th>{ctx_tr("Esito")}</th><th>{ctx_tr("Dettaglio")}</th></tr></thead>
+                                            <tbody>{steps.into_iter().map(|item| {
+                                                let result = text(&item, "result", "info");
+                                                let passed = result == "pass";
+                                                let failed = result == "fail";
+                                                let label = match result.as_str() { "pass" => "Superata", "fail" => "Bloccante", _ => "Informativa" };
+                                                view! {
+                                                    <tr>
+                                                        <td>{text(&item, "rule", "-")}</td>
+                                                        <td><span class="badge" class:ok=passed class:err=failed>{label}</span></td>
+                                                        <td class="truncate">{text(&item, "detail", "")}</td>
+                                                    </tr>
+                                                }
+                                            }).collect_view()}</tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            }
+                        })}
+                    </div>
+                </div>
+            </div>
+        </Show>
     }
 }
 
@@ -1900,7 +2008,7 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                                             <td class="muted">{text(&item, "source", "-")}</td>
                                             <td class="muted">{text(&quality, "resolution", "-")}</td>
                                             <td class="muted">{text(&quality, "codec", "-")}</td>
-                                            <td><button class="btn sm primary" on:click=move |_| { let release = release.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></td>
+                                            <td><div class="toolbar"><ExplainReleaseButton release=release.clone() /><button class="btn sm primary" on:click=move |_| { let release = release.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></div></td>
                                         </tr>
                                     }
                                 }).collect_view()}
@@ -5320,7 +5428,7 @@ fn EpisodeTable(
                                                                 <div class="episode-search-item">
                                                                     <span class="truncate">{text(&release, "title", "Release")}</span>
                                                                     <span class="muted">{text(&release, "source", "-")}{if origin.is_empty() { String::new() } else { format!(" · {origin}") }}</span>
-                                                                    <button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
+                                                                    <ExplainReleaseButton release=queued.clone() /><button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
                                                                 </div>
                                                             }
                                                         }).collect_view()}
@@ -5349,7 +5457,7 @@ fn EpisodeTable(
                                                                 <div class="episode-search-item">
                                                                     <span class="truncate">{text(&release, "title", "Release")}</span>
                                                                     <span class="muted">{text(&release, "source", "-")}{if origin.is_empty() { String::new() } else { format!(" · {origin}") }}</span>
-                                                                    <button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
+                                                                    <ExplainReleaseButton release=queued.clone() /><button class="btn sm primary" on:click=move |_| run_post(data, "/api/search/add", Some(json!({"release": queued.clone()})), "Release accodata")>{ctx_tr("Accoda")}</button>
                                                                 </div>
                                                             }
                                                         }).collect_view()}
@@ -5745,7 +5853,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                         <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Fonte")}</th><th></th></tr></thead>
                                         <tbody>{move || best_matches.get().iter().filter(|release| matches_release_filter(release, &best_filter.get())).cloned().map(|release| {
                                             let queued = release.clone();
-                                            view! { <tr><td class="truncate">{text(&release, "title", "Release")}</td><td class="muted">{text(&release, "source", "-")}</td><td><button class="btn sm primary" on:click=move |_| { let release = queued.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></td></tr> }
+                                            view! { <tr><td class="truncate">{text(&release, "title", "Release")}</td><td class="muted">{text(&release, "source", "-")}</td><td><div class="toolbar"><ExplainReleaseButton release=queued.clone() /><button class="btn sm primary" on:click=move |_| { let release = queued.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></div></td></tr> }
                                         }).collect_view()}</tbody>
                                     </table>
                                 </div>
@@ -5986,7 +6094,7 @@ fn Discovery(data: RwSignal<Data>, page: RwSignal<String>) -> impl IntoView {
                                         <td class="muted">{text(&item, "source", "-")}</td>
                                         <td class="muted">{resolution}</td>
                                         <td class="muted">{codec}</td>
-                                        <td><button class="btn sm primary" on:click=move |_| { let release = release.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></td>
+                                        <td><div class="toolbar"><ExplainReleaseButton release=release.clone() /><button class="btn sm primary" on:click=move |_| { let release = release.clone(); run_post(data, "/api/search/add", Some(json!({"release": release})), "Release accodata"); }>{ctx_tr("Accoda")}</button></div></td>
                                     </tr>
                                 }
                             }).collect_view()}
