@@ -537,6 +537,8 @@ eng:
   "presenti": "present"
   "Eliminare la serie \"{name}\"? I file già archiviati non vengono toccati.": "Delete series \"{name}\"? Already archived files are not affected."
   "Eliminare il film \"{name}\"? I file già archiviati non vengono toccati.": "Delete movie \"{name}\"? Already archived files are not affected."
+  "Eliminare la serie \"{name}\"? I file non vengono toccati, ma Rextto dimentica questa serie (stato, episodi e metadati).": "Delete series \"{name}\"? Files are not touched, but Rextto forgets this series (state, episodes and metadata)."
+  "Eliminare il film \"{name}\"? I file non vengono toccati, ma Rextto dimentica questo film (stato e metadati).": "Delete movie \"{name}\"? Files are not touched, but Rextto forgets this movie (state and metadata)."
   "Eliminare i file dal disco? L'operazione non è reversibile.": "Delete the files from disk? This operation cannot be undone."
   "Metadata in attesa": "Metadata pending"
   "Nome nuova cartella": "New folder name"

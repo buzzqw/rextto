@@ -4501,7 +4501,7 @@ fn Library(data: RwSignal<Data>, mode: &'static str) -> impl IntoView {
                                                     <button class="btn sm primary" on:click=move |_| selected.set(Some(detail_name.clone()))>{ctx_tr("Dettagli")}</button>
                                                      <button class="btn sm" on:click=move |_| toggle_enabled(data, "series", editor_name.clone())>{if enabled { ctx_tr("Pausa") } else { ctx_tr("Attiva") }}</button>
                                                     <button class="btn sm danger" on:click=move |_| {
-                                                        if confirm_dialog(&tr_format(data, "Eliminare la serie \"{name}\"? I file già archiviati non vengono toccati.", &[("{name}", delete_name.clone())])) {
+                                                        if confirm_dialog(&tr_format(data, "Eliminare la serie \"{name}\"? I file non vengono toccati, ma Rextto dimentica questa serie (stato, episodi e metadati).", &[("{name}", delete_name.clone())])) {
                                                             remove_library(data, "series", delete_name.clone());
                                                         }
                                                     }>{ctx_tr("Elimina")}</button>
@@ -5529,7 +5529,7 @@ fn MoviePanel(data: RwSignal<Data>, selected: RwSignal<Option<i64>>) -> impl Int
                                                     <div class="toolbar">
                                                          <button class="btn sm" on:click=move |_| toggle_enabled(data, "movies", toggle_name.clone())>{if enabled { ctx_tr("Pausa") } else { ctx_tr("Attiva") }}</button>
                                                         <button class="btn sm danger" on:click=move |_| {
-                                                            if confirm_dialog(&tr_format(data, "Eliminare il film \"{name}\"? I file già archiviati non vengono toccati.", &[("{name}", delete_name.clone())])) {
+                                                            if confirm_dialog(&tr_format(data, "Eliminare il film \"{name}\"? I file non vengono toccati, ma Rextto dimentica questo film (stato e metadati).", &[("{name}", delete_name.clone())])) {
                                                                 remove_library(data, "movies", delete_name.clone());
                                                             }
                                                         }>{ctx_tr("Elimina")}</button>

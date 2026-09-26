@@ -3419,6 +3419,60 @@ impl Database {
         Ok(removed)
     }
 
+    /// Rimuove tutto lo stato di una serie non più monitorata: quando l'utente
+    /// la elimina dall'elenco non deve restare nulla che i worker possano
+    /// ancora elaborare (backfill MediaInfo, gap fill, rinomina, metadati).
+    /// I "visti dai feed" e la blocklist restano intatti: sono indipendenti
+    /// dalla libreria e coprono di proposito anche i titoli non monitorati.
+    /// Ritorna il numero di righe rimosse.
+    pub fn purge_series(&self, name: &str) -> Result<usize> {
+        let mut removed = 0usize;
+        let series_ids: Vec<i64> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id FROM series WHERE lower(name)=lower(?1)")?;
+            let rows = statement.query_map([name], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in series_ids {
+            removed += self
+                .conn
+                .execute("DELETE FROM episodes WHERE series_id=?1", [id])?;
+            removed += self
+                .conn
+                .execute("DELETE FROM pending_downloads WHERE series_id=?1", [id])?;
+            removed += self.conn.execute("DELETE FROM series WHERE id=?1", [id])?;
+        }
+        for table in [
+            "series_metadata",
+            "episode_metadata",
+            "ignored_episodes",
+            "gap_search_log",
+            "series_status",
+        ] {
+            removed += self.conn.execute(
+                &format!("DELETE FROM {table} WHERE lower(series_name)=lower(?1)"),
+                [name],
+            )?;
+        }
+        Ok(removed)
+    }
+
+    /// Come [`Self::purge_series`] per un film. L'identità dei download è il
+    /// nome, quindi il confronto è case-insensitive.
+    pub fn purge_movie(&self, name: &str) -> Result<usize> {
+        let mut removed = 0usize;
+        removed += self.conn.execute(
+            "DELETE FROM pending_movies WHERE lower(name)=lower(?1)",
+            [name],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM movies WHERE lower(COALESCE(name,''))=lower(?1)",
+            [name],
+        )?;
+        Ok(removed)
+    }
+
     /// Anteprima della pulizia per parola chiave: elenca gli elementi che
     /// corrispondono (torrent, film, episodi, serie e "visti nei feed") senza
     /// rimuoverli, così l'utente vede *cosa* verrebbe eliminato.
@@ -4128,6 +4182,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn purge_series_removes_every_trace() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-purge-series-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute("INSERT INTO series(name) VALUES ('Gone')", [])
+            .unwrap();
+        let id: i64 = db
+            .conn
+            .query_row("SELECT id FROM series WHERE name='Gone'", [], |row| row.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO episodes(series_id,season,episode,title,archive_path) VALUES (?1,1,1,'Gone.S01E01','/nas/gone/e1.mkv')",
+                [id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pending_downloads(series_id,season,episode,status) VALUES (?1,1,1,'pending')",
+                [id],
+            )
+            .unwrap();
+        for statement in [
+            "INSERT INTO series_metadata(series_name,season,episode_count,updated_at) VALUES ('Gone',1,1,datetime('now'))",
+            "INSERT INTO episode_metadata(series_name,season,episode,air_date,updated_at) VALUES ('Gone',1,1,'',datetime('now'))",
+            "INSERT INTO ignored_episodes(series_name,season,episode) VALUES ('Gone',1,2)",
+            "INSERT INTO gap_search_log(series_name,season,episode,last_searched_at) VALUES ('Gone',1,1,datetime('now'))",
+            "INSERT INTO series_status(series_name,status,last_air_date,updated_at) VALUES ('Gone','','',datetime('now'))",
+        ] {
+            db.conn.execute(statement, []).unwrap();
+        }
+
+        // Prima della pulizia la serie rimossa è ancora un target del backfill.
+        assert_eq!(db.media_info_backfill_targets(10).unwrap().len(), 1);
+
+        assert!(db.purge_series("Gone").unwrap() > 0);
+
+        assert!(db.media_info_backfill_targets(10).unwrap().is_empty());
+        for table in [
+            "series",
+            "episodes",
+            "pending_downloads",
+            "series_metadata",
+            "episode_metadata",
+            "ignored_episodes",
+            "gap_search_log",
+            "series_status",
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} deve restare vuota");
+        }
 
         drop(db);
         let _ = std::fs::remove_file(&path);

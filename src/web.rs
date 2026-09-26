@@ -2222,6 +2222,45 @@ async fn library_view(State(s): State<AppState>) -> Json<serde_json::Value> {
         .collect::<Vec<_>>();
     Json(serde_json::json!({"series":series,"movies":cfg.movies}))
 }
+
+/// Dopo un salvataggio della libreria rimuove lo stato delle serie e dei film
+/// appena tolti dall'elenco: quando l'utente elimina una voce non deve restare
+/// nulla che i worker possano ancora elaborare. Il confronto usa il nome per
+/// le serie e l'id per i film (stabile nella configurazione).
+fn purge_removed_library(
+    db: &Database,
+    previous_series: &[SeriesConfig],
+    previous_movies: &[MovieConfig],
+    series: &[SeriesConfig],
+    movies: &[MovieConfig],
+) {
+    for old in previous_series {
+        if !series
+            .iter()
+            .any(|item| item.name.trim().eq_ignore_ascii_case(old.name.trim()))
+        {
+            if let Err(error) = db.purge_series(&old.name) {
+                tracing::warn!(%error, series = %old.name, "impossibile rimuovere lo stato della serie eliminata");
+            }
+        }
+    }
+    for old in previous_movies {
+        let still_present = if old.id > 0 {
+            movies.iter().any(|item| item.id == old.id)
+        } else {
+            movies.iter().any(|item| {
+                item.name.trim().eq_ignore_ascii_case(old.name.trim())
+                    && item.year.trim() == old.year.trim()
+            })
+        };
+        if !still_present {
+            if let Err(error) = db.purge_movie(&old.name) {
+                tracing::warn!(%error, movie = %old.name, "impossibile rimuovere lo stato del film eliminato");
+            }
+        }
+    }
+}
+
 async fn save_library(
     State(s): State<AppState>,
     Json(input): Json<LibraryInput>,
@@ -2244,13 +2283,23 @@ async fn save_library(
             ),
         );
     }
+    let previous = latest_config(&s);
     match Config::save_library(&s.cfg.data_dir, &input.series, &input.movies) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(
-                serde_json::json!({"ok":true,"restart_required":true,"series":input.series.len(),"movies":input.movies.len()}),
-            ),
-        ),
+        Ok(()) => {
+            purge_removed_library(
+                &s.db.lock().unwrap(),
+                &previous.series,
+                &previous.movies,
+                &input.series,
+                &input.movies,
+            );
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"ok":true,"restart_required":true,"series":input.series.len(),"movies":input.movies.len()}),
+                ),
+            )
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -2269,10 +2318,19 @@ async fn save_series_config(
     }
     let cfg = latest_config(&s);
     match Config::save_library(&s.cfg.data_dir, &series, &cfg.movies) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"series":series.len()})),
-        ),
+        Ok(()) => {
+            purge_removed_library(
+                &s.db.lock().unwrap(),
+                &cfg.series,
+                &cfg.movies,
+                &series,
+                &cfg.movies,
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"series":series.len()})),
+            )
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -2291,10 +2349,19 @@ async fn save_movies_config(
     }
     let cfg = latest_config(&s);
     match Config::save_library(&s.cfg.data_dir, &cfg.series, &movies) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"movies":movies.len()})),
-        ),
+        Ok(()) => {
+            purge_removed_library(
+                &s.db.lock().unwrap(),
+                &cfg.series,
+                &cfg.movies,
+                &cfg.series,
+                &movies,
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"movies":movies.len()})),
+            )
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -3826,6 +3893,7 @@ async fn update_movie(
 }
 async fn delete_movie(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let mut cfg = (*latest_config(&s)).clone();
+    let previous_movies = cfg.movies.clone();
     let before = cfg.movies.len();
     cfg.movies.retain(|movie| movie.id != id);
     if before == cfg.movies.len() {
@@ -3835,7 +3903,16 @@ async fn delete_movie(State(s): State<AppState>, Path(id): Path<i64>) -> impl In
         );
     }
     match Config::save_library(&s.cfg.data_dir, &cfg.series, &cfg.movies) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(()) => {
+            purge_removed_library(
+                &s.db.lock().unwrap(),
+                &cfg.series,
+                &previous_movies,
+                &cfg.series,
+                &cfg.movies,
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"ok":false,"error":error.to_string()})),
@@ -8270,8 +8347,25 @@ async fn run_media_info_backfill(
         let targets = db.lock().unwrap().media_info_backfill_targets(limit)?;
         let mut probed = 0usize;
         let mut failed = 0usize;
+        let mut skipped = 0usize;
         let mut failed_items: Vec<serde_json::Value> = Vec::new();
         for target in &targets {
+            // Un file o una cartella che non esiste più (titolo rimosso e poi
+            // cancellato dal NAS) non è un errore da segnalare: si salta in
+            // silenzio, altrimenti il log si riempie di avvisi inutili.
+            if !std::path::Path::new(&target.path).exists() {
+                skipped += 1;
+                tracing::debug!(
+                    kind = %target.kind,
+                    series = %target.series,
+                    season = ?target.season,
+                    episode = ?target.episode,
+                    name = %target.name,
+                    path = %target.path,
+                    "media info backfill: file assente, salto"
+                );
+                continue;
+            }
             match crate::mediainfo::probe_best_result(std::path::Path::new(&target.path)) {
                 Ok(info) => {
                     let json = serde_json::to_string(&info)?;
@@ -8322,6 +8416,7 @@ async fn run_media_info_backfill(
             "candidates": targets.len(),
             "probed": probed,
             "failed": failed,
+            "skipped": skipped,
             "failed_items": failed_items,
         }))
     })
