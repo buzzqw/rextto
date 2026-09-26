@@ -76,6 +76,7 @@ pub async fn run_cycle_domain(
             notifier,
             &cfg.libtorrent_dir,
             torrents,
+            db,
             cfg,
         )
         .await

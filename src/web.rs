@@ -5485,6 +5485,7 @@ async fn comic_cycle(State(s): State<AppState>) -> impl IntoResponse {
         s.notifier.as_ref(),
         &default_root,
         s.torrents.as_ref(),
+        &s.db,
         &cfg,
     )
     .await
@@ -6979,15 +6980,21 @@ async fn comic_download(
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    let comic_dir = crate::postprocess::comic_download_dir(&cfg);
     let target = if input.save_path.trim().is_empty() {
-        // No explicit folder: use the configured default download directory,
-        // matching torrent downloads, instead of a comics folder inside `data`.
-        cfg.libtorrent_dir.clone()
+        // No explicit folder: use the "Comic" NAS path when configured, or the
+        // configured default download directory.
+        comic_dir
+            .clone()
+            .unwrap_or_else(|| cfg.libtorrent_dir.clone())
     } else {
         PathBuf::from(input.save_path.trim())
     };
     let allowed = target.starts_with(&cfg.data_dir)
         || target.starts_with(&cfg.libtorrent_dir)
+        || comic_dir
+            .as_deref()
+            .is_some_and(|dir| target.starts_with(dir))
         || monitored_paths.iter().any(|path| target.starts_with(path));
     if !allowed {
         return (
@@ -6995,6 +7002,7 @@ async fn comic_download(
             Json(serde_json::json!({"ok":false,"error":"percorso comics non configurato"})),
         );
     }
+    let _ = std::fs::create_dir_all(&target);
     let client = GetComicsClient::new();
     let result = match input.method.to_ascii_lowercase().as_str() {
         "download_now" | "direct" | "http" => client
@@ -7016,6 +7024,7 @@ async fn comic_download(
             Ok(path) => match s.torrents.add_torrent_file(&path, &target) {
                 Ok(Some(hash)) => {
                     let _ = std::fs::remove_file(&path);
+                    let _ = s.db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                     if !input.post_url.trim().is_empty() {
                         let _ = s.comics.add_torrent(
                             &hash,
@@ -7031,9 +7040,10 @@ async fn comic_download(
             },
             Err(error) => Err(error),
         },
-        "magnet" | "magnets" => match s.torrents.add(&input.url, &cfg) {
+        "magnet" | "magnets" => match s.torrents.add_with_path(&input.url, &cfg, Some(&target)) {
             Ok(true) => {
                 if let Some(hash) = crate::utils::magnet_hash(&input.url) {
+                    let _ = s.db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                     let _ = s.comics.add_torrent(
                         &hash,
                         input.post_url.trim(),
@@ -11658,6 +11668,9 @@ async fn torrent_event_worker(
             let public_event = event.clone();
             let hash = event.hash.clone();
             if let Ok(Some(comic)) = comics.torrent(&hash) {
+                // A comic torrent always carries the "Comic" tag, so it can be
+                // filtered with the other downloads and routed by category.
+                let _ = db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                 if matches!(event.kind.as_str(), "torrent_finished" | "storage_moved") {
                     let result = comics.complete_torrent(&hash, &event.save_path);
                     match result {

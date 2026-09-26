@@ -1537,7 +1537,7 @@ fn SettingsSearchOverlay(page: RwSignal<String>) -> impl IntoView {
                                                 on:click=move |_| choose(tab, key)
                                             >
                                                 <span class="settings-search-label">{hit.label}</span>
-                                                <span class="badge">{settings_tab_label(tab)}</span>
+                                                <span class="badge">{tr(data, settings_tab_label(tab))}</span>
                                             </button>
                                         }
                                     }).collect_view()}
@@ -1744,7 +1744,7 @@ fn PathPicker(
         <div class="field">
             <span>{label_text}</span>
             <div class="path-picker">
-                <input prop:value=value title=label on:input=move |event| value.set(event_target_value(&event)) placeholder=ctx_tr(placeholder) />
+                <input prop:value=value title=label_text on:input=move |event| value.set(event_target_value(&event)) placeholder=ctx_tr(placeholder) />
                 <BrowseButton value />
             </div>
         </div>
@@ -6782,7 +6782,7 @@ fn ComicsView(data: RwSignal<Data>) -> impl IntoView {
                                         };
                                         view! {
                                             <div>
-                                                <strong>{label}</strong>
+                                                <strong>{tr(data, label)}</strong>
                                                 {urls.into_iter().enumerate().map(|(index, url)| {
                                                         let method = match key {
                                                             "download_now" | "direct" => "direct",
@@ -7053,7 +7053,7 @@ fn NasPathsEditor() -> impl IntoView {
                             let final_dir = raw(rule, "final_dir", "");
                             view! {
                                 <tr>
-                                    <td><input prop:value=tag title=ctx_tr("Tag/categoria della release (es. Film, Serie TV). Deve corrispondere al tag usato per archiviare.") on:input=move |event| { let value = event_target_value(&event); rules.update(|items| { if let Some(item) = items.get_mut(index) { item["tag"] = Value::String(value); } }); } /></td>
+                                    <td><input prop:value=tag title=ctx_tr("Tag/categoria (es. Film, Serie TV, Comic). Deve corrispondere alla categoria; i fumetti usano Comic.") on:input=move |event| { let value = event_target_value(&event); rules.update(|items| { if let Some(item) = items.get_mut(index) { item["tag"] = Value::String(value); } }); } /></td>
                                     <td><input prop:value=temp title=ctx_tr("Cartella in cui scaricare temporaneamente i file di questa categoria prima dello spostamento finale.") on:input=move |event| { let value = event_target_value(&event); rules.update(|items| { if let Some(item) = items.get_mut(index) { item["temp_dir"] = Value::String(value); } }); } /></td>
                                     <td><input prop:value=final_dir title=ctx_tr("Cartella NAS in cui archiviare definitivamente i file di questa categoria.") on:input=move |event| { let value = event_target_value(&event); rules.update(|items| { if let Some(item) = items.get_mut(index) { item["final_dir"] = Value::String(value); } }); } /></td>
                                     <td><button class="btn sm danger" title=ctx_tr("Rimuovi questa regola di percorso") on:click=move |_| rules.update(|items| { if index < items.len() { items.remove(index); } })>{ctx_tr("X")}</button></td>
@@ -9019,7 +9019,7 @@ fn ScoreSimulator(data: RwSignal<Data>) -> impl IntoView {
                                             ("Film corrispondente", text(&value, "matched_movie", "-")),
                                         ];
                                         rows.into_iter().map(|(label, value)| view! {
-                                            <tr><td class="muted">{label}</td><td>{value}</td></tr>
+                                            <tr><td class="muted">{tr(data, label)}</td><td>{value}</td></tr>
                                         }).collect_view()
                                     }}
                                 </tbody>

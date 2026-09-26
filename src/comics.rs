@@ -1,3 +1,4 @@
+use crate::database::Database;
 use crate::notifier::Notifier;
 use crate::{config::Config, libtorrent::LibtorrentClient, utils::magnet_hash};
 use anyhow::{Context, Result};
@@ -273,7 +274,7 @@ fn register_http_download(title: &str, method: &str, url: &str) -> String {
             speed_bytes: 0,
             eta_seconds: None,
             error: None,
-            tag: String::new(),
+            tag: "Comic".into(),
             url: url.to_owned(),
             destination: String::new(),
             temporary: String::new(),
@@ -752,6 +753,7 @@ pub async fn run_cycle(
     notifier: &Notifier,
     default_root: &Path,
     torrents: &LibtorrentClient,
+    main_db: &Arc<Mutex<Database>>,
     cfg: &Config,
 ) -> Result<usize> {
     let monitored = db.list_monitored(true)?;
@@ -854,10 +856,14 @@ pub async fn run_cycle(
                 continue;
             }
             let target = if comic.save_path.trim().is_empty() {
-                default_root.to_path_buf()
+                crate::postprocess::comic_download_dir(cfg)
+                    .unwrap_or_else(|| default_root.to_path_buf())
             } else {
                 PathBuf::from(&comic.save_path)
             };
+            // I magnet rispettano un percorso preferito solo se è già una
+            // directory: creala prima, così la categoria "Comic" viene onorata.
+            let _ = std::fs::create_dir_all(&target);
             let download_result = if let Some(url) = links.direct.first() {
                 client
                     .download_direct(url, &target, &post.title)
@@ -874,11 +880,12 @@ pub async fn run_cycle(
                     Err(error) => Err(error),
                 }
             } else if let Some(magnet) = links.magnets.first() {
-                match torrents.add(magnet, cfg) {
+                match torrents.add_with_path(magnet, cfg, Some(&target)) {
                     Ok(true) => {
                         let hash = magnet_hash(magnet).ok_or_else(|| {
                             anyhow::anyhow!("comic magnet has no valid info hash")
                         })?;
+                        let _ = main_db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                         let _ = notifier
                             .notify_event(
                                 "comic_queued",
@@ -896,6 +903,7 @@ pub async fn run_cycle(
                     Ok(path) => match torrents.add_torrent_file(&path, &target) {
                         Ok(Some(hash)) => {
                             let _ = std::fs::remove_file(&path);
+                            let _ = main_db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                             let _ = notifier.notify_event("comic_queued", serde_json::json!({"title": post.title, "torrent_url": url, "hash": hash, "method": "torrent"})).await;
                             Ok((target.join(&post.title), "torrent", Some(hash)))
                         }
@@ -974,6 +982,7 @@ pub async fn run_cycle(
                 torrents,
                 notifier,
                 default_root,
+                main_db,
                 cfg,
                 &date,
                 &magnet,
@@ -1058,6 +1067,7 @@ pub async fn run_cycle(
                         torrents,
                         notifier,
                         default_root,
+                        main_db,
                         cfg,
                         &date,
                         magnet,
@@ -1099,15 +1109,19 @@ async fn send_weekly_pack(
     torrents: &LibtorrentClient,
     notifier: &Notifier,
     default_root: &Path,
+    main_db: &Arc<Mutex<Database>>,
     cfg: &Config,
     date: &str,
     magnet: &str,
     torrent_url: &str,
     direct_url: &str,
 ) -> Result<bool> {
+    let target = crate::postprocess::comic_download_dir(cfg)
+        .unwrap_or_else(|| default_root.to_path_buf());
+    let _ = std::fs::create_dir_all(&target);
     if !direct_url.is_empty() {
         let path = client
-            .download_direct(direct_url, default_root, &format!("Weekly Pack {date}"))
+            .download_direct(direct_url, &target, &format!("Weekly Pack {date}"))
             .await?;
         db.mark_weekly_sent(date)?;
         let _ = notifier
@@ -1124,12 +1138,13 @@ async fn send_weekly_pack(
     }
     if !magnet.is_empty() {
         if let Some(hash) = magnet_hash(magnet) {
-            if torrents.add(magnet, cfg)? {
+            if torrents.add_with_path(magnet, cfg, Some(&target))? {
+                let _ = main_db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                 db.add_torrent(
                     &hash,
                     &format!("weekly:{date}"),
                     &format!("Weekly Pack {date}"),
-                    &cfg.libtorrent_dir,
+                    &target,
                 )?;
                 db.mark_weekly_sent(date)?;
                 let _ = notifier
@@ -1142,15 +1157,16 @@ async fn send_weekly_pack(
             }
         }
     } else if !torrent_url.is_empty() {
-        let torrent_dir = default_root.join(".torrents");
+        let torrent_dir = target.join(".torrents");
         if let Ok(path) = client.download_torrent(torrent_url, &torrent_dir).await {
-            if let Ok(Some(hash)) = torrents.add_torrent_file(&path, &cfg.libtorrent_dir) {
+            if let Ok(Some(hash)) = torrents.add_torrent_file(&path, &target) {
                 let _ = std::fs::remove_file(path);
+                let _ = main_db.lock().unwrap().set_torrent_tag(&hash, "Comic");
                 db.add_torrent(
                     &hash,
                     &format!("weekly:{date}"),
                     &format!("Weekly Pack {date}"),
-                    &cfg.libtorrent_dir,
+                    &target,
                 )?;
                 db.mark_weekly_sent(date)?;
                 let _ = notifier

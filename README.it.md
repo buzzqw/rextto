@@ -43,7 +43,10 @@ o disco locale).
   dagli slot attivi, poi riprovati automaticamente. In aggiunta: pausa, sequenziale, salta-verifica, cima-coda,
   primo/ultimo pezzo, solo-metadati; priorità per-file, web seed, modifica
   tracker, super seeding ed export `.torrent`/magnet nel dettaglio torrent.
-- **Fumetti** — monitoraggio GetComics e weekly pack.
+- **Fumetti** — monitoraggio GetComics e weekly pack. Ogni fumetto aggiunto
+  (weekly pack, titolo monitorato o *Download Now*) riceve il tag **`Comic`**,
+  così la regola *Percorsi NAS per categoria (tag)* lo instrada nella cartella
+  configurata.
 - **Integrazioni** — Trakt, Simkl, Jellyfin, Plex, notifiche Telegram/e-mail/webhook.
 - **UI web** — single-page responsive, tema chiaro/scuro, completamente in
   **italiano e inglese** (traduzione a runtime con import/export YAML), con log
@@ -72,6 +75,13 @@ o disco locale).
   di qualità passa comunque); gap-fill e azioni manuali vincono sempre.
 - **Backup** — manuali o programmati (locale, FTP, cartella cloud, Telegram).
   Salvano database e configurazione, non i media né lo stato torrent.
+- **Leggero per davvero** — un solo demone usa circa **150 MB di RSS** e
+  **2–3 % di un core CPU** a riposo su una libreria reale con la coda libtorrent
+  attiva (misurato: 9 thread, 155 MB RSS, ~2,7 % CPU su un campione di 15 s,
+  ~43 s di CPU in 17 min di attività). La RAM **sale durante il download perché
+  è libtorrent a "gonfiarsi"** (cache disco automatica e buffer dei pezzi) e
+  torna giù a trasferimento finito; il picco resta limitato dalle impostazioni
+  della cache libtorrent, quindi per l'uso normale non c'è nulla da tarare.
 
 ## Installazione
 
@@ -184,8 +194,10 @@ Poiché l'archivio include libtorrent e il demone trova da sé la `ui/` accanto 
 sé, non serve alcuna libtorrent di sistema. L'archivio è prodotto da
 [`scripts/package-linux.sh`](scripts/package-linux.sh) ed è quello che
 `rexttod --update` installa. Richiede un Linux 64 bit recente (glibc, libstdc++,
-OpenSSL 3, zlib, libzstd); `ffprobe` è opzionale. Per un'installazione gestita
-come servizio usa l'installer descritto sopra.
+OpenSSL 3, zlib, libzstd); `ffprobe` è opzionale. Gli asset precompilati sono
+pubblicati **solo per x86_64**: su `aarch64` l'installer ripiega sulla
+compilazione da sorgente e `rexttod --update` segnala che non esiste un asset.
+Per un'installazione gestita come servizio usa l'installer descritto sopra.
 
 ### Compila da un checkout (sviluppo)
 
@@ -368,7 +380,7 @@ Opzioni di `--update`:
 | `--release <tag>` | installa un tag di release specifico |
 | `--install-dir <dir>` | directory di installazione (default: quella del binario) |
 | `--archive <file>` | installa da un archivio locale invece di scaricare |
-| `--force` | reinstalla anche se la versione è invariata |
+| `--force` | reinstalla anche se la versione è invariata (ha senso solo con `--release`: i canali rolling `continuous` e `stable` scaricano sempre l'ultimo asset) |
 | `--no-restart` | non riavviare `rextto.service` dopo l'installazione |
 
 Esempi:
@@ -429,6 +441,12 @@ schermata. Indice rapido:
 | `REXTTO_API_TOKEN` | Token bearer opzionale per API/UI |
 | `RUST_LOG` | Filtro tracing (default `rextto=info`) |
 | `REXTTO_URL` | Client TUI: URL base del demone (default `http://127.0.0.1:5000`) |
+| `REXTTO_CHANNEL` / `REXTTO_VERSION` | Installer/updater: canale (`continuous`, `stable`) o tag di release specifico |
+| `REXTTO_PORT` / `REXTTO_ENGINE_PORT` | Installer: porta UI/API (default `5000`) e porta motore (default `8889`) |
+| `REXTTO_USER` | Installer: utente di servizio da creare/usare (default `rextto`) |
+| `REXTTO_SKIP_PACKAGES` | Installer: `1` salta l'installazione dei pacchetti di sistema |
+| `REXTTO_SKIP_LIBTORRENT_BUILD` | Installer: `1` salta la compilazione di libtorrent dai sorgenti |
+| `REXTTO_SOURCE_REF` | Installer (fallback): ref GitHub da compilare (default `main`) |
 
 ## Sviluppo
 

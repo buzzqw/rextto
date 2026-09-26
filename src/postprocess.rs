@@ -89,6 +89,57 @@ pub fn download_dir_for(release: &Release, cfg: &Config) -> Option<PathBuf> {
         .filter(|path| path.is_dir())
 }
 
+/// Directory della categoria indicata (es. `Comic`) dalla configurazione
+/// "Percorsi NAS per categoria (tag)". A differenza di `destination_for` non
+/// richiede una `Release`: è pensata per i fumetti, che non ne costruiscono
+/// una. Ritorna `(temp_dir, final_dir)` valorizzati solo se configurati, con
+/// `temp_dir` verificata come directory esistente (come `download_dir_for`).
+pub fn category_dirs(cfg: &Config, category: &str) -> (Option<PathBuf>, Option<PathBuf>) {
+    let Some(raw) = cfg.settings.get("tag_dir_rules") else {
+        return (None, None);
+    };
+    let Ok(rules) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return (None, None);
+    };
+    for rule in rules {
+        let tag = rule
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !tag.trim().eq_ignore_ascii_case(category) {
+            continue;
+        }
+        let temp = rule
+            .get("temp_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+        let final_dir = rule
+            .get("final_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        return (temp, final_dir);
+    }
+    (None, None)
+}
+
+/// Cartella in cui scaricare un contenuto della categoria indicata: preferisce
+/// la destinazione finale, poi la temporanea, altrimenti `None`.
+pub fn category_download_dir(cfg: &Config, category: &str) -> Option<PathBuf> {
+    let (temp, final_dir) = category_dirs(cfg, category);
+    final_dir.or(temp)
+}
+
+/// Cartella dei fumetti secondo "Percorsi NAS per categoria (tag)", accettando
+/// sia `Comic` sia `Fumetto` come nome della categoria.
+pub fn comic_download_dir(cfg: &Config) -> Option<PathBuf> {
+    category_download_dir(cfg, "Comic").or_else(|| category_download_dir(cfg, "Fumetto"))
+}
+
 pub fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -2081,6 +2132,35 @@ mod tests {
         );
         assert_eq!(
             destination_for(&release, &cfg).as_deref(),
+            Some(final_dir.as_path())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn comic_category_uses_tag_dir_rules() {
+        let root = std::env::temp_dir().join(format!("rextto-comicdirs-{}", std::process::id()));
+        let temp = root.join("temp");
+        let final_dir = root.join("final");
+        fs::create_dir_all(&temp).unwrap();
+        fs::create_dir_all(&final_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.settings.insert(
+            "tag_dir_rules".into(),
+            serde_json::json!([
+                {"tag": "Film", "temp_dir": "", "final_dir": "/tmp/film"},
+                {"tag": "Comic", "temp_dir": temp.display().to_string(), "final_dir": final_dir.display().to_string()}
+            ])
+            .to_string(),
+        );
+        assert_eq!(
+            category_dirs(&cfg, "Comic"),
+            (Some(temp.clone()), Some(final_dir.clone()))
+        );
+        // La cartella di download preferisce la destinazione finale.
+        assert_eq!(comic_download_dir(&cfg).as_deref(), Some(final_dir.as_path()));
+        assert_eq!(
+            category_download_dir(&cfg, "Comic").as_deref(),
             Some(final_dir.as_path())
         );
         let _ = fs::remove_dir_all(root);

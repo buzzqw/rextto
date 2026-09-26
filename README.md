@@ -45,7 +45,9 @@ disk).
   first/last piece and metadata-only; per-file priorities, web seeds, tracker
   editing, super seeding and `.torrent`/magnet export are in the torrent
   details.
-- **Comics** — GetComics monitoring and weekly packs.
+- **Comics** — GetComics monitoring and weekly packs. Every comic added (weekly
+  pack, monitored title or *Download Now*) gets the **`Comic`** tag, so the
+  *NAS paths per category (tag)* rule routes it to the configured folder.
 - **Integrations** — Trakt, Simkl, Jellyfin, Plex, Telegram/e-mail/webhook
   notifications.
 - **Web UI** — responsive single-page app, dark/light theme, fully **Italian and
@@ -75,6 +77,13 @@ disk).
   still passes); gap-fill and manual actions always win.
 - **Backups** — manual or scheduled (local, FTP, cloud folder, Telegram).
   They include databases and configuration, not media files or torrent state.
+- **Light on resources** — one daemon uses about **150 MB RSS** and
+  **2–3 % of a single CPU core** while idle on a real library with the
+  libtorrent queue active (measured: 9 threads, 155 MB RSS, ~2.7 % CPU over a
+  15 s sample, ~43 s CPU used in 17 min uptime). RAM **rises while downloading
+  because libtorrent grows** (automatic disk cache and piece buffers) and is
+  released once the transfer finishes; the peak stays bounded by the libtorrent
+  cache settings, so there is nothing to tune for normal use.
 
 ## Installation
 
@@ -186,7 +195,9 @@ Because the archive bundles libtorrent and the daemon resolves its sibling
 `ui/` automatically, no system libtorrent is required. The archive is built by
 [`scripts/package-linux.sh`](scripts/package-linux.sh) and is what
 `rexttod --update` installs. It needs a modern 64-bit Linux (glibc, libstdc++,
-OpenSSL 3, zlib, libzstd); `ffprobe` is optional. For a managed service install
+OpenSSL 3, zlib, libzstd); `ffprobe` is optional. Prebuilt assets are published
+for **x86_64** only: on `aarch64` the installer falls back to building from
+source, and `rexttod --update` reports that no asset is available. For a managed service install
 use the installer above.
 
 ### Build from a checkout (development)
@@ -367,7 +378,7 @@ directly it also accepts these options:
 | `--release <tag>` | install a specific release tag |
 | `--install-dir <dir>` | installation directory (default: the binary's directory) |
 | `--archive <file>` | install from a local archive instead of downloading |
-| `--force` | reinstall even if the version is unchanged |
+| `--force` | reinstall even if the version is unchanged (only meaningful with `--release`: the rolling `continuous` and `stable` channels always fetch the latest asset) |
 | `--no-restart` | do not restart `rextto.service` after installing |
 
 Examples:
@@ -428,6 +439,12 @@ every screen. Quick index:
 | `REXTTO_API_TOKEN` | Optional bearer token for the API/UI |
 | `RUST_LOG` | Tracing filter (default `rextto=info`) |
 | `REXTTO_URL` | TUI client: daemon base URL (default `http://127.0.0.1:5000`) |
+| `REXTTO_CHANNEL` / `REXTTO_VERSION` | Installer/updater channel (`continuous`, `stable`) or a specific release tag |
+| `REXTTO_PORT` / `REXTTO_ENGINE_PORT` | Installer: UI/API port (default `5000`) and engine port (default `8889`) |
+| `REXTTO_USER` | Installer: service account to create/use (default `rextto`) |
+| `REXTTO_SKIP_PACKAGES` | Installer: `1` skips system package installation |
+| `REXTTO_SKIP_LIBTORRENT_BUILD` | Installer: `1` skips building libtorrent from source |
+| `REXTTO_SOURCE_REF` | Installer fallback: GitHub ref to build from (default `main`) |
 
 ## Development
 
