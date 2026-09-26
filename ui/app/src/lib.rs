@@ -2557,6 +2557,16 @@ fn torrent_tag_of(tags: &[Value], hash: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Divide il valore tag in chip. Il caso normale è un tag singolo; virgole e
+/// punti e virgola sono accettati così un valore composto si legge come elenco.
+fn tag_chips(tag: &str) -> Vec<String> {
+    tag.split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Applica il filtro tag della barra strumenti a torrent e download HTTP.
 fn tag_matches(term: &str, tag: &str) -> bool {
     match term {
@@ -3533,11 +3543,12 @@ fn HttpDownloadRow(id: String, data: RwSignal<Data>, selected: RwSignal<Vec<Stri
                 <div class="torrent-name">
                     <span class="torrent-name-text">{move || name.get()}</span>
                     <span class="badge" title=ctx_tr("Download HTTP, non un torrent")>{move || method.get()}</span>
-                    {move || {
-                        let tag = tag.get();
-                        (!tag.is_empty()).then(|| view! { <span class="badge ok" title=ctx_tr("Tag assegnato")>{tag}</span> })
-                    }}
                 </div>
+                <Show when=move || !tag.get().is_empty()>
+                    <div class="tag-line" title=ctx_tr("Tag assegnato")>
+                        {move || tag_chips(&tag.get()).into_iter().map(|chip| view! { <span class="tag-chip">{chip}</span> }).collect_view()}
+                    </div>
+                </Show>
                 <Show when=move || !error.get().is_empty()>
                     <div class="muted" style="font-size:11px;white-space:normal">{move || error.get()}</div>
                 </Show>
@@ -3679,6 +3690,9 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
         tr(data, label)
     });
     let state_tone = Signal::derive(move || torrent_state_label(&state.get()).1);
+    let tag_value = Signal::derive(move || {
+        data.with(|current| torrent_tag_of(&current.torrent_tags, &hash_tag.get_value()))
+    });
     // Seeding infinito: ratio o giorni a 0 nella configurazione del torrent.
     let seed_infinite = Signal::derive(move || {
         let current = item.get();
@@ -3782,6 +3796,11 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                 </div>
                 <Show when=move || !origin_line.get().is_empty()>
                     <div class="muted" style="font-size:11px;white-space:normal;overflow:hidden;text-overflow:ellipsis">{move || origin_line.get()}</div>
+                </Show>
+                <Show when=move || !tag_value.get().is_empty()>
+                    <div class="tag-line" title=ctx_tr("Tag assegnato")>
+                        {move || tag_chips(&tag_value.get()).into_iter().map(|chip| view! { <span class="tag-chip">{chip}</span> }).collect_view()}
+                    </div>
                 </Show>
             </td>
             <td>

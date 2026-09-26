@@ -477,6 +477,9 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 .torrent-name .badge { flex: none; }
 .history-tags { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .history-tags .badge { overflow: hidden; text-overflow: ellipsis; }
+/* Tag del nome file: riga piccola sotto il nome, con un chip per tag. */
+.tag-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
+.tag-chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 600; line-height: 1.5; background: var(--badge-bg); color: var(--badge-text); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .data-table:not(.lib-table) td:first-child { min-width: 220px; }
 /* Tabelle libreria: la prima cella è una checkbox, non va allargata a 220px. */
 .data-table.lib-table td:first-child { min-width: 0; }
