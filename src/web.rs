@@ -8225,6 +8225,38 @@ pub struct BackfillMediaInfoInput {
     pub limit: Option<usize>,
 }
 
+/// Logs which archived file the MediaInfo backfill could not analyze, and why,
+/// and records it in the run report. Kept at WARN (not DEBUG) because a file
+/// that keeps failing stays a target, so the user must be able to see it in the
+/// logs and investigate.
+fn log_media_info_failure(
+    target: &crate::database::MediaInfoBackfillTarget,
+    reason: &str,
+    items: &mut Vec<serde_json::Value>,
+) {
+    tracing::warn!(
+        path = %target.path,
+        kind = %target.kind,
+        series = %target.series,
+        season = ?target.season,
+        episode = ?target.episode,
+        name = %target.name,
+        year = ?target.year,
+        reason = %reason,
+        "🔬 MediaInfo backfill: file non analizzato"
+    );
+    items.push(serde_json::json!({
+        "path": target.path,
+        "kind": target.kind,
+        "series": target.series,
+        "season": target.season,
+        "episode": target.episode,
+        "name": target.name,
+        "year": target.year,
+        "reason": reason,
+    }));
+}
+
 /// Probes archived files that have no stored `ffprobe` result yet. Runs on the
 /// blocking pool; failures are counted, never fatal.
 /// Probes up to `limit` archived entries without stored MediaInfo. Blocking
@@ -8238,9 +8270,10 @@ async fn run_media_info_backfill(
         let targets = db.lock().unwrap().media_info_backfill_targets(limit)?;
         let mut probed = 0usize;
         let mut failed = 0usize;
+        let mut failed_items: Vec<serde_json::Value> = Vec::new();
         for target in &targets {
-            match crate::mediainfo::probe_best(std::path::Path::new(&target.path)) {
-                Some(info) => {
+            match crate::mediainfo::probe_best_result(std::path::Path::new(&target.path)) {
+                Ok(info) => {
                     let json = serde_json::to_string(&info)?;
                     let updated = if target.kind == "movie" {
                         db.lock().unwrap().set_movie_media_info(
@@ -8271,9 +8304,17 @@ async fn run_media_info_backfill(
                         );
                     } else {
                         failed += 1;
+                        log_media_info_failure(
+                            target,
+                            "nessuna riga corrispondente nel database (episodio o film non trovato)",
+                            &mut failed_items,
+                        );
                     }
                 }
-                None => failed += 1,
+                Err(reason) => {
+                    failed += 1;
+                    log_media_info_failure(target, &reason, &mut failed_items);
+                }
             }
         }
         Ok(serde_json::json!({
@@ -8281,6 +8322,7 @@ async fn run_media_info_backfill(
             "candidates": targets.len(),
             "probed": probed,
             "failed": failed,
+            "failed_items": failed_items,
         }))
     })
     .await?

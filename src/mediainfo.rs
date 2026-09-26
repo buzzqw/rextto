@@ -280,14 +280,26 @@ const VIDEO_EXTENSIONS: [&str; 8] = ["mkv", "mp4", "avi", "m4v", "ts", "mov", "w
 /// Probes a video file, or the largest video file directly inside a directory
 /// (archive entries are sometimes stored as a folder).
 pub fn probe_best(path: &Path) -> Option<MediaInfo> {
+    probe_best_result(path).ok()
+}
+
+/// Like [`probe_best`] but keeps the failure reason, so the backfill can tell
+/// the user which file failed and why instead of only counting it.
+pub fn probe_best_result(path: &Path) -> Result<MediaInfo, String> {
     if path.is_file() {
-        return probe(path);
+        return probe_result(path);
     }
     if !path.is_dir() {
-        return None;
+        return Err(if path.exists() {
+            "percorso non valido: non è un file né una cartella".into()
+        } else {
+            "file o cartella non trovata".into()
+        });
     }
     let mut best: Option<(u64, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(path).ok()?.flatten() {
+    let mut any_video = false;
+    let entries = std::fs::read_dir(path).map_err(|error| format!("cartella non leggibile: {error}"))?;
+    for entry in entries.flatten() {
         let candidate = entry.path();
         if !candidate.is_file() {
             continue;
@@ -300,12 +312,17 @@ pub fn probe_best(path: &Path) -> Option<MediaInfo> {
         if !VIDEO_EXTENSIONS.contains(&extension.as_str()) {
             continue;
         }
+        any_video = true;
         let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
         if best.as_ref().is_none_or(|(current, _)| size > *current) {
             best = Some((size, candidate));
         }
     }
-    best.and_then(|(_, path)| probe(&path))
+    match best {
+        Some((_, path)) => probe_result(&path),
+        None if any_video => Err("nessun file video leggibile nella cartella".into()),
+        None => Err("cartella vuota o senza file video".into()),
+    }
 }
 
 /// True when `ffprobe` can be executed. Lets the scheduler skip runs instead
@@ -323,6 +340,12 @@ pub fn available() -> bool {
 /// Runs `ffprobe` on `path`. Returns `None` when the binary is missing, the
 /// file is unreadable, or the output is not valid JSON.
 pub fn probe(path: &Path) -> Option<MediaInfo> {
+    probe_result(path).ok()
+}
+
+/// Runs `ffprobe` on `path` and returns a human-readable reason on failure, so
+/// the caller can log the exact file that could not be analyzed.
+pub fn probe_result(path: &Path) -> Result<MediaInfo, String> {
     let output = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -334,18 +357,47 @@ pub fn probe(path: &Path) -> Option<MediaInfo> {
         ])
         .arg(path)
         .output()
-        .ok()?;
+        .map_err(|error| format!("impossibile eseguire ffprobe: {error}"))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("ffprobe è uscito con stato {}", output.status)
+        } else {
+            detail.chars().take(300).collect()
+        });
     }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    Some(parse_ffprobe(&value))
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("output ffprobe non valido: {error}"))?;
+    Ok(parse_ffprobe(&value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn probe_best_result_names_a_missing_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "rextto-mediainfo-missing-{}",
+            std::process::id()
+        ));
+        let error = probe_best_result(&missing).unwrap_err();
+        assert!(
+            error.contains("non trovata"),
+            "missing path should report a clear reason, got: {error}"
+        );
+    }
+
+    #[test]
+    fn probe_best_still_returns_none_for_a_missing_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "rextto-mediainfo-none-{}",
+            std::process::id()
+        ));
+        assert!(probe_best(&missing).is_none());
+    }
 
     #[test]
     fn parses_hdr10_10bit_with_audio_and_subtitles() {
