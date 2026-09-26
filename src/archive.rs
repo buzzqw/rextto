@@ -64,6 +64,11 @@ impl Archive {
             tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, cfg.release_score(r)])?;
         }
         tx.commit()?;
+        // L'archivio ha un indice FTS5: un batch di migliaia di righe produce un
+        // WAL molto grande (write amplification). Un checkpoint TRUNCATE subito
+        // dopo il commit riporta il file `-wal` a zero tra un ciclo e l'altro,
+        // invece di lasciarlo al picco (centinaia di MB) fino al riavvio.
+        let _ = self.checkpoint();
         Ok(())
     }
 

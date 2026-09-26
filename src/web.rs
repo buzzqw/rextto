@@ -13627,6 +13627,26 @@ async fn cycle_worker(state: AppState) {
 /// Ottimizzazione continua libtorrent: quando `libtorrent_auto_optimize` è
 /// attivo rivaluta periodicamente cache, buffer e coda in base alle risorse e
 /// applica solo i valori cambiati (nessuna riscrittura inutile).
+/// Truncates the WALs periodically so heavy writes (archive FTS batches,
+/// housekeeping deletes, episode updates) do not leave a multi-hundred-MB
+/// `-wal` file between restarts.
+async fn db_checkpoint_worker(state: AppState) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+        let db = state.db.clone();
+        let archive = state.archive.clone();
+        let comics = state.comics.clone();
+        let i18n = state.i18n.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = db.lock().unwrap().checkpoint();
+            let _ = archive.lock().unwrap().checkpoint();
+            let _ = comics.checkpoint();
+            let _ = i18n.checkpoint();
+        })
+        .await;
+    }
+}
+
 async fn optimize_worker(state: AppState) {
     const OPTIMIZE_PERIOD: Duration = Duration::from_secs(15 * 60);
     loop {
@@ -13966,6 +13986,7 @@ pub async fn serve(
     let housekeeping = tokio::spawn(housekeeping_worker(state.clone()));
     let media_backfill = tokio::spawn(media_info_backfill_worker(state.clone()));
     let calendar_warmup = tokio::spawn(calendar_warmup_worker(state.clone()));
+    let db_checkpoint = tokio::spawn(db_checkpoint_worker(state.clone()));
     // Register the long-lived workers so `main` can stop them *before* it
     // touches the native libtorrent session. They must never be running while
     // `torrents.shutdown` waits for `save_resume_data` alerts, or they would
@@ -13981,6 +14002,7 @@ pub async fn serve(
         registry.push(housekeeping);
         registry.push(media_backfill);
         registry.push(calendar_warmup);
+        registry.push(db_checkpoint);
     }
     let app = router(state);
     let result = tokio::try_join!(
