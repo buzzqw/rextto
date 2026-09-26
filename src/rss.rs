@@ -307,7 +307,7 @@ fn parse_feed_body(body: &str, source: &str) -> Result<Vec<Release>> {
 /// errata o indexer non disponibile. Senza questo controllo il parser
 /// restituirebbe semplicemente zero risultati e il provider verrebbe marcato
 /// come sano, impedendo il backoff corretto di Jackett.
-fn torznab_error(body: &str) -> Option<String> {
+pub(crate) fn torznab_error(body: &str) -> Option<String> {
     let mut reader = Reader::from_str(body);
     loop {
         match reader.read_event().ok()? {

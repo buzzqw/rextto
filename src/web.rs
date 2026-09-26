@@ -10637,15 +10637,21 @@ async fn services_status(State(s): State<AppState>) -> impl IntoResponse {
         // Per Jackett la home può rispondere anche quando l'API key o
         // l'endpoint Torznab non funzionano: il probe dedicato usa `t=caps`.
         let probe_url = crate::rss::health_probe_url(indexer);
-        let status = match client.get(&probe_url).send().await {
-            Ok(response) => Some(response.status().as_u16()),
-            Err(_) => None,
+        let (status, error) = match client.get(&probe_url).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                (Some(status), crate::rss::torznab_error(&body))
+            }
+            Err(_) => (None, None),
         };
         indexers.push(serde_json::json!({
             "name": indexer.name,
             "url": indexer.url,
             "reachable": status.is_some(),
+            "healthy": status.is_some_and(|value| (200..300).contains(&value) && error.is_none()),
             "status": status,
+            "error": error,
         }));
     }
     if let Some(url) = cfg
@@ -15012,6 +15018,53 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["lang"],
             "en"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn explain_endpoint_is_structured_and_read_only() {
+        let (state, root) = test_state();
+        let db = state.db.clone();
+        let app = router(state);
+        let release = crate::parser::parse_release(
+            "Example.Show.S01E01.1080p.WEB-DL",
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "test",
+        )
+        .unwrap();
+        let before: i64 = db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM torrent_meta", [], |row| row.get(0))
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/search/explain")
+                    .header("x-rextto-token", "test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"release": release}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(value["trace"]["steps"].as_array().is_some_and(|steps| !steps.is_empty()));
+        assert!(value["trace"]["score_components"].is_array());
+        let after: i64 = db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM torrent_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after, "explanation must not register a torrent");
         let _ = std::fs::remove_dir_all(root);
     }
 

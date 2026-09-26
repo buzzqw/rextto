@@ -145,6 +145,13 @@ aliases, exclusions, NAS path, subtitles, timeframe).
 - **Seen from feed** — every release seen in the sources, grouped by title
   (movies/series) with count, best resolution and score; expand a group to
   queue a single release. Populated by each cycle, even for unmonitored titles.
+- **Why not this one?** — search results include a read-only explanation for a
+  release. It shows the decision, score and score components, passed or blocking
+  rules, source filters, quality/language/subtitle checks, blocklist, active
+  downloads and comparison with the archived file. It does not queue the
+  release, create placeholders or modify the database. The result covers the
+  candidate checks; cycle selection can also depend on gap filling, smart
+  episode, delay, free space and other candidates.
 - **Comics** — in **Add comic**, enter a title and click **Find**; choose the
   exact GetComics result and confirm. Rextto saves the selected post, tag,
   cover and metadata, then uses that post for downloading instead of replacing
@@ -159,6 +166,11 @@ Notifications, Paths, Translations**. Unsaved changes are highlighted with a
 
 - **Sources** — RSS feed list, indexers (Jackett/Prowlarr) with a *Verify*
   button, FlareSolverr URL + test, web engines, content filters, blacklist.
+  For Jackett, use its base URL, for example `http://host:9117`, together with
+  the API key. Rextto builds the Torznab endpoint
+  `/api/v2.0/indexers/all/results/torznab/api`. The health check uses `t=caps`
+  with the same key, so it checks the API rather than only Jackett's home page.
+  Results may identify the source as `jackett:TrackerName`.
 - **libtorrent** — connections/performance, protocols/trackers, security/proxy,
   RAM disk and ports, speed limits and scheduler; apply/optimise/update check.
   The RAM disk section lists available `tmpfs`/`ramfs` mounts and lets you
@@ -283,7 +295,9 @@ scan). If `ffprobe` is missing, the backfill pauses by itself.
 
 - **Health** — process/system status, runtime metrics (3 columns), Rextto
   service state, **indexer reachability**, path permissions, source health,
-  recent errors, disks.
+  recent errors, disks. For Jackett the check uses the Torznab `caps` endpoint,
+  so an API-key or configured-indexer problem is distinguished from simple host
+  reachability.
 - **Logs** — live SSE stream with text filter, line count and follow/pause.
   Lines are English and explicitly formatted as `date time  LEVEL [component]
   message · key: value`, with highlighted keywords (NAS, download, sources,
@@ -303,7 +317,10 @@ test. Completion notifications include size, download time and average speed.
 ## 12. Troubleshooting
 
 - **A source is unreachable** — check *Configuration → Sources → Verify* and the
-  sources health panel; Cloudflare-protected sites need a working FlareSolverr.
+  sources health panel. For Jackett verify the base URL, API key and that at
+  least one indexer is enabled in Jackett. Torznab errors are detected even when
+  Jackett returns HTTP 200. Cloudflare-protected sites need a working
+  FlareSolverr.
 - **Nothing downloads** — confirm *active mode*, that the series/movie is
   enabled, and check the quality/language filters and the free-space guard.
 - **A torrent is stalled** — check the three values under *Configuration →

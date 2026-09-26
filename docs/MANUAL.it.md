@@ -147,6 +147,14 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   (film/serie) con numero, risoluzione e score migliori; espandi un gruppo per
   accodare una singola release. Popolata ad ogni ciclo, anche per titoli non
   monitorati.
+- **Perché non questa?** — nei risultati di ricerca puoi aprire una spiegazione
+  read-only della release. Mostra esito, score e componenti dello score, regole
+  superate o bloccanti, filtro sorgente, qualità/lingua/sottotitoli, blocklist,
+  download attivi e confronto con il file già presente nell'archivio. Non accoda
+  la release, non crea placeholder e non modifica il database. L'esito riguarda
+  i controlli del candidato: la scelta finale del ciclo può dipendere anche da
+  gap filling, smart episode, delay, spazio libero e confronto con altri
+  candidati.
 - **Fumetti** — in **Aggiungi fumetto** scrivi il titolo e premi **Trova**; scegli
   il risultato esatto di GetComics e poi conferma. Rextto salva il post scelto,
   il tag, la copertina e i metadati, e usa quel post per il download senza
@@ -162,6 +170,11 @@ la barra “Salva tutte”.
 
 - **Sorgenti** — lista feed RSS, indexer (Jackett/Prowlarr) con pulsante
   *Verifica*, URL FlareSolverr + test, motori web, filtri contenuto, blacklist.
+  Per Jackett puoi indicare l'URL base, ad esempio `http://host:9117`, e la
+  relativa API key: Rextto costruisce l'endpoint Torznab
+  `/api/v2.0/indexers/all/results/torznab/api`. Il controllo di salute usa
+  `t=caps` con la stessa API key, quindi verifica l'API e non soltanto la home di
+  Jackett. Nei risultati la sorgente può apparire come `jackett:NomeTracker`.
 - **libtorrent** — connessioni/prestazioni, protocolli/tracker, sicurezza/proxy,
   RAM disk e porte, limiti di velocità e scheduler; applica/ottimizza/verifica
   aggiornamenti. In *Sicurezza, proxy e rete* l'**interfaccia VPN (killswitch)**
@@ -296,7 +309,9 @@ backfill si mette in pausa da solo.
 
 - **Salute** — stato processo/sistema, runtime (3 colonne), stato del servizio
   Rextto, **raggiungibilità degli indexer**, permessi percorsi, stato sorgenti,
-  ultimi errori, dischi.
+  ultimi errori, dischi. Per Jackett il controllo usa l'endpoint Torznab `caps`;
+  un problema di API key o di configurazione degli indexer viene quindi distinto
+  dalla semplice raggiungibilità della macchina.
 - **Log** — stream SSE live con filtro testuale, numero righe e segui/pausa.
   Le righe sono in inglese e in formato esplicito: `data ora  LIVELLO [componente]
   messaggio · campo: valore`, con parole chiave evidenziate (NAS, download,
@@ -318,8 +333,10 @@ velocità media.
 ## 12. Risoluzione problemi
 
 - **Una sorgente non risponde** — controlla *Configurazione → Sorgenti → Verifica*
-  e il pannello stato sorgenti; i siti protetti da Cloudflare richiedono un
-  FlareSolverr funzionante.
+  e il pannello stato sorgenti; per Jackett verifica URL base, API key e che
+  almeno un indexer sia abilitato in Jackett. Gli errori Torznab vengono mostrati
+  anche quando Jackett risponde HTTP 200. I siti protetti da Cloudflare
+  richiedono un FlareSolverr funzionante.
 - **Non scarica nulla** — verifica la *modalità attiva*, che serie/film siano
   abilitati, e controlla filtri qualità/lingua e il limite di spazio libero.
 - **Un torrent è stalled** — controlla i tre valori in *Configurazione →

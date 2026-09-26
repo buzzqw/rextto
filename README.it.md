@@ -51,6 +51,9 @@ o disco locale).
 - **UI web** — single-page responsive, tema chiaro/scuro, completamente in
   **italiano e inglese** (traduzione a runtime con import/export YAML), con log
   viewer, salute, grafici e manutenzione.
+- **Decisioni leggibili** — dai risultati di ricerca puoi vedere perché una
+  release supera o non supera i controlli, con score, regole applicate e
+  confronto read-only con l'archivio; la spiegazione non accoda né modifica dati.
 - **Visti dai feed** — ogni release vista nelle sorgenti, raggruppata per titolo,
   consultabile anche per ciò che non è monitorato.
 - **Regole di sanità automatiche** — sottotitoli hardcoded e dimensioni assurde
@@ -256,6 +259,12 @@ In *Configurazione → Sorgenti* aggiungi:
 - filtri contenuto e blacklist.
 
 Nella stessa sezione regoli punteggi, rinomina, percorsi e libtorrent.
+
+Per Jackett usa normalmente l'URL base, ad esempio `http://host:9117`, insieme
+alla sua API key. Rextto interroga l'endpoint Torznab e usa `t=caps` nel controllo
+salute, così verifica anche la chiave e la disponibilità degli indexer configurati.
+Gli errori Torznab vengono riconosciuti anche con risposta HTTP 200; nei risultati
+la sorgente può essere indicata come `jackett:NomeTracker`.
 
 ### Aggiungi serie e film
 

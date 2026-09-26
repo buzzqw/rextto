@@ -53,6 +53,9 @@ disk).
 - **Web UI** — responsive single-page app, dark/light theme, fully **Italian and
   English** (runtime translation layer with YAML import/export), with log viewer,
   health, charts and maintenance tools.
+- **Readable decisions** — search results can explain why a release passes or
+  fails the checks, including score, rules and a read-only archive comparison;
+  the explanation does not queue or modify data.
 - **Seen from feed** — every release seen in the sources, grouped by title,
   browsable even for titles you do not monitor.
 - **Automatic sanity rules** — hardcoded subtitles and absurd file sizes
@@ -255,6 +258,12 @@ In *Configuration → Sources* add:
 - content filters and blocklist.
 
 The same section holds scoring, renaming, paths and libtorrent settings.
+
+For Jackett, normally use its base URL, for example `http://host:9117`, together
+with the API key. Rextto queries the Torznab endpoint and uses `t=caps` for the
+health check, so it also validates the key and configured indexers. Torznab
+errors are detected even when Jackett returns HTTP 200, and results may identify
+the source as `jackett:TrackerName`.
 
 ### Add series and movies
 
