@@ -592,8 +592,9 @@ pub fn sanitize_subtitle_requirements(raw: &str) -> String {
 pub fn open_config_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     // WAL is persisted in the file header, but re-applying it is harmless.
-    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+    // Durability/concurrency pragmas shared with the other databases.
+    crate::database::harden_connection(&conn)?;
     Ok(conn)
 }
 

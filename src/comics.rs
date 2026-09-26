@@ -1052,11 +1052,17 @@ impl ComicsDb {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        crate::database::harden_connection(&conn)?;
         ensure_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// `PRAGMA quick_check` (vedi `crate::database::quick_check`).
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        crate::database::quick_check(&conn)
     }
 
     pub fn optimize(&self, action: &str) -> Result<()> {

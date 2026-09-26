@@ -28,8 +28,9 @@ impl Archive {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        // Wait for concurrent writers instead of failing with SQLITE_BUSY.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Wait for concurrent writers instead of failing with SQLITE_BUSY, plus
+        // FULL synchronous and a bounded WAL for durability.
+        crate::database::harden_connection(&conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS archive (id INTEGER PRIMARY KEY, title TEXT NOT NULL, magnet TEXT NOT NULL UNIQUE, magnet_hash TEXT, source TEXT, quality_score INTEGER, added_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_archive_title ON archive(title); CREATE INDEX IF NOT EXISTS idx_archive_added ON archive(added_at DESC); CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(title, content='archive', content_rowid='id'); CREATE TRIGGER IF NOT EXISTS archive_fts_ai AFTER INSERT ON archive BEGIN INSERT INTO archive_fts(rowid,title) VALUES (new.id,new.title); END; CREATE TRIGGER IF NOT EXISTS archive_fts_ad AFTER DELETE ON archive BEGIN INSERT INTO archive_fts(archive_fts,rowid,title) VALUES('delete',old.id,old.title); END; CREATE TRIGGER IF NOT EXISTS archive_fts_au AFTER UPDATE OF title ON archive BEGIN INSERT INTO archive_fts(archive_fts,rowid,title) VALUES('delete',old.id,old.title); INSERT INTO archive_fts(rowid,title) VALUES(new.id,new.title); END;")?;
         let archive_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM archive", [], |row| row.get(0))?;
@@ -49,27 +50,37 @@ impl Archive {
         Ok(Self { conn })
     }
     pub fn save_batch(&self, releases: &[Release], cfg: &Config) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for r in releases {
-            // RSS sources such as Jackett can expose only a `.torrent` URL.
-            // Do not collapse all those releases into one empty unique magnet.
-            let source = if r.magnet.trim().is_empty() {
-                r.torrent_url.as_deref().unwrap_or_default()
-            } else {
-                &r.magnet
-            };
-            if source.trim().is_empty() {
-                continue;
+        // Spezza il batch in transazioni più piccole: un'unica transazione da
+        // migliaia di righe con l'indice FTS5 generava un WAL enorme (osservato
+        // ~458 MB) e una finestra di scrittura molto lunga. Con chunk da 1000
+        // righe il WAL resta nell'ordine di pochi MB e un crash recupera un
+        // insieme di transazioni più piccolo (l'atomicità resta per chunk).
+        for chunk in releases.chunks(1000) {
+            let tx = self.conn.unchecked_transaction()?;
+            for r in chunk {
+                // RSS sources such as Jackett can expose only a `.torrent` URL.
+                // Do not collapse all those releases into one empty unique magnet.
+                let source = if r.magnet.trim().is_empty() {
+                    r.torrent_url.as_deref().unwrap_or_default()
+                } else {
+                    &r.magnet
+                };
+                if source.trim().is_empty() {
+                    continue;
+                }
+                tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, cfg.release_score(r)])?;
             }
-            tx.execute("INSERT OR IGNORE INTO archive(title,magnet,magnet_hash,source,quality_score,added_at) VALUES (?1,?2,?3,?4,?5,datetime('now'))", params![r.title, source, magnet_hash(source), r.source, cfg.release_score(r)])?;
+            tx.commit()?;
+            // Trunca il WAL tra i chunk: la write amplification FTS5 non si
+            // accumula fino al riavvio.
+            let _ = self.checkpoint();
         }
-        tx.commit()?;
-        // L'archivio ha un indice FTS5: un batch di migliaia di righe produce un
-        // WAL molto grande (write amplification). Un checkpoint TRUNCATE subito
-        // dopo il commit riporta il file `-wal` a zero tra un ciclo e l'altro,
-        // invece di lasciarlo al picco (centinaia di MB) fino al riavvio.
-        let _ = self.checkpoint();
         Ok(())
+    }
+
+    /// `PRAGMA quick_check` (vedi `crate::database::quick_check`).
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        crate::database::quick_check(&self.conn)
     }
 
     /// Removes every archived listing for a rejected infohash. Indexers can

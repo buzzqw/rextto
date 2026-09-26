@@ -3,30 +3,84 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+/// SQLite databases that get a transaction-consistent snapshot.
+const DATABASES: &[&str] = &[
+    "rextto_series.db",
+    "rextto_archive.db",
+    "rextto_config.db",
+    "rextto_comics.db",
+];
+
+/// Produces a consistent copy of a live database with the online backup API.
+/// Copying the file while the daemon writes can capture a torn or stale state
+/// (commits still only in the `-wal`); the backup API guarantees a
+/// transactionally consistent snapshot.
+fn snapshot_database(source: &Path, destination: &Path) -> Result<()> {
+    let src = rusqlite::Connection::open(source)?;
+    // Non bloccare il daemon: attendi i lock invece di fallire.
+    src.busy_timeout(Duration::from_secs(5))?;
+    let mut dst = rusqlite::Connection::open(destination)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
+        backup.run_to_completion(512, Duration::from_millis(5), None)?;
+    }
+    // Il file di destinazione deve essere autonomo (nessun -wal).
+    let _ = dst.execute_batch("PRAGMA journal_mode=DELETE;");
+    dst.close().map_err(|(_, error)| anyhow::anyhow!(error))?;
+    Ok(())
+}
+
+/// Aggiunge un file allo zip con compressione standard.
+fn add_zip_file(writer: &mut ZipWriter<fs::File>, name: &str, path: &Path) -> Result<()> {
+    let mut source = fs::File::open(path)?;
+    writer.start_file(
+        name.to_string(),
+        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+    )?;
+    let mut buffer = Vec::new();
+    source.read_to_end(&mut buffer)?;
+    writer.write_all(&buffer)?;
+    Ok(())
+}
 
 pub fn create_snapshot(data_dir: &Path, backup_root: &Path, retain: usize) -> Result<PathBuf> {
     fs::create_dir_all(backup_root)?;
     // Nome leggibile e ordinabile cronologicamente (locale del server).
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let destination = backup_root.join(format!("rextto-backup-{stamp}.zip"));
-    for name in [
-        "rextto_series.db",
-        "rextto_archive.db",
-        "rextto_config.db",
-        "rextto_comics.db",
-    ] {
-        let source = data_dir.join(name);
-        if let Ok(connection) = rusqlite::Connection::open(source) {
-            let _ = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
-        }
+
+    // 1) Snapshot coerente dei database in una cartella temporanea.
+    let temp = data_dir.join(format!(".rextto-backup-{}", std::process::id()));
+    if temp.is_dir() {
+        let _ = fs::remove_dir_all(&temp);
     }
+    fs::create_dir_all(&temp)?;
+    let mut snapshots = Vec::new();
+    for name in DATABASES {
+        let source = data_dir.join(name);
+        if !source.is_file() {
+            continue;
+        }
+        let snapshot = temp.join(name);
+        snapshot_database(&source, &snapshot)
+            .map_err(|error| anyhow::anyhow!("snapshot di {name} fallito: {error}"))?;
+        snapshots.push((*name, snapshot));
+    }
+
+    // 2) Zip dei file non-DB + snapshot consistenti dei DB.
     let file = fs::File::create(&destination)?;
     let mut archive = ZipWriter::new(file);
-    add_directory(&mut archive, data_dir, data_dir, backup_root)?;
+    add_directory(&mut archive, data_dir, data_dir, backup_root, &temp)?;
+    for (name, snapshot) in &snapshots {
+        add_zip_file(&mut archive, name, snapshot)?;
+    }
     archive.finish()?.sync_all()?;
+    let _ = fs::remove_dir_all(&temp);
+
     let mut snapshots = fs::read_dir(backup_root)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -203,6 +257,7 @@ fn add_directory(
     root: &Path,
     current: &Path,
     backup_root: &Path,
+    skip: &Path,
 ) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
@@ -210,7 +265,7 @@ fn add_directory(
             continue;
         }
         let path = entry.path();
-        if path.starts_with(backup_root) {
+        if path.starts_with(backup_root) || path.starts_with(skip) {
             continue;
         }
         if path
@@ -225,24 +280,19 @@ fn add_directory(
             .to_string_lossy()
             .replace('\\', "/");
         if path.is_dir() {
-            add_directory(writer, root, &path, backup_root)?;
+            add_directory(writer, root, &path, backup_root, skip)?;
             continue;
         }
-        if name.ends_with("-wal")
+        // I database sono aggiunti separatamente come snapshot coerenti.
+        if name.ends_with(".db")
+            || name.ends_with("-wal")
             || name.ends_with("-shm")
             || name.ends_with(".log")
             || name.contains(".log.")
         {
             continue;
         }
-        let mut source = fs::File::open(&path)?;
-        writer.start_file(
-            name,
-            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
-        )?;
-        let mut buffer = Vec::new();
-        source.read_to_end(&mut buffer)?;
-        writer.write_all(&buffer)?;
+        add_zip_file(writer, &name, &path)?;
     }
     Ok(())
 }
@@ -250,6 +300,42 @@ fn add_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_contains_a_consistent_live_database() {
+        let root = std::env::temp_dir().join(format!("rextto-backup-{}", std::process::id()));
+        let data = root.join("data");
+        let backups = root.join("backups");
+        fs::create_dir_all(&data).unwrap();
+        // Database "vivo": connessione aperta, in WAL, con una riga committata.
+        let conn = rusqlite::Connection::open(data.join("rextto_series.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (42);",
+        )
+        .unwrap();
+
+        let zip = create_snapshot(&data, &backups, 3).unwrap();
+
+        let mut archive = zip::ZipArchive::new(fs::File::open(&zip).unwrap()).unwrap();
+        let mut entry = archive.by_name("rextto_series.db").unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        drop(entry);
+        let restored = root.join("restored.db");
+        fs::write(&restored, &bytes).unwrap();
+        let restored_conn = rusqlite::Connection::open(&restored).unwrap();
+        let check: String = restored_conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let value: i64 = restored_conn
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 42, "lo snapshot deve contenere la transazione committata");
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn ftp_endpoint_defaults_to_port_21() {

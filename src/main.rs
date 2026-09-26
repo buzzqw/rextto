@@ -105,6 +105,26 @@ async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
     let _ = archive.lock().unwrap().checkpoint();
     let _ = comics.checkpoint();
     let _ = i18n.checkpoint();
+    // Verifica l'integrità di ogni database all'avvio: crash, cadute di corrente
+    // o spazio esaurito possono lasciare problemi che è meglio rilevare subito.
+    for (name, result) in [
+        ("rextto_series.db", db.lock().unwrap().quick_check()),
+        ("rextto_archive.db", archive.lock().unwrap().quick_check()),
+        ("rextto_comics.db", comics.quick_check()),
+        ("rextto_config.db", i18n.quick_check()),
+    ] {
+        match result {
+            Ok(rows) if rows.len() == 1 && rows[0] == "ok" => {
+                tracing::info!(database = name, "integrity check: ok")
+            }
+            Ok(rows) => tracing::error!(
+                database = name,
+                detail = %rows.join(" | "),
+                "integrity check: problemi rilevati"
+            ),
+            Err(error) => tracing::warn!(database = name, %error, "integrity check non eseguito"),
+        }
+    }
     let state = AppState {
         cfg: cfg.clone(),
         config_path,

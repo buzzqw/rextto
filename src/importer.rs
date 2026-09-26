@@ -181,6 +181,7 @@ pub fn import_extto(source_dir: &Path, destination_dir: &Path) -> Result<ImportR
     crate::database::Database::open(&target_path)?;
     let target = Connection::open(&target_path)?;
     target.pragma_update(None, "journal_mode", "WAL")?;
+    let _ = target.busy_timeout(Duration::from_secs(5));
     let tx = target.unchecked_transaction()?;
     let mut report = ImportReport {
         snapshot_dir: snapshot_dir.display().to_string(),
@@ -380,6 +381,7 @@ pub fn import_extto(source_dir: &Path, destination_dir: &Path) -> Result<ImportR
     if let Some(source_archive) = archive_snapshot {
         let archive_db = readonly(&source_archive)?;
         let target_archive = Connection::open(destination_dir.join("rextto_archive.db"))?;
+        let _ = target_archive.busy_timeout(Duration::from_secs(5));
         target_archive.execute_batch("CREATE TABLE IF NOT EXISTS archive (id INTEGER PRIMARY KEY, title TEXT NOT NULL, magnet TEXT NOT NULL UNIQUE, magnet_hash TEXT, source TEXT, quality_score INTEGER, added_at TEXT NOT NULL);")?;
         if has_table(&archive_db, "archive")? {
             let tx = target_archive.unchecked_transaction()?;
@@ -405,6 +407,7 @@ pub fn import_extto(source_dir: &Path, destination_dir: &Path) -> Result<ImportR
     }
 
     let comics_conn = Connection::open(destination_dir.join("rextto_comics.db"))?;
+    let _ = comics_conn.busy_timeout(Duration::from_secs(5));
     report.comics = comics::import_from_extto(&snapshot_dir, &comics_conn)?;
     if let Some(config_snapshot) = config_snapshot {
         let config_conn = readonly(&config_snapshot)?;
@@ -419,6 +422,7 @@ pub fn import_extto(source_dir: &Path, destination_dir: &Path) -> Result<ImportR
             .unwrap_or(0);
         let target_config = destination_dir.join("rextto_config.db");
         let target = Connection::open(&target_config)?;
+        let _ = target.busy_timeout(Duration::from_secs(5));
         target.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS translations (lang TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(lang,key)); CREATE TABLE IF NOT EXISTS movies_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, year TEXT DEFAULT '', quality TEXT DEFAULT '', language TEXT DEFAULT '', enabled INTEGER DEFAULT 1, subtitle TEXT DEFAULT '', exclude TEXT DEFAULT '', language_requirements TEXT DEFAULT '', subtitle_requirements TEXT DEFAULT ''); CREATE TABLE IF NOT EXISTS torrent_limits (info_hash TEXT PRIMARY KEY, dl_bytes INTEGER NOT NULL DEFAULT -1, ul_bytes INTEGER NOT NULL DEFAULT -1, updated_at TEXT NOT NULL DEFAULT (datetime('now')));")?;
         let _ = target.execute(
             "ALTER TABLE movies_config ADD COLUMN language_requirements TEXT DEFAULT ''",

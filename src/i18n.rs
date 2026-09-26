@@ -38,6 +38,12 @@ impl I18nDb {
         crate::database::checkpoint_connection(&conn)
     }
 
+    /// `PRAGMA quick_check` (vedi `crate::database::quick_check`).
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        crate::database::quick_check(&conn)
+    }
+
     fn storage_language(lang: &str) -> &str {
         match lang {
             "it" | "ita" => "ita",

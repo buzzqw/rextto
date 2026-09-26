@@ -84,6 +84,26 @@ pub fn checkpoint_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Pragmas di durabilità/concorrenza condivisi da tutti i database Rextto:
+/// busy timeout per i writer concorrenti, `synchronous=FULL` (WAL è già
+/// crash-safe; FULL rende durabili anche le transazioni committate in caso di
+/// caduta di corrente) e un limite alla dimensione del `-wal`, così un
+/// checkpoint non lascia mai un file di centinaia di MB.
+pub fn harden_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    Ok(())
+}
+
+/// Esegue `PRAGMA quick_check` e restituisce le righe (`["ok"]` se sana).
+pub fn quick_check(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare("PRAGMA quick_check")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Estimated database size in bytes (page_count × page_size).
 pub fn connection_size_bytes(conn: &Connection) -> i64 {
     let pages = conn
@@ -402,11 +422,15 @@ impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        harden_connection(&conn)?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// `PRAGMA quick_check` (vedi `quick_check`).
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        quick_check(&self.conn)
     }
 
     fn migrate(&self) -> Result<()> {
