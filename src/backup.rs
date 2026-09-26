@@ -20,6 +20,9 @@ const DATABASES: &[&str] = &[
 /// (commits still only in the `-wal`); the backup API guarantees a
 /// transactionally consistent snapshot.
 fn snapshot_database(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let src = rusqlite::Connection::open(source)?;
     // Non bloccare il daemon: attendi i lock invece di fallire.
     src.busy_timeout(Duration::from_secs(5))?;
@@ -53,8 +56,9 @@ pub fn create_snapshot(data_dir: &Path, backup_root: &Path, retain: usize) -> Re
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let destination = backup_root.join(format!("rextto-backup-{stamp}.zip"));
 
-    // 1) Snapshot coerente dei database in una cartella temporanea.
-    let temp = data_dir.join(format!(".rextto-backup-{}", std::process::id()));
+    // Cartella temporanea univoca per evitare collisioni se due backup partono
+    // insieme (es. backup manuale + schedulato).
+    let temp = data_dir.join(format!(".rextto-backup-{}", uuid::Uuid::new_v4()));
     if temp.is_dir() {
         let _ = fs::remove_dir_all(&temp);
     }
@@ -252,6 +256,20 @@ pub fn upload_ftp(
     Ok(())
 }
 
+/// Nomi (file o cartelle) esclusi dal backup: contenuto scaricato e cache, non
+/// configurazione. Il backup deve contenere **solo configurazioni e database**.
+const EXCLUDED_ENTRIES: &[&str] = &[
+    // File scaricati (fumetti): contenuto, non configurazione.
+    "comics",
+    // Blocklist scaricata.
+    "ipfilter.dat",
+    // Cache/generati dello scraper e del feed.
+    "rextto_magnet_cache.json",
+    "rextto_magnet_feed.xml",
+    // Stato della sessione libtorrent (fastresume): escluso come prima.
+    "rextto_torrents_state",
+];
+
 fn add_directory(
     writer: &mut ZipWriter<fs::File>,
     root: &Path,
@@ -271,7 +289,7 @@ fn add_directory(
         if path
             .file_name()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value == "rextto_torrents_state")
+            .is_some_and(|value| EXCLUDED_ENTRIES.contains(&value))
         {
             continue;
         }
@@ -303,7 +321,7 @@ mod tests {
 
     #[test]
     fn snapshot_contains_a_consistent_live_database() {
-        let root = std::env::temp_dir().join(format!("rextto-backup-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rextto-backup-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         let backups = root.join("backups");
         fs::create_dir_all(&data).unwrap();
@@ -334,6 +352,51 @@ mod tests {
         assert_eq!(value, 42, "lo snapshot deve contenere la transazione committata");
 
         drop(conn);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_excludes_content_and_caches_but_keeps_config() {
+        let root =
+            std::env::temp_dir().join(format!("rextto-backup-scope-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let backups = root.join("backups");
+        fs::create_dir_all(data.join("comics")).unwrap();
+        fs::write(data.join("comics/big.cbz"), [0u8; 1024]).unwrap();
+        fs::write(data.join("ipfilter.dat"), b"blocklist").unwrap();
+        fs::write(data.join("rextto_magnet_cache.json"), b"{}").unwrap();
+        fs::write(data.join("rextto_magnet_feed.xml"), b"<rss/>").unwrap();
+        fs::write(data.join("rextto.json"), b"{}").unwrap();
+        let conn = rusqlite::Connection::open(data.join("rextto_config.db")).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let zip = create_snapshot(&data, &backups, 3).unwrap();
+        let mut archive = zip::ZipArchive::new(fs::File::open(&zip).unwrap()).unwrap();
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            names.push(archive.by_index(index).unwrap().name().to_string());
+        }
+        assert!(
+            names.iter().any(|name| name == "rextto_config.db"),
+            "il database deve essere incluso: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "rextto.json"),
+            "la configurazione deve essere inclusa: {names:?}"
+        );
+        for excluded in [
+            "comics/big.cbz",
+            "ipfilter.dat",
+            "rextto_magnet_cache.json",
+            "rextto_magnet_feed.xml",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == excluded),
+                "{excluded} non deve finire nel backup: {names:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
