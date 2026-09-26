@@ -5,6 +5,44 @@ La UI è disponibile in **italiano** e **inglese** (selettore lingua in alto); q
 sono usate le etichette italiane, la versione inglese è in
 [`MANUAL.en.md`](MANUAL.en.md).
 
+## Come usare questa guida
+
+Rextto è un demone unico: ricerca le sorgenti, valuta le release, gestisce
+libtorrent, rinomina i file e li archivia. Non è necessario avviare componenti
+separati per il funzionamento normale.
+
+Il percorso consigliato per una nuova installazione è:
+
+1. configurare percorsi e sorgenti;
+2. lasciare il demone in **dry-run**;
+3. aggiungere un solo titolo di prova;
+4. eseguire una ricerca o un ciclo manuale;
+5. controllare Salute e Log;
+6. abilitare la modalità attiva solo dopo aver verificato i risultati.
+
+Il manuale distingue sempre tra:
+
+- **ricerca manuale**: serve a ispezionare risultati e accodare una scelta;
+- **ciclo automatico**: cerca i titoli monitorati e decide cosa scaricare;
+- **archivio**: i file già importati o archiviati nella libreria;
+- **sessione torrent**: i download ancora gestiti da libtorrent.
+
+### Checklist iniziale
+
+Prima di abilitare i download reali verifica:
+
+- `http://<host>:5000` è raggiungibile;
+- *Salute* non segnala problemi di permessi o spazio;
+- la cartella temporanea è scrivibile;
+- la cartella libreria/NAS è montata e scrivibile dall'utente del servizio;
+- almeno una sorgente risponde a *Verifica*;
+- una ricerca manuale restituisce release coerenti;
+- in dry-run Rextto non ha prodotto errori inattesi.
+
+Se usi un NAS, prova prima a creare un file nella destinazione con lo stesso
+utente che esegue `rextto.service`. Un percorso visibile dalla shell dell'utente
+personale può non essere visibile al servizio systemd.
+
 - [1. Primo avvio](#1-primo-avvio)
 - [2. Dashboard](#2-dashboard)
 - [3. Scarico](#3-scarico)
@@ -28,6 +66,38 @@ Rextto gira come un unico servizio. Apri la UI all'indirizzo `http://<host>:5000
 - **Attivo vs dry-run**: in dry-run non partono download reali; abilita la
   *modalità attiva* in *Configurazione → Daemon* solo quando sei pronto.
 - Aggiungi serie/film da **Esplora** (TMDB) oppure da **Serie TV / Film → Aggiungi**.
+
+### Procedura consigliata per il primo ciclo
+
+1. In *Configurazione → Percorsi* controlla cartella download, temporanea,
+   libreria e cestino.
+2. In *Configurazione → Sorgenti* aggiungi una sola sorgente funzionante e premi
+   **Verifica**. Aggiungi le altre solo dopo aver validato la prima.
+3. Lascia disattivati i download reali e aggiungi una serie con una sola stagione
+   o un film di prova.
+4. Dalla Dashboard avvia il ciclo del dominio interessato.
+5. Apri *Salute* e *Log*: devi vedere il ciclo, le sorgenti interrogate e il
+   motivo per cui una release è stata accettata o scartata.
+6. Esegui una ricerca manuale e controlla un risultato con **Perché non questa?**.
+7. Quando percorsi, filtri e risultati sono corretti, abilita *Modalità attiva*.
+
+In caso di dubbi non modificare contemporaneamente qualità, percorsi e sorgenti:
+una modifica alla volta rende il problema riproducibile.
+
+### Percorsi e responsabilità
+
+Rextto usa percorsi con ruoli diversi:
+
+| Percorso | Uso | Può essere temporaneo? |
+|---|---|---|
+| Download | dati dei torrent in sessione | no, finché il torrent è attivo |
+| Temporaneo/incomplete | metadati e dati incompleti | sì, ma deve essere scrivibile |
+| Libreria/NAS | file finali archiviati | no |
+| Cestino | file rimossi durante upgrade/pulizia | sì, secondo retention |
+| Cartella osservata | `.torrent`/`.magnet` da importare | sì, ma non durante la copia |
+
+Non usare la cartella temporanea come libreria finale e non cancellare a mano i
+file di un torrent ancora attivo: usa le azioni della sessione torrent.
 
 ### Riga di comando e aggiornamenti
 
@@ -72,6 +142,33 @@ il pacchetto Linux autonomo descritto nel README (*Pacchetto Linux autonomo*).
 - **Consumo e dischi**, **prossime uscite**, **ultimi download**,
   **attività recente** e **ultimi trovati nelle sorgenti**.
 
+### Ricerca manuale dalla Dashboard
+
+La ricerca manuale è utile per capire cosa vede Rextto prima di modificare una
+configurazione o avviare un download:
+
+1. inserisci un titolo o una query tecnica;
+2. attendi che le sorgenti terminino o che il timeout segnali quelle lente;
+3. confronta titolo, sorgente, qualità, dimensione e seed/peer;
+4. usa **Filtra i risultati già caricati** per restringere localmente la lista;
+5. apri **Perché non questa?** sui risultati interessanti;
+6. usa **Accoda** solo dopo aver controllato il motivo e il confronto archivio.
+
+Il filtro locale lavora sui risultati già ricevuti, inclusi titolo, sorgente e
+campi tecnici della qualità. Scrivere nel filtro non interroga nuovamente gli
+indexer e non modifica la query originale.
+
+La ricerca manuale può mostrare release non idonee per permettere l’ispezione.
+Il fatto che una release sia visibile non significa che il ciclo automatico la
+scaricherebbe.
+
+### Come leggere un ciclo
+
+Un ciclo normale attraversa, in ordine, ricerca, filtri, confronto con archivio,
+selezione e accodamento. Il numero di release trovate non equivale al numero di
+download: una release può essere esclusa perché non monitorata, troppo vecchia,
+bloccata, già presente o inferiore al file archiviato.
+
 ## 3. Scarico
 
 - **Aggiungi** un magnet/URL `.torrent` oppure carica un file `.torrent`;
@@ -87,6 +184,10 @@ il pacchetto Linux autonomo descritto nel README (*Pacchetto Linux autonomo*).
   .torrent**, **Super seeding** e l'aggiunta/rimozione di **web seed**; in
   **Tracker** puoi modificare l'intera lista (`tier|url` per riga); in
   **Contenuto** imposti la **priorità per file** (Salta/Normale/Alta/Massima).
+- Quando usi **Sposta storage**, il log registra richiesta, destinazione e
+  accettazione del comando; l'esito finale viene scritto quando libtorrent
+  completa o rifiuta lo spostamento. Con **Check** il log distingue comando
+  avviato e controllo terminato, includendo stato e byte verificati.
 - **Storico download**: elenca i download conclusi (nativi e migrati). Colonne:
   nome (con badge **NAS** quando il file è archiviato), tipo/stagione/episodio,
   **tag NAS** (regola di cartella), score, stato (*Completato*), **percorso
@@ -108,6 +209,22 @@ La presenza di peer senza aumento dei byte non resetta il timer. Nel log cerca
 `DOWNLOAD STALLED`, `stalled torrent resumed and reannounced` e, solo dopo il
 limite finale, `DOWNLOAD FAILED — stalled`.
 
+### Stati e azioni consigliate
+
+| Stato | Significato | Azione consigliata |
+|---|---|---|
+| In coda | registrato ma non ancora avviato | attendere il ciclo/sessione |
+| Download | trasferimento in corso | controllare velocità e peer |
+| Stalled | nessun aumento reale dei byte | attendere il retry automatico |
+| Seeding | download completato, seed ancora attivo | lasciare il torrent o rimuoverlo secondo policy |
+| Errore | il torrent ha riportato un errore | leggere il motivo prima di rimuoverlo |
+| Archiviato/NAS | il file finale è stato copiato nella libreria | verificare il percorso, non cancellare la sorgente mentre è in uso |
+
+**Rimuovi** agisce sulla sessione torrent e può chiedere se eliminare i file.
+**Pulisci completati** è più selettivo: rimuove i torrent che hanno raggiunto i
+limiti di seed. Un torrent rimosso dalla sessione non equivale necessariamente a
+un file rimosso dalla libreria.
+
 ## 4. Serie TV
 
 Aggiungi una serie via ricerca TMDB o manualmente (titolo, qualità, lingue,
@@ -128,6 +245,47 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   magnet, ignorare/riattivare, forzare, riscaricare o eliminare; la ricerca
   manuale segnala i risultati già presenti nel feed.
 
+### Aggiungere e configurare una serie
+
+Per una serie nuova il metodo più sicuro è la ricerca TMDB:
+
+1. apri **Esplora**, cerca il titolo e seleziona il risultato corretto;
+2. controlla titolo, anno, rete e poster;
+3. scegli qualità, lingua, sottotitoli e stagioni da monitorare;
+4. imposta il percorso archivio solo se non vuoi usare quello globale;
+5. salva in dry-run e controlla la pagina di dettaglio.
+
+I campi più importanti sono:
+
+| Campo | Effetto |
+|---|---|
+| Qualità | restringe le release accettabili e partecipa allo score |
+| Lingua | richiede la lingua configurata quando è riconoscibile nel titolo |
+| Sottotitoli | gestisce la preferenza senza accettare sottotitoli hardcoded |
+| Stagioni | decide quali stagioni sono monitorate; gli intervalli sono supportati |
+| Alias | aiuta a collegare titoli diversi alla stessa serie |
+| Esclusioni | parole nel titolo che devono bloccare la release |
+| Consenti aggiornamenti | abilita o blocca la sostituzione di file già archiviati |
+
+Lascia le stagioni non ancora disponibili abilitate se vuoi che il calendario e
+la ricerca dei mancanti continuino a funzionare. Usa *Ignora* solo per episodi
+che non vuoi più cercare: riattivandoli tornano candidati nei cicli successivi.
+
+### Episodi mancanti e pack
+
+Da **Cerca mancanti** o dalla scheda episodio:
+
+1. controlla che la stagione sia monitorata;
+2. avvia la ricerca del singolo episodio o del dominio serie;
+3. confronta release singole e season pack;
+4. se un episodio è già sul disco ma non nel database, usa la scansione archivio;
+5. usa **Forza** solo per un’azione manuale consapevole.
+
+Rextto evita normalmente di riscaricare episodi vecchi quando possiede episodi
+successivi, a meno che si tratti di un buco riconosciuto o di un upgrade reale.
+Un season pack può riempire più episodi, ma il confronto con l’archivio resta
+episodio per episodio.
+
 ## 5. Film
 
 - Tab **Monitorati / Scaricati**; colonne ordinabili (nome, anno, qualità, lingua).
@@ -135,6 +293,23 @@ stagioni, alias, esclusioni, percorso NAS, sottotitoli, timeframe).
   lingue richieste** con flag “obbligatoria” per riga.
 - **Dettaglio film**: locandina, trama, cast, modifica, riscarica, **Cerca subito**
   e tabella dei “migliori trovati” dalle sorgenti.
+
+### Aggiungere e scegliere un film
+
+1. cerca il film in **Esplora** e controlla anno e titolo originale;
+2. aggiungilo alla libreria;
+3. imposta qualità, lingua, sottotitoli ed eventuali esclusioni;
+4. usa **Cerca subito** per vedere i risultati senza aspettare il ciclo;
+5. apri **Perché non questa?** prima di accodare una release borderline.
+
+Il film viene identificato usando titolo e anno quando disponibili. Evita di
+creare duplicati con lo stesso film scritto in modi diversi: correggi i metadati
+del film monitorato invece di aggiungerlo nuovamente.
+
+Le lingue richieste possono essere opzionali o obbligatorie. Una lingua
+obbligatoria deve essere presente perché la release sia ammessa; una preferenza
+opzionale influenza la scelta e lo score senza trasformarsi automaticamente in un
+blocco.
 
 ## 6. Esplora, Archivio, Fumetti
 
@@ -231,9 +406,79 @@ la barra “Salva tutte”.
    salvate per italiano o inglese, modificarle e reimportarle. Il formato è una
    mappa `chiave: valore`, ad esempio `"Testa porte": "Test ports"`.
    L'importazione aggiorna o aggiunge le chiavi presenti e non cancella quelle
-   assenti dal file. Non cambia la lingua attiva: quella si sceglie dal
-   selettore in alto. La UI traduce le stringhe a runtime e, se manca una
-   traduzione, mostra la sorgente italiana.
+  assenti dal file. Non cambia la lingua attiva: quella si sceglie dal
+  selettore in alto. La UI traduce le stringhe a runtime e, se manca una
+  traduzione, mostra la sorgente italiana.
+
+### Configurare un indexer Torznab
+
+Per Jackett:
+
+1. crea o verifica almeno un indexer dentro Jackett;
+2. copia la API key dalla pagina Jackett;
+3. in Rextto premi **+ Jackett**;
+4. inserisci URL base, ad esempio `http://jackett:9117`, e API key;
+5. salva e premi **Verifica**;
+6. controlla *Salute → Stato API*.
+
+Rextto usa automaticamente `/api/v2.0/indexers/all/results/torznab/api` per
+Jackett. Non aggiungere quel percorso se stai usando l'URL base. Se usi un
+percorso Torznab personalizzato già completo, lascialo configurato come endpoint
+esplicito. Prowlarr usa invece il proprio endpoint di ricerca e normalmente la
+porta `9696`.
+
+Un indexer può essere raggiungibile ma non sano: per esempio Jackett può
+rispondere HTTP 200 con un errore Torznab dovuto a API key errata o nessun
+indexer abilitato. In questo caso *Salute* mostra **Errore API** e il dettaglio;
+il log del ciclo mostrerà anche il backoff della sorgente quando applicabile.
+
+### Punteggio, filtri e “Perché non questa?”
+
+I controlli principali sono indipendenti:
+
+1. titolo monitorato;
+2. blocklist e duplicati;
+3. filtri globali e filtro della sorgente;
+4. sanità della release, inclusi sottotitoli hardcoded e dimensione minima;
+5. qualità, lingua, sottotitoli ed esclusioni del titolo;
+6. confronto con file già archiviati e download attivi.
+
+Lo score aiuta a scegliere tra candidati ammessi; non rende valida una release
+che fallisce un filtro bloccante. Nel pannello **Perché non questa?**:
+
+- **Superata** significa che quel controllo è passato;
+- **Bloccante** indica un motivo sufficiente a rifiutare il candidato;
+- **Informativa** indica un controllo che dipende dal contesto dell'intero ciclo;
+- il confronto archivio mostra se si tratta di primo download o di possibile
+  upgrade.
+
+La spiegazione è una diagnosi, non una prenotazione: aprirla non crea righe
+torrent, non accoda magnet e non cambia la configurazione.
+
+### Ritardi e backoff delle sorgenti
+
+Il delay di acquisizione può trattenere una release prima dell'avvio per dare
+tempo a un risultato migliore. Un punteggio alto può bypassare il delay secondo
+la configurazione. Il backoff delle sorgenti è diverso: viene attivato da errori
+ripetuti e impedisce temporaneamente nuove richieste alla sorgente problematica.
+
+In *Configurazione → Acquisizione* puoi vedere livello, scadenza e ultimo errore.
+Usa il reset per singola sorgente dopo aver corretto la causa; non usarlo per
+mascherare un'API key sbagliata, altrimenti il backoff ricomincerà.
+
+### Configurare il NAS senza sorprese
+
+Per una libreria su NAS:
+
+1. monta il filesystem prima dell'avvio di Rextto;
+2. assegna permessi di lettura/scrittura all'utente del servizio;
+3. imposta spazio minimo prudente;
+4. esegui una scansione archivio dopo aver copiato file esistenti;
+5. controlla il percorso effettivo nella cronologia dopo il primo completamento.
+
+Se il NAS non è montato, non sostituire temporaneamente il percorso con la root
+locale senza aver capito l'effetto: potresti archiviare file nel posto sbagliato.
+Meglio correggere il mount e lasciare il download in attesa.
 
 I controlli di sanità delle release sono **automatici** e non configurabili:
 sottotitoli hardcoded (`HC`) e dimensioni assurde (una soglia per risoluzione
@@ -267,6 +512,23 @@ backfill si mette in pausa da solo.
   d'ambiente `REXTTO_*`. I programmi sono eseguiti senza shell e con timeout di
   default pari a 60 secondi (massimo 24 ore; anche `0` usa il default).
 
+### Collegare un servizio esterno
+
+Le integrazioni non sono necessarie per scaricare e archiviare i media. Attivale
+una alla volta e usa sempre il pulsante di test quando disponibile:
+
+- **Trakt/Simkl**: completa il flusso PIN/OAuth, verifica che l'account corretto
+  sia visualizzato e solo dopo abilita import watchlist o scrobbling;
+- **Jellyfin/Plex**: inserisci URL raggiungibile dal demone e token con i permessi
+  minimi necessari, poi prova l'aggiornamento libreria;
+- **Hook**: configura prima un programma innocuo che scriva un log, verifica i
+  placeholder e solo dopo collegalo a script di automazione o notifiche.
+
+Gli hook vengono eseguiti senza shell: pipe, redirezioni e operatori come `&&`
+non vengono interpretati. Se servono, inserisci un vero script eseguibile e
+passagli i valori tramite i placeholder o le variabili `REXTTO_*`. Non inserire
+token o password negli argomenti se il comando finisce nei log del sistema.
+
 ## 9. Manutenzione
 
 - Backup immediato, pulisci cestino, ricalcola scoring, scansiona archivi,
@@ -299,11 +561,41 @@ backfill si mette in pausa da solo.
    La pulizia dei "visti" rimuove solo righe storiche dei feed, non file o
    download; applica anche la pulizia standard degli ultimi 50 cicli e degli
    errori torrent più vecchi di 7 giorni.
-- **Backup**: retention, schedulazione (manuale, ogni N ore o a un orario fisso
-  giornaliero HH:MM), FTP (host/utente/percorso) con **Test FTP** (verifica
-  connessione, percorso e upload di prova), copia su cartella cloud/sync, invio
-  Telegram, elenco backup. Lo snapshot contiene database e configurazione, non
-  i media né lo stato della sessione torrent.
+ - **Backup**: retention, schedulazione (manuale, ogni N ore o a un orario fisso
+   giornaliero HH:MM), FTP (host/utente/percorso) con **Test FTP** (verifica
+   connessione, percorso e upload di prova), copia su cartella cloud/sync, invio
+   Telegram, elenco backup. Lo snapshot contiene database e configurazione, non
+   i media né lo stato della sessione torrent.
+
+### Backup: cosa protegge e cosa no
+
+Un backup di Rextto protegge database e configurazione. Non contiene i video,
+gli archivi multimediali né lo stato completo della sessione libtorrent. Prima di
+un ripristino:
+
+1. ferma o metti in pausa i cicli automatici;
+2. conserva una copia del database attuale;
+3. verifica data e dimensione del backup;
+4. ripristina solo su un'installazione compatibile;
+5. controlla percorsi e permessi prima di riattivare i download.
+
+Il ripristino di un database non sposta automaticamente i file multimediali. Se
+la libreria è stata spostata, correggi i percorsi o esegui una scansione archivio
+prima di avviare upgrade e ricerche mancanti.
+
+### Pulizia e operazioni irreversibili
+
+Usa prima le anteprime quando disponibili. In particolare:
+
+- *Anteprima duplicati* mostra cosa finirebbe nel cestino;
+- *Anteprima rinomina* mostra vecchio e nuovo nome;
+- *Pulizia database* riguarda righe storiche, non la libreria;
+- la pulizia del cestino può eliminare definitivamente i file;
+- l'eliminazione di un torrent può chiedere di cancellare anche i dati.
+
+Non confondere **cestino**, **Archivio**, **Storico download** e **sessione
+torrent**: sono insiemi diversi e una pulizia in uno non implica automaticamente
+la pulizia degli altri.
 
 ## 10. Salute, Log, Grafici
 
@@ -324,11 +616,64 @@ backfill si mette in pausa da solo.
   giornaliero.
 - **Attività** — eventi torrent recenti e download.
 
+### Salute: interpretare lo stato delle sorgenti
+
+Per ogni indexer la tabella distingue:
+
+- **OK**: risposta HTTP valida e nessun errore Torznab applicativo;
+- **Errore API**: il servizio risponde, ma API key o configurazione indexer non
+  sono accettate;
+- **Non raggiungibile**: non è arrivata una risposta entro il timeout.
+
+Questa distinzione è importante: riavviare Rextto non risolve un errore API key,
+mentre un problema di rete può richiedere di controllare DNS, container, porta o
+firewall.
+
 ## 11. Notifiche
 
 Configura Telegram, e-mail (SMTP) o un webhook (con segreto HMAC) e invia un
 test. Le notifiche di completamento includono dimensione, tempo di download e
 velocità media.
+
+### Procedura di configurazione
+
+1. salva le credenziali nella scheda **Notifiche**;
+2. abilita solo gli eventi che vuoi ricevere;
+3. invia il test dalla UI;
+4. controlla sia la risposta del provider sia il log Rextto;
+5. esegui un test di completamento solo con un download non importante.
+
+Per un webhook verifica il segreto HMAC sul ricevente e non confondere il test
+HTTP con la consegna dell'evento reale. Per SMTP controlla host, porta, TLS,
+utente e mittente: un server raggiungibile può comunque rifiutare il mittente o
+richiedere autenticazione diversa.
+
+## Riferimento rapido
+
+### Quando usare quale azione
+
+| Obiettivo | Azione |
+|---|---|
+| Capire cosa esiste online | Ricerca manuale |
+| Riempire episodi mancanti | Cerca mancanti / ciclo Serie |
+| Scegliere una release specifica | **Perché non questa?** → Accoda |
+| Far riconoscere file già presenti | Scansiona archivio |
+| Cambiare il nome senza riscaricare | Anteprima rinomina |
+| Correggere un servizio esterno | Salute → sorgente → Verifica |
+| Eliminare file inferiori | Anteprima duplicati → Pulizia |
+| Salvare configurazione e DB | Backup |
+
+### Glossario
+
+- **Release**: risultato trovato da feed, indexer o motore web.
+- **Ciclo**: una passata automatica di ricerca e selezione.
+- **Gap**: episodio mancante riconosciuto nell'archivio.
+- **Placeholder**: riga temporanea che rappresenta un download non ancora
+  completato.
+- **Upgrade**: sostituzione di un file archiviato con una release migliore.
+- **Backoff**: pausa progressiva delle richieste a una sorgente che fallisce.
+- **Seed**: condivisione del torrent dopo il completamento.
+- **NAS**: destinazione di rete usata per la libreria o per i percorsi configurati.
 
 ## 12. Risoluzione problemi
 
@@ -337,6 +682,10 @@ velocità media.
   almeno un indexer sia abilitato in Jackett. Gli errori Torznab vengono mostrati
   anche quando Jackett risponde HTTP 200. I siti protetti da Cloudflare
   richiedono un FlareSolverr funzionante.
+- **Jackett è raggiungibile ma mostra errore API** — copia nuovamente la API key,
+  controlla che almeno un indexer sia abilitato in Jackett e verifica che l'URL
+  inserito in Rextto sia quello base corretto. Non aggiungere due volte il
+  percorso `/api/v2.0/indexers/all/results/torznab/api`.
 - **Non scarica nulla** — verifica la *modalità attiva*, che serie/film siano
   abilitati, e controlla filtri qualità/lingua e il limite di spazio libero.
 - **Un torrent è stalled** — controlla i tre valori in *Configurazione →
@@ -347,6 +696,18 @@ velocità media.
   stabili, poi ritenta automaticamente gli errori. Controlla il log del watcher.
 - **Un file non viene rinominato** — conviene avere `mediainfo` installato (tag
   tecnici); controlla le impostazioni *Rinomina* e la chiave TMDB.
+- **La release è visibile ma non viene scelta** — apri **Perché non questa?**:
+  controlla prima titolo monitorato, filtri globali, sanità, qualità/lingua e
+  confronto archivio. Se tutti questi passano, guarda il controllo informativo
+  sulla selezione del ciclo: altri candidati, delay, spazio libero e gap filling
+  possono ancora cambiare il risultato.
+- **Un file esiste sul NAS ma Rextto lo considera mancante** — controlla nome
+  episodio, percorso associato alla serie e permessi; poi usa *Scansiona archivio*.
+  La scansione riconosce i nomi video con stagione/episodio, non file arbitrari
+  che non permettono di identificare il contenuto.
+- **Il download è completo ma non compare nella libreria** — guarda il log per
+  spostamento, permessi e spazio; non cancellare la sorgente finché il percorso
+  archiviato non è visibile nella cronologia.
 - **Il backup FTP fallisce** — usa *Test FTP*: indica il passo che fallisce
   (connessione, login, percorso remoto, upload, rimozione) e lo registra nel log.
 - **Log** — vedi `data/rextto.log` (rotazione a 5 MB) o il viewer nella UI.

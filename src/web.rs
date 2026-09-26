@@ -1202,6 +1202,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/maintenance/restore-source", post(restore_source))
         .route("/api/search", post(manual_search))
+        .route("/api/search/archive", post(manual_archive_search))
         .route("/api/manual-search", get(manual_search_get))
         .route("/api/search/add", post(add_search_result))
         .route("/api/tmdb/search", post(tmdb_search))
@@ -1769,7 +1770,7 @@ async fn logs_stream(
 }
 
 /// Server-sent stream of torrent lifecycle events (metadata received, finished,
-/// storage moved). New entries appended to the shared buffer are pushed as they
+/// storage moved, integrity checked). New entries appended to the shared buffer are pushed as they
 /// appear, so the Activity view can react in real time instead of polling
 /// `/api/torrent-events`.
 async fn notifications_stream(State(s): State<AppState>) -> impl IntoResponse {
@@ -8799,13 +8800,43 @@ async fn manual_search(
         );
     }
     let _cycle_guard = s.cycle_lock.lock().await;
-    let mut results = s.engine.search_query(&s.cfg, query).await;
+    let cfg = latest_config(&s);
+    // The UI shows the archive after 60 seconds, but keep the remote request
+    // alive a little longer so an indexer that finishes just afterwards can
+    // still append its results. The request is then bounded and cannot hang.
+    const MANUAL_SEARCH_BUDGET: Duration = Duration::from_secs(90);
+    let mut results = match tokio::time::timeout(
+        MANUAL_SEARCH_BUDGET,
+        s.engine.search_query_manual(&cfg, query),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            tracing::warn!(query, timeout_secs = MANUAL_SEARCH_BUDGET.as_secs(), "manual search budget expired; returning archive results");
+            Vec::new()
+        }
+    };
+    results.extend(archive_releases_for_query(&s, &cfg, query));
+    let mut seen = HashSet::new();
+    results.retain(|release| {
+        crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
+    });
+    results.sort_by_key(|release| std::cmp::Reverse(cfg.release_score(release)));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok":true,"query":query,"results":results})),
+    )
+}
+
+fn archive_releases_for_query(s: &AppState, cfg: &Config, query: &str) -> Vec<Release> {
+    let mut results = Vec::new();
     for (title, magnet, source) in s.archive.lock().unwrap().search(query).unwrap_or_default() {
         if let Some(release) =
             crate::parser::parse_release(&title, &magnet, &format!("archive:{source}"))
         {
-            if let Some(reason) = s.cfg.all_release_denied_reason(&release) {
-                if s.cfg.release_is_monitored(&release) {
+            if let Some(reason) = cfg.all_release_denied_reason(&release) {
+                if cfg.release_is_monitored(&release) {
                     crate::rules::log_rejection(&release, &reason);
                 }
             } else {
@@ -8813,13 +8844,33 @@ async fn manual_search(
             }
         }
     }
+    results
+}
+
+async fn manual_archive_search(
+    State(s): State<AppState>,
+    Json(input): Json<SearchInput>,
+) -> impl IntoResponse {
+    if !setup_complete(&s.cfg) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":"complete the initial setup first"})),
+        );
+    }
+    let query = input.query.trim();
+    if query.is_empty() || query.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok":false,"error":"query must contain 1-256 characters"})),
+        );
+    }
+    let cfg = latest_config(&s);
+    let mut results = archive_releases_for_query(&s, &cfg, query);
     let mut seen = HashSet::new();
     results.retain(|release| {
         crate::utils::magnet_hash(&release.magnet).is_some_and(|hash| seen.insert(hash))
     });
-    results.sort_by_key(|release| {
-        std::cmp::Reverse(s.cfg.release_score(release))
-    });
+    results.sort_by_key(|release| std::cmp::Reverse(cfg.release_score(release)));
     (
         StatusCode::OK,
         Json(serde_json::json!({"ok":true,"query":query,"results":results})),
@@ -9535,7 +9586,34 @@ async fn add_download_tag(
     )
 }
 async fn recheck_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
-    torrent_action(s.torrents.force_recheck(&hash))
+    let name = s
+        .torrents
+        .list()
+        .into_iter()
+        .find(|torrent| torrent.hash.eq_ignore_ascii_case(&hash))
+        .map(|torrent| torrent.name)
+        .unwrap_or_else(|| hash.clone());
+    tracing::info!(hash = %hash, name = %name, "manual torrent integrity check requested");
+    let result = s.torrents.force_recheck(&hash);
+    match &result {
+        Ok(true) => tracing::info!(
+            hash = %hash,
+            name = %name,
+            "manual torrent integrity check accepted by libtorrent"
+        ),
+        Ok(false) => tracing::warn!(
+            hash = %hash,
+            name = %name,
+            "manual torrent integrity check not started: torrent session unavailable"
+        ),
+        Err(error) => tracing::error!(
+            hash = %hash,
+            name = %name,
+            %error,
+            "manual torrent integrity check failed to start"
+        ),
+    }
+    torrent_action(result)
 }
 async fn reannounce_torrent(
     State(s): State<AppState>,
@@ -9573,7 +9651,61 @@ async fn move_torrent_storage(
             ),
         );
     }
-    torrent_action(s.torrents.move_storage(&hash, destination))
+    let name = s
+        .torrents
+        .list()
+        .into_iter()
+        .find(|torrent| torrent.hash.eq_ignore_ascii_case(&hash))
+        .map(|torrent| torrent.name)
+        .unwrap_or_else(|| hash.clone());
+    let destination = destination.to_path_buf();
+    let target = destination.join(&name);
+    tracing::info!(
+        hash = %hash,
+        name = %name,
+        destination = %destination.display(),
+        "manual torrent storage move requested"
+    );
+    if target.exists() {
+        let error = format!(
+            "destination already contains the torrent data: {}",
+            target.display()
+        );
+        tracing::warn!(
+            hash = %hash,
+            name = %name,
+            destination = %destination.display(),
+            target = %target.display(),
+            "manual torrent storage move rejected before libtorrent: destination exists"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok":false,"error":error})),
+        );
+    }
+    let result = s.torrents.move_storage(&hash, &destination);
+    match &result {
+        Ok(true) => tracing::info!(
+            hash = %hash,
+            name = %name,
+            destination = %destination.display(),
+            "manual torrent storage move accepted by libtorrent; waiting for completion"
+        ),
+        Ok(false) => tracing::warn!(
+            hash = %hash,
+            name = %name,
+            destination = %destination.display(),
+            "manual torrent storage move not started: torrent session unavailable"
+        ),
+        Err(error) => tracing::error!(
+            hash = %hash,
+            name = %name,
+            destination = %destination.display(),
+            %error,
+            "manual torrent storage move failed to start"
+        ),
+    }
+    torrent_action(result)
 }
 async fn set_torrent_limits(
     State(s): State<AppState>,
@@ -11731,6 +11863,28 @@ async fn torrent_event_worker(
         for event in torrent_events {
             let public_event = event.clone();
             let hash = event.hash.clone();
+            if event.kind == "torrent_checked" {
+                match torrents
+                    .list()
+                    .into_iter()
+                    .find(|torrent| torrent.hash.eq_ignore_ascii_case(&event.hash))
+                {
+                    Some(torrent) => tracing::info!(
+                        hash = %event.hash,
+                        name = %event.name,
+                        state = %torrent.state,
+                        progress = torrent.progress,
+                        checked_bytes = torrent.total_done,
+                        total_bytes = torrent.total_size,
+                        "torrent integrity check completed"
+                    ),
+                    None => tracing::info!(
+                        hash = %event.hash,
+                        name = %event.name,
+                        "torrent integrity check completed; torrent is no longer in the session"
+                    ),
+                }
+            }
             if let Ok(Some(comic)) = comics.torrent(&hash) {
                 // A comic torrent always carries the "Comic" tag, so it can be
                 // filtered with the other downloads and routed by category.
@@ -13513,6 +13667,12 @@ async fn handle_torrent_event(
             false
         }
         "storage_moved" => {
+            tracing::info!(
+                hash = %event.hash,
+                name = %event.name,
+                save_path = %event.save_path,
+                "torrent storage move completed"
+            );
             post_seed_moves.remove(&event.hash);
             storage_move_retries.remove(&event.hash.to_ascii_lowercase());
             // A post-seeding relocation happens after the release was already

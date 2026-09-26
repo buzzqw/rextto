@@ -16,6 +16,8 @@ pub struct ArchiveEntry {
     pub source: String,
     pub quality_score: i64,
     pub added_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
 }
 #[derive(serde::Serialize)]
 pub struct ArchivePage {
@@ -269,13 +271,17 @@ impl Archive {
 }
 
 fn archive_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveEntry> {
+    let title: String = row.get(1)?;
+    let magnet: String = row.get(2)?;
+    let source: String = row.get(3)?;
     Ok(ArchiveEntry {
         id: row.get(0)?,
-        title: row.get(1)?,
-        magnet: row.get(2)?,
-        source: row.get(3)?,
+        title: title.clone(),
+        magnet: magnet.clone(),
+        source: source.clone(),
         quality_score: row.get(4)?,
         added_at: row.get(5)?,
+        release: crate::parser::parse_release(&title, &magnet, &format!("archive:{source}")),
     })
 }
 

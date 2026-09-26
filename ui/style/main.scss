@@ -163,7 +163,7 @@ a { color: var(--accent-2); }
 .top-actions { display: flex; align-items: center; justify-content: flex-start; gap: 8px; flex-wrap: nowrap; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
 .top-actions > * { flex: none; white-space: nowrap; }
 .top-actions .btn { padding: 6px 10px; }
-.top-actions .lang-select, .top-actions .mode-badge, .top-actions .system-pill { padding: 6px 10px; }
+.top-actions .lang-select, .top-actions .system-pill { padding: 6px 10px; }
 .lang-select { padding: 6px 8px; max-width: 110px; border-radius: 8px; background: var(--btn); color: var(--btn-text); border: 1px solid var(--btn-line); font-weight: 600; }
 .top-metric {
   box-sizing: border-box; flex: 1 1 86px; width: auto; min-width: 78px; max-width: 170px; height: 42px;
@@ -483,6 +483,9 @@ pre.output { max-height: 260px; overflow: auto; margin: 0; padding: 12px; border
 .data-table:not(.lib-table) td:first-child { min-width: 220px; }
 /* Tabelle libreria: la prima cella è una checkbox, non va allargata a 220px. */
 .data-table.lib-table td:first-child { min-width: 0; }
+/* Archivio torrent: anche qui la prima colonna contiene solo la checkbox. */
+.data-table.archive-table th:first-child,
+.data-table.archive-table td:first-child { width: 3%; min-width: 0; white-space: nowrap; }
 /* Storico download: la colonna "Cartella libreria / NAS" resta stretta, così il
    nome del file scaricato ha più spazio. */
 .data-table.history-table { table-layout: fixed; min-width: 900px; }

@@ -86,6 +86,7 @@ struct GlobalSearch {
     loading: RwSignal<bool>,
     searched: RwSignal<bool>,
     elapsed: RwSignal<u32>,
+    generation: RwSignal<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -470,6 +471,23 @@ fn array(value: &Value, key: &str) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+fn merge_release_results(current: &mut Vec<Value>, incoming: Vec<Value>) {
+    for item in incoming {
+        let magnet = text(&item, "magnet", "");
+        let duplicate = if !magnet.is_empty() {
+            current.iter().any(|existing| text(existing, "magnet", "") == magnet)
+        } else {
+            let identity = (text(&item, "title", ""), text(&item, "source", ""));
+            current.iter().any(|existing| {
+                (text(existing, "title", ""), text(existing, "source", "")) == identity
+            })
+        };
+        if !duplicate {
+            current.push(item);
+        }
+    }
 }
 
 /// Filtro locale per le release già trovate: confronta titolo, fonte, origine e
@@ -1086,6 +1104,7 @@ pub fn App() -> impl IntoView {
         loading: RwSignal::new(false),
         searched: RwSignal::new(false),
         elapsed: RwSignal::new(0),
+        generation: RwSignal::new(0),
     });
     provide_context(DecisionExplanationState {
         trace: RwSignal::new(None),
@@ -1414,16 +1433,8 @@ pub fn App() -> impl IntoView {
                                  <option value="en">{ctx_tr("English")}</option>
                              </select>
                              <button class="btn" title=move || tr(data, "Cambia tra tema chiaro e scuro") on:click=move |_| light.update(|value| *value = !*value)>{move || tr(data, if light.get() { "Tema scuro" } else { "Tema chiaro" })}</button>
-                            <button class="btn" title=move || tr(data, "Ricarica i dati mostrati") on:click=move |_| reload()>{move || tr(data, "Aggiorna")}</button>
-                            {move || {
-                                let dry = data.get().status.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
-                                if dry {
-                                    view! { <span class="mode-badge dry">{move || tr(data, "Dry-run · solo test")}</span> }.into_any()
-                                } else {
-                                    view! { <span class="mode-badge active">{move || tr(data, "Attivo")}</span> }.into_any()
-                                }
-                            }}
-                            <span class="system-pill"><span class="pulse"></span>{move || text(&data.get().health, "status", "offline")}</span>
+                             <button class="btn" title=move || tr(data, "Ricarica i dati mostrati") on:click=move |_| reload()>{move || tr(data, "Aggiorna")}</button>
+                             <span class="system-pill" title=ctx_tr("Stato del servizio: il processo Rextto e la sua API rispondono.")><span class="pulse"></span>{move || text(&data.get().health, "status", "offline")}</span>
                         </div>
                     </header>
                     <div class="content">
@@ -1519,8 +1530,8 @@ fn DecisionExplanationOverlay() -> impl IntoView {
                                             <span>{format!("{}: {}", text(&component, "label", ""), number(&component, "value"))}</span>
                                         }).collect_view()}
                                     </div>
-                                    <div class="table-wrap">
-                                        <table class="data-table">
+                                     <div class="table-wrap">
+                                         <table class="data-table">
                                             <thead><tr><th>{ctx_tr("Regola")}</th><th>{ctx_tr("Esito")}</th><th>{ctx_tr("Dettaglio")}</th></tr></thead>
                                             <tbody>{steps.into_iter().map(|item| {
                                                 let result = text(&item, "result", "info");
@@ -1914,6 +1925,16 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
     let global_loading = search.loading;
     let global_searched = search.searched;
     let global_elapsed = search.elapsed;
+    let global_generation = search.generation;
+    let global_filter = RwSignal::new(String::new());
+    let global_visible_results = Signal::derive(move || {
+        let filter = global_filter.get().trim().to_ascii_lowercase();
+        global_results
+            .get()
+            .into_iter()
+            .filter(|item| filter.is_empty() || item.to_string().to_ascii_lowercase().contains(&filter))
+            .collect::<Vec<_>>()
+    });
     let feed_items = RwSignal::new(Vec::<Value>::new());
     let feed_loading = RwSignal::new(false);
     let feed_loaded = RwSignal::new(false);
@@ -1946,24 +1967,56 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                     if query.trim().is_empty() { return; }
                     let results = global_results;
                     let loading = global_loading;
-                    let searched = global_searched;
-                    let elapsed = global_elapsed;
-                    loading.set(true);
-                    searched.set(false);
+                     let searched = global_searched;
+                     let elapsed = global_elapsed;
+                     let filter = global_filter;
+                     let request_id = global_generation.get_untracked().wrapping_add(1);
+                     global_generation.set(request_id);
+                     let remote_done = RwSignal::new(false);
+                     loading.set(true);
+                     searched.set(false);
+                     results.set(Vec::new());
+                     filter.set(String::new());
                     elapsed.set(0);
                     spawn_local(async move {
                         while loading.get_untracked() {
                             TimeoutFuture::new(1000).await;
                             if loading.get_untracked() {
                                 elapsed.update(|value| *value += 1);
-                            }
-                        }
-                    });
-                    spawn_local(async move {
-                        match send("POST", "/api/search", Some(json!({"query": query}))).await {
-                            Ok(value) => results.set(array(&value, "results")),
-                            Err(error) => data.update(|current| current.error = error),
-                        }
+                             }
+                         }
+                     });
+                     let archive_results = results;
+                     let archive_query = query.clone();
+                     spawn_local(async move {
+                         if let Ok(value) = send("POST", "/api/search/archive", Some(json!({"query": archive_query}))).await {
+                             if global_generation.get_untracked() == request_id && !remote_done.get_untracked() {
+                                 archive_results.update(|current| merge_release_results(current, array(&value, "results")));
+                             }
+                         }
+                     });
+                     let timeout_loading = loading;
+                     let timeout_searched = searched;
+                     spawn_local(async move {
+                         TimeoutFuture::new(60_000).await;
+                         if global_generation.get_untracked() == request_id && timeout_loading.get_untracked() {
+                             timeout_loading.set(false);
+                             timeout_searched.set(true);
+                         }
+                     });
+                     spawn_local(async move {
+                         match send("POST", "/api/search", Some(json!({"query": query}))).await {
+                             Ok(value) => {
+                                 if global_generation.get_untracked() == request_id {
+                                     results.set(array(&value, "results"));
+                                 }
+                                 remote_done.set(true);
+                             }
+                             Err(error) => {
+                                 remote_done.set(true);
+                                 data.update(|current| current.error = error);
+                             }
+                         }
                         loading.set(false);
                         searched.set(true);
                     });
@@ -1993,13 +2046,26 @@ fn Dashboard(data: RwSignal<Data>, page: RwSignal<String>, next_cycle: Signal<St
                     <div class="skeleton-line"></div>
                 </div>
             </Show>
-            <Show when=move || !global_results.get().is_empty()>
-                <Panel title="Risultati ricerca">
-                    <div class="table-wrap">
-                        <table class="data-table">
-                            <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Sorgente")}</th><th>{ctx_tr("Risoluzione")}</th><th>{ctx_tr("Codec")}</th><th></th></tr></thead>
-                            <tbody>
-                                {move || global_results.get().iter().cloned().map(|item| {
+             <Show when=move || !global_results.get().is_empty()>
+                 <Panel title="Risultati ricerca">
+                     <div class="toolbar" style="margin-bottom:10px">
+                         <input
+                             type="search"
+                             prop:value=global_filter
+                             on:input=move |event| global_filter.set(event_target_value(&event))
+                             placeholder=ctx_tr("Filtra i risultati già caricati…")
+                             title=ctx_tr("Filtro locale: non interroga nuovamente le sorgenti")
+                         />
+                         <small class="muted">{move || format!("{} / {}", global_visible_results.get().len(), global_results.get().len())}</small>
+                     </div>
+                     <Show when=move || global_visible_results.get().is_empty()>
+                         <div class="notice">{ctx_tr("Nessun risultato corrisponde al filtro locale.")}</div>
+                     </Show>
+                     <div class="table-wrap">
+                         <table class="data-table">
+                             <thead><tr><th>{ctx_tr("Release")}</th><th>{ctx_tr("Sorgente")}</th><th>{ctx_tr("Risoluzione")}</th><th>{ctx_tr("Codec")}</th><th></th></tr></thead>
+                             <tbody>
+                                 {move || global_visible_results.get().into_iter().map(|item| {
                                     let release = item.clone();
                                     let quality = item.get("quality").cloned().unwrap_or_default();
                                     view! {
@@ -6240,8 +6306,8 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                     <button class="btn sm" disabled=move || { data.get().archive_page >= data.get().archive_pages } on:click=move |_| archive_page(data, query.get(), data.get().archive_page.saturating_add(1))>{ctx_tr("Successiva")}</button>
                 </div>
                 <div class="table-wrap" style="margin-top:10px">
-                    <table class="data-table">
-                        <thead><tr><th><input type="checkbox" title=ctx_tr("Seleziona tutti") prop:checked=move || {
+                     <table class="data-table archive-table">
+                         <thead><tr><th><input type="checkbox" title=ctx_tr("Seleziona tutti") prop:checked=move || {
                             let ids: Vec<i64> = data.get().archive.iter().filter_map(|item| item.get("id").and_then(Value::as_i64)).collect();
                             !ids.is_empty() && ids.iter().all(|id| selected.get().contains(id))
                         } on:change=move |_| {
@@ -6260,19 +6326,21 @@ fn ArchiveView(data: RwSignal<Data>) -> impl IntoView {
                             {move || data.get().archive.iter().cloned().map(|item| {
                                 let id = item.get("id").and_then(Value::as_i64).unwrap_or_default();
                                 let title = text(&item, "title", "Release");
-                                let add_title = title.clone();
-                                let add_magnet = text(&item, "magnet", "");
-                                let add_source = text(&item, "source", "archive");
-                                let tmdb_search_url = format!("https://www.themoviedb.org/search?query={}", urlencoding::encode(&title));
-                                view! {
+                                 let add_title = title.clone();
+                                 let add_magnet = text(&item, "magnet", "");
+                                 let add_source = text(&item, "source", "archive");
+                                 let explain_release = item.get("release").cloned();
+                                 let tmdb_search_url = format!("https://www.themoviedb.org/search?query={}", urlencoding::encode(&title));
+                                 view! {
                                     <tr>
                                         <td><input type="checkbox" prop:checked=move || selected.get().contains(&id) on:change=move |_| selected.update(|items| { if items.contains(&id) { items.retain(|value| *value != id); } else { items.push(id); } }) /></td>
                                         <td class="truncate">{title}</td>
                                         <td class="muted">{text(&item, "source", "archive")}</td>
-                                        <td class="numeric">{number(&item, "quality_score")}</td>
-                                        <td>
-                                                <div class="toolbar">
-                                                    <button class="btn sm" on:click=move |_| { run_post(data, "/api/archive/add", Some(json!({"title": add_title.clone(), "magnet": add_magnet.clone(), "source": add_source.clone()})), "Release accodata"); }>{ctx_tr("Accoda")}</button>
+                                         <td class="numeric">{number(&item, "quality_score")}</td>
+                                         <td>
+                                                 <div class="toolbar">
+                                                     {explain_release.map(|release| view! { <ExplainReleaseButton release /> })}
+                                                     <button class="btn sm" on:click=move |_| { run_post(data, "/api/archive/add", Some(json!({"title": add_title.clone(), "magnet": add_magnet.clone(), "source": add_source.clone()})), "Release accodata"); }>{ctx_tr("Accoda")}</button>
                                                     <a class="btn sm" href=tmdb_search_url target="_blank" rel="noopener" title=ctx_tr("Cerca il titolo della release su TMDB")>{ctx_tr("TMDB")}</a>
                                                     <button class="btn sm danger" on:click=move |_| { run_post(data, "/api/archive/delete", Some(json!({"ids":[id]})), "Release eliminata"); }>{ctx_tr("Elimina")}</button>
                                             </div>

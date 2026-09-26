@@ -197,6 +197,7 @@ static void collect_events(rextto_lt_session* session) {
         // move can fail with `fail_if_exist` when the destination already
         // exists, leaving the torrent on the RAM disk forever.
         else if (const auto* event = lt::alert_cast<lt::storage_moved_failed_alert>(alert)) { kind = 4; handle = event->handle; }
+        else if (const auto* event = lt::alert_cast<lt::torrent_checked_alert>(alert)) { kind = 5; handle = event->handle; }
         if (kind == 0 || !handle.is_valid()) continue;
         auto status = handle.status(lt::torrent_handle::query_name | lt::torrent_handle::query_save_path);
         rextto_lt_event output{};

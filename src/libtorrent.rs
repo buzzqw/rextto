@@ -1428,6 +1428,7 @@ impl LibtorrentClient {
                     2 => "torrent_finished",
                     3 => "storage_moved",
                     4 => "storage_move_failed",
+                    5 => "torrent_checked",
                     _ => "unknown",
                 };
                 if kind == "metadata_received" {
