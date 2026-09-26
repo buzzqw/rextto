@@ -126,7 +126,7 @@ async fn run_daemon(dry_run: bool, config: Option<String>) -> Result<()> {
         }
     }
     let state = AppState {
-        cfg: cfg.clone(),
+        cfg: Arc::new(cfg.clone()),
         config_path,
         i18n: i18n.clone(),
         db: db.clone(),

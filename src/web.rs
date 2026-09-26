@@ -295,7 +295,10 @@ use tracing_subscriber::{reload, EnvFilter};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub cfg: Config,
+    /// Startup configuration, wrapped in `Arc` on purpose: `axum::serve` clones
+    /// the state for every accepted connection, so a deep `Config` clone here
+    /// used to burn tens of milliseconds of CPU per new connection.
+    pub cfg: Arc<Config>,
     pub config_path: std::path::PathBuf,
     pub i18n: Arc<I18nDb>,
     pub db: Arc<Mutex<Database>>,
@@ -311,7 +314,9 @@ pub struct AppState {
     pub log_reload: Arc<Mutex<reload::Handle<EnvFilter, tracing_subscriber::Registry>>>,
     pub rename_progress: Arc<Mutex<RenameProgress>>,
     /// Cache della `Config` con la generazione al momento del caricamento.
-    pub config_cache: Arc<Mutex<Option<(u64, Config)>>>,
+    /// `Arc` così `latest_config` non ricopia l'intera configurazione a ogni
+    /// richiesta.
+    pub config_cache: Arc<Mutex<Option<(u64, Arc<Config>)>>>,
 }
 
 /// Progress of a background rename-all job, polled by `/api/rename-progress`.
@@ -916,18 +921,20 @@ fn ui_pkg_dir() -> PathBuf {
 fn setup_complete(cfg: &Config) -> bool {
     setup_marker(cfg).is_file()
 }
-fn latest_config(state: &AppState) -> Config {
+fn latest_config(state: &AppState) -> Arc<Config> {
     let generation = crate::config::config_generation();
     if let Ok(guard) = state.config_cache.lock() {
         if let Some((cached_generation, cached)) = guard.as_ref() {
             if *cached_generation == generation {
-                return cached.clone();
+                return Arc::clone(cached);
             }
         }
     }
-    let loaded = Config::load(&state.config_path).unwrap_or_else(|_| state.cfg.clone());
+    let loaded = Arc::new(
+        Config::load(&state.config_path).unwrap_or_else(|_| (*state.cfg).clone()),
+    );
     if let Ok(mut guard) = state.config_cache.lock() {
-        *guard = Some((generation, loaded.clone()));
+        *guard = Some((generation, Arc::clone(&loaded)));
     }
     loaded
 }
@@ -2365,7 +2372,7 @@ async fn toggle_season(
     Path(name): Path<String>,
     Json(input): Json<SeasonToggleInput>,
 ) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let Some(series) = cfg
         .series
         .iter_mut()
@@ -2401,7 +2408,7 @@ async fn set_series_path(
     Path(name): Path<String>,
     Json(input): Json<SeriesPathInput>,
 ) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let Some(series) = cfg
         .series
         .iter_mut()
@@ -2535,7 +2542,7 @@ async fn series_metadata_refresh(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let Some(series) = find_series(&cfg, &name).cloned() else {
         return (
             StatusCode::NOT_FOUND,
@@ -3676,7 +3683,7 @@ async fn apply_movie_metadata(
     } else {
         metadata_year.to_string()
     };
-    let mut updated = latest_config(&s);
+    let mut updated = (*latest_config(&s)).clone();
     let Some(movie) = updated.movies.iter_mut().find(|movie| movie.id == id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -3780,7 +3787,7 @@ async fn update_movie(
     Path(id): Path<i64>,
     Json(input): Json<MovieUpdateInput>,
 ) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let Some(movie) = cfg.movies.iter_mut().find(|movie| movie.id == id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -3818,7 +3825,7 @@ async fn update_movie(
     }
 }
 async fn delete_movie(State(s): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let before = cfg.movies.len();
     cfg.movies.retain(|movie| movie.id != id);
     if before == cfg.movies.len() {
@@ -5309,7 +5316,7 @@ fn apply_watchlist_import(
 }
 
 async fn trakt_watchlist_import(State(s): State<AppState>) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let client = TraktClient::from_settings(&cfg.settings);
     let value = match client.watchlist().await {
         Ok(value) => value,
@@ -5338,7 +5345,7 @@ async fn trakt_watchlist_import(State(s): State<AppState>) -> impl IntoResponse 
 }
 
 async fn simkl_watchlist_import(State(s): State<AppState>) -> impl IntoResponse {
-    let mut cfg = latest_config(&s);
+    let mut cfg = (*latest_config(&s)).clone();
     let client = SimklClient::from_settings(&cfg.settings);
     let value = match client.watchlist().await {
         Ok(value) => value,
@@ -14123,7 +14130,7 @@ pub async fn serve(
     );
     let worker = tokio::spawn(torrent_event_worker(
         state.config_path.clone(),
-        state.cfg.clone(),
+        (*state.cfg).clone(),
         state.torrents.clone(),
         state.db.clone(),
         state.comics.clone(),
@@ -14480,7 +14487,7 @@ mod tests {
             log_reload: Arc::new(Mutex::new(log_reload)),
             rename_progress: Arc::new(Mutex::new(RenameProgress::default())),
             config_cache: Arc::new(Mutex::new(None)),
-            cfg,
+            cfg: Arc::new(cfg),
             config_path,
         };
         (state, root)
