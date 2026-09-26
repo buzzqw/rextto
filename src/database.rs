@@ -2472,10 +2472,20 @@ impl Database {
     }
 
     pub fn set_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
-        self.conn.execute(
+        // Un torrent aggiunto a mano (magnet/.torrent) non ha una riga in
+        // torrent_meta: un semplice UPDATE non salverebbe nulla. Aggiorniamo la
+        // riga esistente (anche con hash di case diverso) e, se manca, la
+        // creiamo senza toccare eventuali stati già presenti.
+        let updated = self.conn.execute(
             "UPDATE torrent_meta SET tag=?1, updated_at=datetime('now') WHERE lower(hash)=lower(?2)",
             rusqlite::params![tag, hash],
         )?;
+        if updated == 0 {
+            self.conn.execute(
+                "INSERT INTO torrent_meta(hash,tag,status,created_at,updated_at) VALUES (?1,?2,'queued',datetime('now'),datetime('now'))",
+                rusqlite::params![hash.to_ascii_lowercase(), tag],
+            )?;
+        }
         Ok(())
     }
 
@@ -4067,6 +4077,57 @@ mod tests {
             db.torrent_status(&digest).unwrap().as_deref(),
             Some("queued")
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn tags_manual_torrents_creating_missing_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "rextto-db-set-tag-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let hash = "f9d1b5f8b88ed1132723a6ce5a6d51e67267ab95";
+
+        // Torrent aggiunto a mano: nessuna riga in torrent_meta. Il tag deve
+        // comunque persistere creando la riga.
+        db.set_torrent_tag(hash, "Manuale").unwrap();
+        let tags = db.torrent_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].0, hash);
+        assert_eq!(tags[0].1, "Manuale");
+
+        // Un secondo assegnamento aggiorna la riga esistente senza duplicarla.
+        db.set_torrent_tag(&hash.to_ascii_uppercase(), "Film").unwrap();
+        let tags = db.torrent_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].1, "Film");
+
+        // Una riga legacy con hash in maiuscolo viene aggiornata, non duplicata.
+        let legacy = "0123456789abcdef0123456789abcdef01234567";
+        db.conn
+            .execute(
+                "INSERT INTO torrent_meta(hash,tag,status,created_at,updated_at) VALUES (?1,'','queued',datetime('now'),datetime('now'))",
+                params![legacy.to_ascii_uppercase()],
+            )
+            .unwrap();
+        db.set_torrent_tag(legacy, "Serie TV").unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM torrent_meta WHERE lower(hash)=?1",
+                [legacy],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
 
         drop(db);
         let _ = std::fs::remove_file(&path);
