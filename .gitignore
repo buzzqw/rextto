@@ -1,7 +1,11 @@
 # Build output
 /target/
 /ui/target/
-/ui/end2end/
+# Playwright e2e: the test sources are tracked, only generated output is ignored.
+/ui/end2end/node_modules/
+/ui/end2end/test-results/
+/ui/end2end/playwright-report/
+/ui/end2end/.cache/
 **/*.profraw
 **/*.profdata
 
