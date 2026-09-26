@@ -2568,12 +2568,49 @@ fn tag_chips(tag: &str) -> Vec<String> {
 }
 
 /// Applica il filtro tag della barra strumenti a torrent e download HTTP.
+/// Il valore salvato può contenere più etichette separate da virgola/punto e
+/// virgola: il filtro trova l'elemento se contiene l'etichetta cercata.
 fn tag_matches(term: &str, tag: &str) -> bool {
     match term {
         "" => true,
-        "__none__" => tag.is_empty(),
-        _ => tag == term,
+        "__none__" => tag_chips(tag).is_empty(),
+        _ => tag_chips(tag)
+            .iter()
+            .any(|chip| chip.eq_ignore_ascii_case(term)),
     }
+}
+
+/// Aggiunge un'etichetta alla lista separata da virgole, senza duplicati e
+/// ignorando il case; anche il valore aggiunto viene spezzato nei suoi chip.
+fn merge_tag(current: &str, tag: &str) -> String {
+    let mut chips = tag_chips(current);
+    for candidate in tag_chips(tag) {
+        if !chips
+            .iter()
+            .any(|chip| chip.eq_ignore_ascii_case(&candidate))
+        {
+            chips.push(candidate);
+        }
+    }
+    chips.join(", ")
+}
+
+/// Rimuove le etichette indicate dalla lista; con `tag` vuoto la svuota.
+fn remove_tag(current: &str, tag: &str) -> String {
+    let removals = tag_chips(tag);
+    let chips: Vec<String> = if removals.is_empty() {
+        Vec::new()
+    } else {
+        tag_chips(current)
+            .into_iter()
+            .filter(|chip| {
+                !removals
+                    .iter()
+                    .any(|remove| remove.eq_ignore_ascii_case(chip))
+            })
+            .collect()
+    };
+    chips.join(", ")
 }
 
 /// Adatta un download HTTP (fumetti) alla forma usata dai torrent così la
@@ -3003,20 +3040,22 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     // condivisa dalla tendina di filtro e da quella di assegnazione.
     let all_tags = Signal::derive(move || {
         let snapshot = data.get();
-        let mut tags: Vec<String> = snapshot.download_tags.clone();
+        let mut tags: Vec<String> = snapshot
+            .download_tags
+            .iter()
+            .flat_map(|tag| tag_chips(tag))
+            .collect();
         tags.extend(
             snapshot
                 .torrent_tags
                 .iter()
-                .map(|item| text(item, "tag", ""))
-                .filter(|tag| !tag.is_empty()),
+                .flat_map(|item| tag_chips(&text(item, "tag", ""))),
         );
         tags.extend(
             snapshot
                 .comic_downloads
                 .iter()
-                .map(|item| text(item, "tag", ""))
-                .filter(|tag| !tag.is_empty()),
+                .flat_map(|item| tag_chips(&text(item, "tag", ""))),
         );
         tags.sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
         tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
@@ -3024,8 +3063,10 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
     });
     // Un tag per i selezionati, torrent e download HTTP insieme: un solo punto
     // di ingresso al posto del pulsante per riga. La voce "__new__" crea un tag
-    // che viene registrato e ricompare nelle tendine.
-    let assign_tag = move |_| {
+    // che viene registrato e ricompare nelle tendine. `remove` distingue tra
+    // aggiunta (unione alle etichette esistenti) e rimozione; con il tag vuoto
+    // entrambe azzerano la lista, come prima.
+    let update_tags = move |remove: bool| {
         let chosen = tag_assign.get();
         let is_new = chosen == "__new__";
         let tag = if is_new {
@@ -3033,6 +3074,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
         } else {
             chosen.clone()
         };
+        let snapshot = data.get();
         let torrents = selected_torrents.get();
         let http = selected_http.get();
         let count = torrents.len() + http.len();
@@ -3044,23 +3086,55 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             flash_text(data, "err", tr(data, "Seleziona almeno un torrent o un download."));
             return;
         }
-        spawn_local(async move {
-            if !tag.is_empty() {
-                let _ = send("POST", "/api/download-tags", Some(json!({"tag": tag.clone()}))).await;
+        let apply = |current: &str| {
+            if remove {
+                remove_tag(current, &tag)
+            } else if tag.is_empty() {
+                String::new()
+            } else {
+                merge_tag(current, &tag)
             }
-            for hash in torrents {
+        };
+        let torrent_updates: Vec<(String, String)> = torrents
+            .iter()
+            .map(|hash| {
+                let current = torrent_tag_of(&snapshot.torrent_tags, hash);
+                (hash.clone(), apply(&current))
+            })
+            .collect();
+        let http_updates: Vec<(String, String)> = http
+            .iter()
+            .map(|id| {
+                let current = snapshot
+                    .comic_downloads
+                    .iter()
+                    .find(|item| text(item, "id", "") == *id)
+                    .map(|item| text(item, "tag", ""))
+                    .unwrap_or_default();
+                (id.clone(), apply(&current))
+            })
+            .collect();
+        spawn_local(async move {
+            if !remove && !tag.is_empty() {
+                // Registra ogni etichetta così ricompare nelle tendine anche
+                // quando il valore contiene più tag separati da virgola.
+                for part in tag_chips(&tag) {
+                    let _ = send("POST", "/api/download-tags", Some(json!({"tag": part}))).await;
+                }
+            }
+            for (hash, value) in torrent_updates {
                 let _ = send(
                     "POST",
                     "/api/torrent-tags",
-                    Some(json!({"hash": hash, "tag": tag.clone()})),
+                    Some(json!({"hash": hash, "tag": value})),
                 )
                 .await;
             }
-            for id in http {
+            for (id, value) in http_updates {
                 let _ = send(
                     "POST",
                     "/api/comics/downloads/tag",
-                    Some(json!({"id": id, "tag": tag.clone()})),
+                    Some(json!({"id": id, "tag": value})),
                 )
                 .await;
             }
@@ -3072,7 +3146,11 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                     "ok",
                     tr_format(
                         data,
-                        "Tag assegnato a {count} elementi",
+                        if remove {
+                            "Tag rimosso da {count} elementi"
+                        } else {
+                            "Tag assegnato a {count} elementi"
+                        },
                         &[("{count}", count.to_string())],
                     ),
                 );
@@ -3082,6 +3160,8 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
             trigger_refresh();
         });
     };
+    let assign_tag = move |_| update_tags(false);
+    let remove_tags = move |_| update_tags(true);
     let set_sort = move |key: &'static str| {
         if sort_key.get() == key {
             sort_asc.update(|value| *value = !*value);
@@ -3258,6 +3338,7 @@ fn Downloads(data: RwSignal<Data>) -> impl IntoView {
                         <input style="width:150px" prop:value=tag_assign_new on:input=move |event| tag_assign_new.set(event_target_value(&event)) placeholder=ctx_tr("Nuovo tag") title=ctx_tr("Nome del nuovo tag: verrà salvato e comparirà nelle tendine") />
                     </Show>
                     <button class="btn sm primary" title=ctx_tr("Assegna il tag scelto a tutti gli elementi selezionati (vuoto = rimuove il tag)") on:click=assign_tag>{ctx_tr("Assegna tag")}</button>
+                    <button class="btn sm" title=ctx_tr("Rimuovi il tag scelto dagli elementi selezionati (vuoto = rimuove tutti i tag)") on:click=remove_tags>{ctx_tr("Rimuovi tag")}</button>
                     <button class="btn sm" title=ctx_tr("Metti in pausa i torrent selezionati") on:click=move |_| bulk_post("pause", None)>{ctx_tr("Pausa")}</button>
                     <button class="btn sm" title=ctx_tr("Riprendi i torrent selezionati") on:click=move |_| bulk_post("resume", None)>{ctx_tr("Riprendi")}</button>
                     <button class="btn sm" title=ctx_tr("Riavvia il check dei torrent selezionati") on:click=move |_| bulk_post("recheck", None)>{ctx_tr("Recheck")}</button>
@@ -3921,7 +4002,7 @@ fn TorrentRow(hash: String, data: RwSignal<Data>, selected: RwSignal<Vec<String>
                                             let hash = hash_tag.get_value();
                                             spawn_local(async move {
                                                 let Some(window) = web_sys::window() else { return };
-                                                let Ok(Some(tag)) = window.prompt_with_message(&tr(data, "Tag del torrent")) else { return };
+                                                let Ok(Some(tag)) = window.prompt_with_message(&tr(data, "Tag del torrent (separati da virgola per più tag)")) else { return };
                                                 let _ = send("POST", "/api/torrent-tags", Some(json!({"hash": hash, "tag": tag}))).await;
                                             });
                                         }>{ctx_tr("Tag")}</button>

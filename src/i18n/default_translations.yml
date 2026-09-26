@@ -1347,3 +1347,7 @@ eng:
   "Scrivi il nome del nuovo tag.": "Type the name of the new tag."
   "Tag creato": "Tag created"
   "Assegna il tag scelto a tutti gli elementi selezionati (vuoto = rimuove il tag)": "Assign the chosen tag to all selected items (empty = remove the tag)"
+  "Rimuovi tag": "Remove tag"
+  "Rimuovi il tag scelto dagli elementi selezionati (vuoto = rimuove tutti i tag)": "Remove the chosen tag from the selected items (empty = remove all tags)"
+  "Tag rimosso da {count} elementi": "Tag removed from {count} items"
+  "Tag del torrent (separati da virgola per più tag)": "Torrent tag (comma-separated for multiple tags)"
